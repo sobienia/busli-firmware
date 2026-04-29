@@ -1,0 +1,16 @@
+# PlatformIO build artifacts
+.pio/
+.vscode/
+.pioenvs/
+.piolibdeps/
+
+# Your WiFi password lives here — never commit it
+include/secrets.h
+
+# Claude Code session data
+.claude/
+
+# OS clutter
+.DS_Store
+Thumbs.db
+*.swp
