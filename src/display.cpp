@@ -242,7 +242,7 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
 }
 
 // ── Rows ──────────────────────────────────────────────────────────────────────
-static void draw_rows(const std::vector<Departure>& departures) {
+static void draw_rows(const std::vector<Departure>& departures, time_t fetch_time) {
     int rows_top = HEADER_H;
     int rows_h   = SCREEN_H - FOOTER_H - rows_top;
     int row_h    = rows_h / ROW_COUNT;
@@ -250,15 +250,17 @@ static void draw_rows(const std::vector<Departure>& departures) {
     gfx->fillRect(0, rows_top, SCREEN_W, rows_h, BLACK);
 
     if (departures.empty()) {
-        String msg = "Loading...";
+        String msg = (fetch_time > 0) ? "No more departures" : "Loading...";
         draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2,
                   rows_top + rows_h / 2 - 8, 2, COLOR_META);
         return;
     }
 
-    // Column widths (text size 3 ≈ 18px wide × 24px tall per character)
-    const int num_col_end  = PAD + 60;    // line number right edge
-    const int dest_start   = num_col_end + 16;
+    // Column widths (text size 3: each char = 18 px wide)
+    // num_col_end is sized for 3-char numbers (54 px) + PAD — so "2", "20",
+    // and "S14" all right-align to the same edge with a consistent 14 px gap.
+    const int num_col_end  = PAD + 54;    // line number right edge  (= 62)
+    const int dest_start   = num_col_end + 14;  //                   (= 76)
     const int right_margin = 64;          // reserved for time/icon
 
     int count = std::min((int)departures.size(), ROW_COUNT);
@@ -385,7 +387,7 @@ void display_draw_board(
 
     if (fetch_time != s_last_fetch_time) {
         s_last_fetch_time = fetch_time;
-        draw_rows(departures);
+        draw_rows(departures, fetch_time);
     }
 
     draw_footer(weather_str, uv_str, rain_today, rain_pct, from_cache, wifi_ok, age_seconds);

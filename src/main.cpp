@@ -29,22 +29,33 @@
 // In Phase 2 we'll move this into a web-editable config. For now it's
 // hardcoded here.
 
+// ── Per-stop filter arrays ────────────────────────────────────────────────────
+// Direction filter: show only departures whose destination CONTAINS one of
+//   these substrings (case-insensitive). Leave as nullptr for all directions.
+// Line filter: show only these exact line numbers. Leave as nullptr for all.
+
+static const char* eth_directions[]  = { "Triemli", "Milchbuck", "Bucheggplatz" };
+static const char* schlieren_lines[] = { "2", "20" };
+
 static const StopConfig STOPS[] = {
     {
+        // Buses 69 + 80 toward the city only (Triemli / Milchbuck direction).
+        // Oerlikon-bound departures are filtered out.
         .label            = "ETH Hönggerberg",
         .station          = "ETH Hönggerberg",
-        .direction_filter = nullptr,
-        .direction_count  = 0,
+        .direction_filter = eth_directions,
+        .direction_count  = 3,
         .line_filter      = nullptr,
         .line_count       = 0,
     },
     {
-        .label            = "Schlieren, Gasometerbrücke",
+        // Lines 2 and 20 only — the trams that serve this stop.
+        .label            = "Gasometerbrücke",
         .station          = "Schlieren, Gasometerbrücke",
         .direction_filter = nullptr,
         .direction_count  = 0,
-        .line_filter      = nullptr,
-        .line_count       = 0,
+        .line_filter      = schlieren_lines,
+        .line_count       = 2,
     },
 };
 static const int NUM_STOPS = sizeof(STOPS) / sizeof(STOPS[0]);

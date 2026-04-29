@@ -64,11 +64,15 @@ static time_t parse_iso8601(const String& iso) {
     return epoch - offset_seconds;
 }
 
-// Strip "Zürich, " prefix from destination names since it's redundant
-// when we're showing departures from a Zürich stop
+// Strip redundant city prefixes from destination names.
+static const char* CITY_PREFIXES[] = {
+    "Zürich, ", "Zurich, ", "Schlieren, ", "Baden, ", "Dietikon, "
+};
 static String format_destination(const String& dest) {
-    if (dest.startsWith("Zürich, ")) return dest.substring(8);
-    if (dest.startsWith("Zurich, ")) return dest.substring(8);
+    for (const char* prefix : CITY_PREFIXES) {
+        if (dest.startsWith(prefix))
+            return dest.substring(strlen(prefix));
+    }
     return dest;
 }
 
@@ -118,7 +122,7 @@ bool api_fetch_departures(
         }
     }
     url += encoded;
-    url += "&limit=6";    // 6 is plenty — we show max 4 rows, 2 extra for filtering
+    url += "&limit=6";
 
     Serial.print("[API] Fetching: ");
     Serial.println(url);
@@ -141,8 +145,8 @@ bool api_fetch_departures(
         return false;
     }
 
-    // Read the full body. http.getString() is the most reliable approach —
-    // it reads until the connection closes or Content-Length is satisfied.
+    // getString() handles chunked transfer encoding correctly.
+    // The field filter below keeps the parsed document tiny regardless of body size.
     String body = http.getString();
     http.end();
 
@@ -153,22 +157,19 @@ bool api_fetch_departures(
         return false;
     }
 
-    // Strip any leading garbage before the JSON object
-    int first = body.indexOf('{');
-    if (first < 0) {
-        Serial.print("[API] Not JSON: ");
-        Serial.println(body.substring(0, 80));
-        return false;
-    }
-    if (first > 0) body = body.substring(first);
+    // Only parse the four fields we need — parsed doc stays small even for 80 KB+ bodies.
+    JsonDocument filter;
+    filter["stationboard"][0]["number"]                         = true;
+    filter["stationboard"][0]["to"]                             = true;
+    filter["stationboard"][0]["stop"]["departure"]              = true;
+    filter["stationboard"][0]["stop"]["prognosis"]["departure"] = true;
 
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body);
+    DeserializationError err = deserializeJson(doc, body,
+                                               DeserializationOption::Filter(filter));
     if (err) {
         Serial.print("[API] JSON error: ");
         Serial.println(err.c_str());
-        Serial.print("[API] Body start: ");
-        Serial.println(body.substring(0, 120));
         return false;
     }
     Serial.println("[API] JSON OK");
