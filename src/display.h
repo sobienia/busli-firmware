@@ -34,6 +34,8 @@ void display_draw_board(
     const std::vector<Departure>& departures,
     const char* weather_str,
     const char* uv_str,
+    bool rain_today,
+    int  rain_pct,
     bool from_cache,
     bool wifi_ok,
     int age_seconds,

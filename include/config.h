@@ -46,8 +46,8 @@
 #define SCREEN_W   480
 #define SCREEN_H   222
 
-#define HEADER_H   48       // top bar (stop name, clock, umbrella, dots)
-#define FOOTER_H   22       // bottom bar (weather, refresh time)
+#define HEADER_H   36       // top bar (stop name, clock, dots)
+#define FOOTER_H   34       // bottom bar (weather, rain, UV, refresh age)
 #define ROW_COUNT  4        // number of departure rows
 #define PAD        8        // padding from screen edge
 
@@ -63,3 +63,13 @@
 
 #define API_BASE_URL  "http://transport.opendata.ch/v1/stationboard"
 #define API_TIMEOUT_MS 10000
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  WEATHER (Open-Meteo — free, no API key required)                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define WEATHER_LAT            47.376   // Zürich
+#define WEATHER_LON             8.541
+#define WEATHER_REFRESH_SEC     900     // 15 minutes
+#define WEATHER_TIMEOUT_MS    10000
+#define WEATHER_RAIN_PROB_PCT    30     // umbrella if daily precip probability >= this

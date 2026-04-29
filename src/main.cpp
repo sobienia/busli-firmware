@@ -21,6 +21,7 @@
 
 #include "display.h"
 #include "api.h"
+#include "weather.h"
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  STOPS — edit these to change which stops the device shows                ║
@@ -58,6 +59,9 @@ static uint32_t last_fetch_ms = 0;
 static uint32_t last_redraw_ms = 0;
 static time_t   last_successful_fetch_time = 0;
 static bool     from_cache = false;
+
+static WeatherData weather_data = {};
+static uint32_t    last_weather_ms = 0;
 
 // Button debouncing state
 static bool     button_was_pressed = false;
@@ -187,6 +191,10 @@ void setup() {
 
     sync_clock();
 
+    display_show_status("Loading weather...");
+    weather_fetch(weather_data);
+    last_weather_ms = millis();
+
     // First fetch
     display_show_status("Loading departures...");
     fetch_now();
@@ -202,6 +210,12 @@ void loop() {
         fetch_now();
     }
 
+    // Refresh weather every WEATHER_REFRESH_SEC
+    if (now_ms - last_weather_ms >= WEATHER_REFRESH_SEC * 1000UL) {
+        weather_fetch(weather_data);
+        last_weather_ms = now_ms;
+    }
+
     // Redraw screen every second so the clock and refresh-age update
     if (now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
@@ -212,13 +226,26 @@ void loop() {
             ? (int)(now - last_successful_fetch_time)
             : 0;
 
+        char weather_str[20] = "";
+        char uv_str[10]      = "";
+        if (weather_data.valid) {
+            snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
+                     (int)roundf(weather_data.temp_c),
+                     (int)roundf(weather_data.temp_max_c));
+            snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
+                     weather_data.uv_index,
+                     weather_data.uv_index_max);
+        }
+
         display_draw_board(
             stop.label,
             current_stop_idx,
             NUM_STOPS,
             last_departures,
-            "",                          // weather string (Phase 3)
-            "",                          // UV string (Phase 3)
+            weather_str,
+            uv_str,
+            weather_data.valid && weather_data.rain_today,
+            weather_data.valid ? weather_data.precip_prob_pct : 0,
             from_cache,
             WiFi.status() == WL_CONNECTED,
             age_s,
@@ -226,13 +253,16 @@ void loop() {
         );
     }
 
-    // Watch WiFi state — try to reconnect if it dropped
+    // Watch WiFi state — try to reconnect if it dropped.
+    // 30 s interval avoids AUTH_LEAVE floods from aggressive reconnect calls.
     static uint32_t last_wifi_check = 0;
-    if (now_ms - last_wifi_check > 10000) {
+    if (now_ms - last_wifi_check > 30000) {
         last_wifi_check = now_ms;
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("[WiFi] Disconnected — reconnecting...");
-            WiFi.reconnect();
+            WiFi.disconnect();
+            delay(100);
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         }
     }
 

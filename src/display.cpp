@@ -27,8 +27,8 @@ static Arduino_GFX     *gfx = nullptr;
 
 // ── Partial-redraw state ──────────────────────────────────────────────────────
 // We avoid redrawing sections that haven't changed to eliminate per-second flicker.
-static time_t s_last_fetch_time   = -1;  // rows redrawn when this changes
-static int    s_last_clock_minute = -1;  // header redrawn when this changes
+static time_t s_last_fetch_time   = -1;   // rows redrawn when this changes
+static int    s_last_clock_minute = -1;   // header redrawn when this changes
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -226,15 +226,16 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
         while (label.length() > 1 && text_w(label, 2) > label_max)
             label = label.substring(0, label.length() - 1);
     }
-    draw_text(label, PAD, 4, 2, COLOR_ROWS);
-    draw_text(clock_str, clock_x, 4, 2, COLOR_ROWS);
+    int ty = (HEADER_H - 16) / 2;   // vertically center size-2 text (16 px tall)
+    draw_text(label, PAD, ty, 2, COLOR_ROWS);
+    draw_text(clock_str, clock_x, ty, 2, COLOR_ROWS);
 
     if (umbrella_x >= 0)
-        draw_umbrella(umbrella_x, 4, COLOR_ROWS);
+        draw_umbrella(umbrella_x, ty, COLOR_ROWS);
 
     for (int i = 0; i < stop_count; i++) {
         uint16_t c = (i == stop_index) ? COLOR_ROWS : COLOR_META;
-        gfx->fillRect(dots_x + i * 12, 8, 6, 6, c);
+        gfx->fillRect(dots_x + i * 12, ty + 5, 6, 6, c);
     }
 
     gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, COLOR_META);
@@ -309,17 +310,31 @@ static void draw_rows(const std::vector<Departure>& departures) {
 
 // ── Footer ────────────────────────────────────────────────────────────────────
 static void draw_footer(const char* weather_str, const char* uv_str,
+                        bool rain_today, int rain_pct,
                         bool from_cache, bool wifi_ok, int age_seconds) {
     int fy = SCREEN_H - FOOTER_H;
     gfx->fillRect(0, fy, SCREEN_W, FOOTER_H, BLACK);
     gfx->drawFastHLine(0, fy, SCREEN_W, rgb(20, 12, 0));
 
-    int x = PAD, ty = fy + 4;
+    int ty  = fy + (FOOTER_H - 16) / 2;   // vertically center size-2 text
+    int uby = fy + (FOOTER_H - 15) / 2;   // vertically center umbrella (15 px tall)
+    int x   = PAD;
 
     if (weather_str && strlen(weather_str) > 0) {
         String s = to_ascii(weather_str);
         draw_text(s, x, ty, 2, COLOR_ROWS);
-        x += text_w(s, 2) + 16;
+        x += text_w(s, 2) + 14;
+    }
+    if (rain_today) {
+        if (rain_pct > 0) {
+            char pct_buf[6];
+            snprintf(pct_buf, sizeof(pct_buf), "%d%%", rain_pct);
+            String ps = pct_buf;
+            draw_text(ps, x, ty, 2, COLOR_ROWS);
+            x += text_w(ps, 2) + 10;   // wider gap before umbrella
+        }
+        draw_umbrella(x, uby, COLOR_ROWS);
+        x += 28;                        // wider gap after umbrella
     }
     if (uv_str && strlen(uv_str) > 0) {
         String s = to_ascii(uv_str);
@@ -340,7 +355,7 @@ static void draw_footer(const char* weather_str, const char* uv_str,
     if (!wifi_ok) dot = ((millis() / 500) % 2 == 0) ? rgb(180, 30, 0) : BLACK;
     else if (from_cache) dot = COLOR_DIM;
     else                 dot = COLOR_META;
-    gfx->fillRect(SCREEN_W - PAD - 6, fy + 8, 6, 6, dot);
+    gfx->fillRect(SCREEN_W - PAD - 6, uby + 4, 6, 6, dot);
 }
 
 // ── Partial board redraw (called every second from main loop) ─────────────────
@@ -351,6 +366,7 @@ void display_draw_board(
     const char* stop_name, int stop_index, int stop_count,
     const std::vector<Departure>& departures,
     const char* weather_str, const char* uv_str,
+    bool rain_today, int rain_pct,
     bool from_cache, bool wifi_ok, int age_seconds,
     time_t fetch_time)
 {
@@ -372,7 +388,7 @@ void display_draw_board(
         draw_rows(departures);
     }
 
-    draw_footer(weather_str, uv_str, from_cache, wifi_ok, age_seconds);
+    draw_footer(weather_str, uv_str, rain_today, rain_pct, from_cache, wifi_ok, age_seconds);
 }
 
 // ── Boot animation ────────────────────────────────────────────────────────────
