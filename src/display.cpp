@@ -172,8 +172,8 @@ void display_show_status(const char* message) {
     s_footer_static_drawn = false;
     gfx->fillScreen(BLACK);
     String s = to_latin1(message);
-    int16_t w = text_w(s, 2);
-    draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 8, 2, COLOR_ROW0);
+    int16_t w = text_w(s, 3);
+    draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 14, 3, COLOR_ROW0);
 }
 
 void display_invalidate() {

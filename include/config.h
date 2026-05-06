@@ -95,5 +95,5 @@
 #define WEATHER_LAT            47.376   // Zürich
 #define WEATHER_LON             8.541
 #define WEATHER_REFRESH_SEC     900     // 15 minutes
-#define WEATHER_TIMEOUT_MS    10000
+#define WEATHER_TIMEOUT_MS     5000
 #define WEATHER_RAIN_PROB_PCT    30     // umbrella if daily precip probability >= this

@@ -39,6 +39,22 @@ static const StopConfig STOPS[] = {
         .line_filter      = schlieren_lines,
         .line_count       = 2,
     },
+    {
+        .label            = "Letzipark",
+        .station          = "Zürich, Letzipark",
+        .direction_filter = nullptr,
+        .direction_count  = 0,
+        .line_filter      = nullptr,
+        .line_count       = 0,
+    },
+    {
+        .label            = "Letzipark West",
+        .station          = "Zürich, Letzipark West",
+        .direction_filter = nullptr,
+        .direction_count  = 0,
+        .line_filter      = nullptr,
+        .line_count       = 0,
+    },
 };
 static const int NUM_STOPS = sizeof(STOPS) / sizeof(STOPS[0]);
 
@@ -135,9 +151,12 @@ static void check_button() {
 static void check_touch() {
     switch (touch_poll()) {
         case TOUCH_SWIPE_LEFT:
-        case TOUCH_SWIPE_RIGHT:
-            Serial.println("[Touch] Swipe → next stop");
+            Serial.println("[Touch] Swipe left → next stop");
             switch_stop((current_stop_idx + 1) % NUM_STOPS);
+            break;
+        case TOUCH_SWIPE_RIGHT:
+            Serial.println("[Touch] Swipe right → prev stop");
+            switch_stop((current_stop_idx - 1 + NUM_STOPS) % NUM_STOPS);
             break;
         case TOUCH_LONG_PRESS:
             Serial.println("[Touch] Long press → force refresh");
@@ -183,12 +202,11 @@ void setup() {
 
     sync_clock();
 
-    display_show_status("Loading weather...");
+    display_show_status("Loading...");
+    fetch_task_start(STOPS, NUM_STOPS);
+
     weather_fetch(weather_data);
     last_weather_ms = millis();
-
-    display_show_status("Loading departures...");
-    fetch_task_start(STOPS, NUM_STOPS);
 }
 
 void loop() {
