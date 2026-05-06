@@ -1,10 +1,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// touch_handler.cpp — CST820 touch gesture detection
+// touch_handler.cpp — CST226SE touch gesture detection
 // ─────────────────────────────────────────────────────────────────────────────
-// The T-Display S3 Pro uses a CST820 capacitive touch IC on I2C.
+// The T-Display S3 Pro uses a CST226SE capacitive touch IC (CST Mutual family)
+// at I2C address 0x5A on SDA=GPIO5 / SCL=GPIO6.
 // No interrupt pin is wired to the MCU, so we poll touch.read() every loop.
 //
-// Coordinate note: the CST820 reports in portrait orientation (x=0..222,
+// Coordinate note: the CST226SE reports in portrait orientation (x=0..222,
 // y=0..480). With display rotation=3 (landscape, USB-C left), raw x maps to
 // the screen's vertical axis and raw y maps to the horizontal axis. For swipe
 // classification we use raw_y delta for left/right and raw_x delta for up/down.
@@ -15,7 +16,7 @@
 #include <Wire.h>
 #include <TouchLib.h>
 
-static TouchLib s_touch(Wire, TOUCH_SDA_PIN, TOUCH_SCL_PIN, CTS820_SLAVE_ADDRESS);
+static TouchLib s_touch(Wire, TOUCH_SDA_PIN, TOUCH_SCL_PIN, TOUCH_I2C_ADDR);
 
 // Gesture state
 static bool     s_touching          = false;
@@ -32,7 +33,10 @@ static bool     s_waiting_double_tap = false;
 
 void touch_init() {
     Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
-    s_touch.init();
+    bool ok = s_touch.init();
+    Serial.printf("[Touch] init() = %s (SDA=%d SCL=%d addr=0x%02X)\n",
+                  ok ? "OK" : "FAIL",
+                  TOUCH_SDA_PIN, TOUCH_SCL_PIN, TOUCH_I2C_ADDR);
 }
 
 TouchGesture touch_poll() {

@@ -10,8 +10,9 @@
 #include "../include/tramli_fonts.h"
 #include <Arduino_GFX_Library.h>
 
-static const int SMALL_ASCENT = 15;   // TramliSmall 16px
-static const int LARGE_ASCENT = 22;   // TramliLarge 24px
+static const int SMALL_ASCENT  = 15;   // TramliSmall  16px
+static const int LARGE_ASCENT  = 22;   // TramliLarge  24px
+static const int XLARGE_ASCENT = 26;   // TramliXLarge 28px
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 #define BOARD_TFT_DC    9
@@ -88,8 +89,9 @@ static String to_latin1(const String& src) {
 
 // ── Text width helper ─────────────────────────────────────────────────────────
 static int16_t text_w(const String& s, uint8_t size) {
-    if (size == 2) gfx->setFont(&TramliSmall);
-    else           gfx->setFont(&TramliLarge);
+    if      (size == 2) gfx->setFont(&TramliSmall);
+    else if (size == 4) gfx->setFont(&TramliXLarge);
+    else                gfx->setFont(&TramliLarge);
     gfx->setTextSize(1);
     int16_t x1, y1; uint16_t w, h;
     gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
@@ -100,8 +102,9 @@ static int16_t text_w(const String& s, uint8_t size) {
 static void draw_text(const String& s, int16_t x, int16_t y,
                       uint8_t size, uint16_t color) {
     int asc;
-    if (size == 2) { gfx->setFont(&TramliSmall); asc = SMALL_ASCENT; }
-    else           { gfx->setFont(&TramliLarge);  asc = LARGE_ASCENT; }
+    if      (size == 2) { gfx->setFont(&TramliSmall);  asc = SMALL_ASCENT;  }
+    else if (size == 4) { gfx->setFont(&TramliXLarge); asc = XLARGE_ASCENT; }
+    else                { gfx->setFont(&TramliLarge);  asc = LARGE_ASCENT;  }
     gfx->setTextSize(1);
     gfx->setTextColor(color);
     gfx->setCursor(x, y + asc);   // GFX fonts use baseline as cursor origin
@@ -290,31 +293,33 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
         return;
     }
 
-    // Column widths (size-3 font: each char = 18 px wide, bold)
-    const int num_col_end  = PAD + 54;    // line number right edge  (= 62)
-    const int dest_start   = num_col_end + 14;  //                   (= 76)
-    const int right_margin = 64;          // reserved for time/icon
+    // Column widths — scaled up for the bigger font in large mode
+    uint8_t row_fsz    = large_font ? 4 : 3;
+    int     row_yadv   = large_font ? 32 : 28;  // yAdvance for vertical centering
+    int num_col_end    = large_font ? (PAD + 65) : (PAD + 54);
+    int dest_start     = num_col_end + (large_font ? 16 : 14);
+    int right_margin   = large_font ? 75 : 64;
 
     int count = std::min((int)departures.size(), max_rows);
     for (int i = 0; i < count; i++) {
         const Departure& dep = departures[i];
         int y      = rows_top + i * row_h;
-        int text_y = y + (row_h - 28) / 2;
+        int text_y = y + (row_h - row_yadv) / 2;
 
         bool disrupted = (dep.delay >= 2);
         uint16_t color = disrupted ? COLOR_DIM : COLOR_ROW0;
 
         // Line number — right-aligned in number column
         String ln = to_latin1(dep.line);
-        draw_text(ln, num_col_end - text_w(ln, 3), text_y, 3, color);
+        draw_text(ln, num_col_end - text_w(ln, row_fsz), text_y, row_fsz, color);
 
         // Destination — truncated to fit, leaving room for delay badge + time
         String dest    = to_latin1(dep.destination);
         int dest_max_w = SCREEN_W - dest_start - right_margin - PAD;
         if (disrupted) dest_max_w -= 52;
-        while (dest.length() > 1 && text_w(dest, 3) > dest_max_w)
+        while (dest.length() > 1 && text_w(dest, row_fsz) > dest_max_w)
             dest = dest.substring(0, dest.length() - 1);
-        draw_text(dest, dest_start, text_y, 3, color);
+        draw_text(dest, dest_start, text_y, row_fsz, color);
 
         // Delay badge (smaller font, between dest and time)
         if (disrupted && dep.delay > 0) {
@@ -332,7 +337,7 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
             char tbuf[8];
             snprintf(tbuf, sizeof(tbuf), "%d'", dep.minutes);
             String ts = tbuf;
-            draw_text(ts, SCREEN_W - PAD - text_w(ts, 3), text_y, 3, color);
+            draw_text(ts, SCREEN_W - PAD - text_w(ts, row_fsz), text_y, row_fsz, color);
         }
 
         // Row separator

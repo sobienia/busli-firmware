@@ -20,8 +20,9 @@ FIRST_CHAR = 0x20
 LAST_CHAR  = 0xFF
 
 SIZES = [
-    ("TramliSmall", 16),
-    ("TramliLarge", 24),
+    ("TramliSmall",  16),
+    ("TramliLarge",  24),
+    ("TramliXLarge", 28),
 ]
 
 

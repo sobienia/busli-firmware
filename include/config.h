@@ -31,12 +31,11 @@
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  THEME COLORS (16-bit RGB565 format)                                      ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
-// Default: amber (looks like an old train station display)
-
-#define COLOR_ROW0    0xFE60   // bright amber for first row
-#define COLOR_ROWS    0xCCC0   // medium amber for other rows
-#define COLOR_DIM     0x8B20   // dim amber for delays
-#define COLOR_META    0x4A00   // very dim amber for separators
+// ZVV amber (#F7B500 = RGB 247,181,0) at four brightness levels
+#define COLOR_ROW0    0xF5A0   // 100% — main text
+#define COLOR_ROWS    0xC480   //  80% — boot animation trail
+#define COLOR_DIM     0x7AC0   //  50% — delays / stale indicator
+#define COLOR_META    0x49A0   //  30% — separators / inactive dots
 #define COLOR_BLACK   0x0000
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -63,8 +62,9 @@
 // ║  TOUCH                                                                    ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define TOUCH_SCL_PIN        5
-#define TOUCH_SDA_PIN        6
+#define TOUCH_SDA_PIN        5
+#define TOUCH_SCL_PIN        6
+#define TOUCH_I2C_ADDR       0x5A  // CST226SE (Mutual) — confirmed by I2C scan
 #define TOUCH_SWIPE_PX       40     // minimum displacement to register a swipe
 #define TOUCH_LONG_PRESS_MS  2000
 #define TOUCH_DOUBLE_TAP_MS  350
