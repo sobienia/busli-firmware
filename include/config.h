@@ -52,10 +52,34 @@
 #define PAD        8        // padding from screen edge
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  BACKGROUND FETCH TASK                                                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define FETCH_TASK_STACK      8192   // FreeRTOS task stack (bytes)
+#define FETCH_TASK_PRIORITY   1      // Low priority — runs on WiFi core 0
+#define FETCH_INTERVAL_MS     60000  // Full cycle time across all stops (ms)
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  TOUCH                                                                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define TOUCH_SCL_PIN        5
+#define TOUCH_SDA_PIN        6
+#define TOUCH_SWIPE_PX       40     // minimum displacement to register a swipe
+#define TOUCH_LONG_PRESS_MS  2000
+#define TOUCH_DOUBLE_TAP_MS  350
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  HARDWARE PINS                                                            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 #define PIN_BOOT_BUTTON   0     // BOOT button (used for switching stops)
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  FOOTER LAYOUT                                                            ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define FOOTER_AGE_REGION_W  90  // right-anchored dynamic region (age + dot)
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  TRANSIT API                                                              ║

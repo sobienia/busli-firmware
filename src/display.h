@@ -39,7 +39,8 @@ void display_draw_board(
     bool from_cache,
     bool wifi_ok,
     int age_seconds,
-    time_t fetch_time
+    time_t fetch_time,
+    bool large_font_mode
 );
 
 // Force a full redraw on the next display_draw_board call (call after stop changes,

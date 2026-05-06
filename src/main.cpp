@@ -1,15 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// main.cpp — Tramli Phase 1 entry point
-// ─────────────────────────────────────────────────────────────────────────────
-// What this does:
-//   1. Initialize the display
-//   2. Show boot animation
-//   3. Connect to your WiFi
-//   4. Sync the clock from the internet
-//   5. Loop forever:
-//      - Every 30 seconds: fetch fresh departures from the SBB API
-//      - Redraw the screen
-//      - Watch for the BOOT button to switch between stops
+// main.cpp — Tramli entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
@@ -18,6 +8,8 @@
 
 #include "../include/config.h"
 #include "../include/secrets.h"
+#include "../include/fetch_task.h"
+#include "../include/touch_handler.h"
 
 #include "display.h"
 #include "api.h"
@@ -26,21 +18,12 @@
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  STOPS — edit these to change which stops the device shows                ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
-// In Phase 2 we'll move this into a web-editable config. For now it's
-// hardcoded here.
-
-// ── Per-stop filter arrays ────────────────────────────────────────────────────
-// Direction filter: show only departures whose destination CONTAINS one of
-//   these substrings (case-insensitive). Leave as nullptr for all directions.
-// Line filter: show only these exact line numbers. Leave as nullptr for all.
 
 static const char* eth_directions[]  = { "Triemli", "Milchbuck", "Bucheggplatz" };
 static const char* schlieren_lines[] = { "2", "20" };
 
 static const StopConfig STOPS[] = {
     {
-        // Buses 69 + 80 toward the city only (Triemli / Milchbuck direction).
-        // Oerlikon-bound departures are filtered out.
         .label            = "ETH Hönggerberg",
         .station          = "ETH Hönggerberg",
         .direction_filter = eth_directions,
@@ -49,7 +32,6 @@ static const StopConfig STOPS[] = {
         .line_count       = 0,
     },
     {
-        // Lines 2 and 20 only — the trams that serve this stop.
         .label            = "Gasometerbrücke",
         .station          = "Schlieren, Gasometerbrücke",
         .direction_filter = nullptr,
@@ -64,20 +46,16 @@ static const int NUM_STOPS = sizeof(STOPS) / sizeof(STOPS[0]);
 // ║  RUNTIME STATE                                                            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-static int current_stop_idx = 0;
-static std::vector<Departure> last_departures;
-static uint32_t last_fetch_ms = 0;
-static uint32_t last_redraw_ms = 0;
-static time_t   last_successful_fetch_time = 0;
-static bool     from_cache = false;
+static int      current_stop_idx = 0;
+static bool     large_font_mode  = false;
+static uint32_t last_redraw_ms   = 0;
 
-static WeatherData weather_data = {};
+static WeatherData weather_data    = {};
 static uint32_t    last_weather_ms = 0;
 
 // Button debouncing state
-static bool     button_was_pressed = false;
+static bool     button_was_pressed   = false;
 static uint32_t button_press_start_ms = 0;
-static const uint32_t LONG_PRESS_MS = 2000;
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  HELPERS                                                                  ║
@@ -112,17 +90,14 @@ static void sync_clock() {
     Serial.println("[NTP] Syncing time...");
     display_show_status("Syncing time...");
 
-    // Switzerland uses CET/CEST — configTime handles DST automatically
-    // when given the timezone string.
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3",
                  "pool.ntp.org", "time.nist.gov");
 
-    // Wait up to 10 seconds for NTP sync
     uint32_t start = millis();
     time_t now = 0;
     while (millis() - start < 10000) {
         now = time(nullptr);
-        if (now > 1700000000) break;     // Jan 2024 sanity check
+        if (now > 1700000000) break;
         delay(200);
     }
 
@@ -133,46 +108,52 @@ static void sync_clock() {
                   t.tm_hour, t.tm_min, t.tm_sec);
 }
 
-static void fetch_now() {
-    const StopConfig& stop = STOPS[current_stop_idx];
-    Serial.printf("[Fetch] Stop %d: %s\n", current_stop_idx, stop.label);
-
-    std::vector<Departure> fresh;
-    bool ok = api_fetch_departures(stop, fresh, 6);
-
-    if (ok) {
-        last_departures = fresh;
-        last_successful_fetch_time = time(nullptr);
-        from_cache = false;
-    } else {
-        // Keep showing what we had — just mark it stale
-        from_cache = true;
-        Serial.println("[Fetch] FAILED — keeping last data");
-    }
-    last_fetch_ms = millis();
+static void switch_stop(int new_idx) {
+    current_stop_idx = new_idx;
+    fetch_task_set_active_stop(new_idx);
+    display_invalidate();
 }
 
 static void check_button() {
     bool pressed = (digitalRead(PIN_BOOT_BUTTON) == LOW);
 
     if (pressed && !button_was_pressed) {
-        // Just pressed
         button_press_start_ms = millis();
     } else if (!pressed && button_was_pressed) {
-        // Just released — was it a short or long press?
         uint32_t held_ms = millis() - button_press_start_ms;
-        if (held_ms >= LONG_PRESS_MS) {
+        if (held_ms >= TOUCH_LONG_PRESS_MS) {
             Serial.println("[Button] Long press → force refresh");
-            fetch_now();
-        } else if (held_ms >= 50) {       // basic debounce
+            fetch_task_force_refresh();
+        } else if (held_ms >= 50) {
             Serial.println("[Button] Short press → next stop");
-            current_stop_idx = (current_stop_idx + 1) % NUM_STOPS;
-            // Clear the screen and force an immediate fetch
-            display_show_status("Loading...");
-            fetch_now();
+            switch_stop((current_stop_idx + 1) % NUM_STOPS);
         }
     }
     button_was_pressed = pressed;
+}
+
+static void check_touch() {
+    switch (touch_poll()) {
+        case TOUCH_SWIPE_LEFT:
+        case TOUCH_SWIPE_RIGHT:
+            Serial.println("[Touch] Swipe → next stop");
+            switch_stop((current_stop_idx + 1) % NUM_STOPS);
+            break;
+        case TOUCH_LONG_PRESS:
+            Serial.println("[Touch] Long press → force refresh");
+            fetch_task_force_refresh();
+            break;
+        case TOUCH_DOUBLE_TAP:
+            Serial.println("[Touch] Double tap → toggle font size");
+            large_font_mode = !large_font_mode;
+            display_invalidate();
+            break;
+        case TOUCH_SWIPE_UP:
+        case TOUCH_SWIPE_DOWN:
+            break;   // reserved for future use
+        default:
+            break;
+    }
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -181,19 +162,19 @@ static void check_button() {
 
 void setup() {
     Serial.begin(115200);
-    delay(500);   // give the USB CDC time to come up
+    delay(500);
     Serial.println();
     Serial.println("============================================");
-    Serial.println("  Tramli Phase 1 — T-Display S3 Pro");
+    Serial.println("  Tramli — T-Display S3 Pro");
     Serial.println("============================================");
 
     pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
 
     display_init();
+    touch_init();
     display_boot_animation(2500);
 
     if (!connect_wifi()) {
-        // Stay here showing the failure message and try again every 30s
         while (WiFi.status() != WL_CONNECTED) {
             delay(30000);
             connect_wifi();
@@ -206,20 +187,15 @@ void setup() {
     weather_fetch(weather_data);
     last_weather_ms = millis();
 
-    // First fetch
     display_show_status("Loading departures...");
-    fetch_now();
+    fetch_task_start(STOPS, NUM_STOPS);
 }
 
 void loop() {
     check_button();
+    check_touch();
 
     uint32_t now_ms = millis();
-
-    // Fetch fresh data every REFRESH_INTERVAL_SEC
-    if (now_ms - last_fetch_ms >= REFRESH_INTERVAL_SEC * 1000UL) {
-        fetch_now();
-    }
 
     // Refresh weather every WEATHER_REFRESH_SEC
     if (now_ms - last_weather_ms >= WEATHER_REFRESH_SEC * 1000UL) {
@@ -227,15 +203,18 @@ void loop() {
         last_weather_ms = now_ms;
     }
 
-    // Redraw screen every second so the clock and refresh-age update
+    // Redraw screen every second so the clock and age counter update
     if (now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
 
+        std::vector<Departure> departures;
+        time_t fetch_time;
+        bool   from_cache;
+        fetch_task_get(current_stop_idx, departures, fetch_time, from_cache);
+
         const StopConfig& stop = STOPS[current_stop_idx];
         time_t now = time(nullptr);
-        int age_s = last_successful_fetch_time > 0
-            ? (int)(now - last_successful_fetch_time)
-            : 0;
+        int age_s = (fetch_time > 0) ? (int)(now - fetch_time) : 0;
 
         char weather_str[20] = "";
         char uv_str[10]      = "";
@@ -252,7 +231,7 @@ void loop() {
             stop.label,
             current_stop_idx,
             NUM_STOPS,
-            last_departures,
+            departures,
             weather_str,
             uv_str,
             weather_data.valid && weather_data.rain_today,
@@ -260,12 +239,12 @@ void loop() {
             from_cache,
             WiFi.status() == WL_CONNECTED,
             age_s,
-            last_successful_fetch_time
+            fetch_time,
+            large_font_mode
         );
     }
 
-    // Watch WiFi state — try to reconnect if it dropped.
-    // 30 s interval avoids AUTH_LEAVE floods from aggressive reconnect calls.
+    // Reconnect WiFi if dropped — 30s interval avoids AUTH_LEAVE floods
     static uint32_t last_wifi_check = 0;
     if (now_ms - last_wifi_check > 30000) {
         last_wifi_check = now_ms;
@@ -277,5 +256,5 @@ void loop() {
         }
     }
 
-    delay(20);   // small yield to keep the system happy
+    delay(20);
 }

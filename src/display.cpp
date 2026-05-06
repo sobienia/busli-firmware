@@ -30,9 +30,13 @@ static Arduino_DataBus *bus = nullptr;
 static Arduino_GFX     *gfx = nullptr;
 
 // ── Partial-redraw state ──────────────────────────────────────────────────────
-// We avoid redrawing sections that haven't changed to eliminate per-second flicker.
-static time_t s_last_fetch_time   = -1;   // rows redrawn when this changes
-static int    s_last_clock_minute = -1;   // header redrawn when this changes
+// Header redraws on minute change, rows on new fetch data, footer is split:
+//   static region (weather/UV) redraws on weather change (~15 min)
+//   dynamic region (age + dot) redraws every second
+static time_t    s_last_fetch_time    = -1;
+static int       s_last_clock_minute  = -1;
+static uint32_t  s_last_weather_hash  = 0xFFFFFFFF;
+static bool      s_footer_static_drawn = false;
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -104,6 +108,15 @@ static void draw_text(const String& s, int16_t x, int16_t y,
     gfx->print(s);
 }
 
+// ── Weather hash for footer static redraw guard ───────────────────────────────
+static uint32_t weather_hash(const char* weather_str, const char* uv_str,
+                              bool rain_today, int rain_pct) {
+    uint32_t h = (rain_today ? 1u : 0u) ^ ((uint32_t)(rain_pct & 0xFF) << 1);
+    for (const char* p = weather_str; p && *p; p++) h ^= (uint32_t)*p << 8;
+    for (const char* p = uv_str;      p && *p; p++) h ^= (uint32_t)*p << 16;
+    return h;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  PUBLIC INTERFACE
 // ═════════════════════════════════════════════════════════════════════════════
@@ -151,17 +164,19 @@ void display_set_brightness(uint8_t percent) {
 
 void display_show_status(const char* message) {
     if (!gfx) return;
-    s_last_fetch_time   = -1;   // force full redraw on next display_draw_board
-    s_last_clock_minute = -1;
+    s_last_fetch_time     = -1;
+    s_last_clock_minute   = -1;
+    s_footer_static_drawn = false;
     gfx->fillScreen(BLACK);
     String s = to_latin1(message);
     int16_t w = text_w(s, 2);
-    draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 8, 2, COLOR_ROWS);
+    draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 8, 2, COLOR_ROW0);
 }
 
 void display_invalidate() {
-    s_last_fetch_time   = -1;
-    s_last_clock_minute = -1;
+    s_last_fetch_time     = -1;
+    s_last_clock_minute   = -1;
+    s_footer_static_drawn = false;
 }
 
 // ── Umbrella icon ─────────────────────────────────────────────────────────────
@@ -203,8 +218,12 @@ static void apply_night_brightness() {
 
 // ── Header ────────────────────────────────────────────────────────────────────
 static void draw_header(const char* stop_name, int stop_index, int stop_count,
-                        bool rain_active) {
+                        bool rain_active, bool large_font) {
     gfx->fillRect(0, 0, SCREEN_W, HEADER_H, BLACK);
+
+    uint8_t fsz = large_font ? 3 : 2;
+    int     fh  = large_font ? 28 : 16;   // yAdvance for vertical centering
+    int     ty  = (HEADER_H - fh) / 2;
 
     // Clock — show "--:--" until NTP sync
     char clock_buf[6] = "--:--";
@@ -217,85 +236,87 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     String clock_str = clock_buf;
 
     // Build right cluster right-to-left: clock, umbrella, dots
-    int16_t clock_w = text_w(clock_str, 2);
+    int16_t clock_w = text_w(clock_str, fsz);
     int rx = SCREEN_W - PAD - clock_w;
     int clock_x = rx;
 
     int umbrella_x = -1;
     if (rain_active) { rx -= 16; umbrella_x = rx; }
 
-    int dots_w  = stop_count * 12;
-    int dots_x  = (dots_w > 0) ? (rx -= 8, rx -= dots_w, rx) : rx;
+    int dots_w = stop_count * 12;
+    int dots_x = (dots_w > 0) ? (rx -= 8, rx -= dots_w, rx) : rx;
 
-    // Stop label (strip "City, " prefix if too long)
+    // Stop label — truncate if too wide
     String label = to_latin1(stop_name);
     int label_max = dots_x - PAD - 8;
-    if (text_w(label, 2) > label_max) {
+    if (text_w(label, fsz) > label_max) {
         int comma = label.indexOf(", ");
         if (comma >= 0) label = label.substring(comma + 2);
-        while (label.length() > 1 && text_w(label, 2) > label_max)
+        while (label.length() > 1 && text_w(label, fsz) > label_max)
             label = label.substring(0, label.length() - 1);
     }
-    int ty = (HEADER_H - 16) / 2;   // vertically center size-2 text (16 px tall)
-    draw_text(label, PAD, ty, 2, COLOR_ROWS);
-    draw_text(clock_str, clock_x, ty, 2, COLOR_ROWS);
+
+    draw_text(label, PAD, ty, fsz, COLOR_ROW0);
+    draw_text(clock_str, clock_x, ty, fsz, COLOR_ROW0);
 
     if (umbrella_x >= 0)
-        draw_umbrella(umbrella_x, ty, COLOR_ROWS);
+        draw_umbrella(umbrella_x, ty, COLOR_ROW0);
 
+    // Stop indicator dots — center them vertically in header
+    int dot_y = (HEADER_H - 6) / 2;
     for (int i = 0; i < stop_count; i++) {
-        uint16_t c = (i == stop_index) ? COLOR_ROWS : COLOR_META;
-        gfx->fillRect(dots_x + i * 12, ty + 5, 6, 6, c);
+        uint16_t c = (i == stop_index) ? COLOR_ROW0 : COLOR_META;
+        gfx->fillRect(dots_x + i * 12, dot_y, 6, 6, c);
     }
 
     gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, COLOR_META);
 }
 
 // ── Rows ──────────────────────────────────────────────────────────────────────
-static void draw_rows(const std::vector<Departure>& departures, time_t fetch_time) {
+static void draw_rows(const std::vector<Departure>& departures, time_t fetch_time,
+                      bool large_font) {
     int rows_top = HEADER_H;
     int rows_h   = SCREEN_H - FOOTER_H - rows_top;
-    int row_h    = rows_h / ROW_COUNT;
+    int max_rows = large_font ? 2 : ROW_COUNT;
+    int row_h    = rows_h / max_rows;
 
     gfx->fillRect(0, rows_top, SCREEN_W, rows_h, BLACK);
 
     if (departures.empty()) {
         String msg = (fetch_time > 0) ? "No more departures" : "Loading...";
-        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2,
-                  rows_top + rows_h / 2 - 8, 2, COLOR_META);
+        uint8_t fsz = large_font ? 3 : 2;
+        draw_text(msg, (SCREEN_W - text_w(msg, fsz)) / 2,
+                  rows_top + rows_h / 2 - 14, fsz, COLOR_META);
         return;
     }
 
-    // Column widths (text size 3: each char = 18 px wide)
-    // num_col_end is sized for 3-char numbers (54 px) + PAD — so "2", "20",
-    // and "S14" all right-align to the same edge with a consistent 14 px gap.
+    // Column widths (size-3 font: each char = 18 px wide, bold)
     const int num_col_end  = PAD + 54;    // line number right edge  (= 62)
     const int dest_start   = num_col_end + 14;  //                   (= 76)
     const int right_margin = 64;          // reserved for time/icon
 
-    int count = std::min((int)departures.size(), ROW_COUNT);
+    int count = std::min((int)departures.size(), max_rows);
     for (int i = 0; i < count; i++) {
         const Departure& dep = departures[i];
         int y      = rows_top + i * row_h;
         int text_y = y + (row_h - 28) / 2;
 
         bool disrupted = (dep.delay >= 2);
-        uint16_t color = disrupted ? COLOR_DIM
-                        : (i == 0  ? COLOR_ROW0 : COLOR_ROWS);
+        uint16_t color = disrupted ? COLOR_DIM : COLOR_ROW0;
 
         // Line number — right-aligned in number column
         String ln = to_latin1(dep.line);
         draw_text(ln, num_col_end - text_w(ln, 3), text_y, 3, color);
 
         // Destination — truncated to fit, leaving room for delay badge + time
-        String dest     = to_latin1(dep.destination);
-        int dest_max_w  = SCREEN_W - dest_start - right_margin - PAD;
-        if (disrupted) dest_max_w -= 52;  // extra room for "+Xm" badge
+        String dest    = to_latin1(dep.destination);
+        int dest_max_w = SCREEN_W - dest_start - right_margin - PAD;
+        if (disrupted) dest_max_w -= 52;
         while (dest.length() > 1 && text_w(dest, 3) > dest_max_w)
             dest = dest.substring(0, dest.length() - 1);
         draw_text(dest, dest_start, text_y, 3, color);
 
-        // Delay badge (smaller font, placed between dest and time)
+        // Delay badge (smaller font, between dest and time)
         if (disrupted && dep.delay > 0) {
             char badge[8];
             snprintf(badge, sizeof(badge), "+%dm", dep.delay);
@@ -320,49 +341,62 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
     }
 }
 
-// ── Footer ────────────────────────────────────────────────────────────────────
-static void draw_footer(const char* weather_str, const char* uv_str,
-                        bool rain_today, int rain_pct,
-                        bool from_cache, bool wifi_ok, int age_seconds) {
-    int fy = SCREEN_H - FOOTER_H;
-    gfx->fillRect(0, fy, SCREEN_W, FOOTER_H, BLACK);
-    gfx->drawFastHLine(0, fy, SCREEN_W, rgb(20, 12, 0));
+// ── Footer — static region (weather, UV, umbrella) ────────────────────────────
+// Erases + redraws only the left portion (SCREEN_W - FOOTER_AGE_REGION_W wide).
+// Called only when weather data changes or after a full-screen clear.
+static void draw_footer_static(int fy, const char* weather_str, const char* uv_str,
+                                bool rain_today, int rain_pct, bool large_font) {
+    gfx->fillRect(0, fy, SCREEN_W - FOOTER_AGE_REGION_W, FOOTER_H, BLACK);
+    gfx->drawFastHLine(0, fy, SCREEN_W, rgb(20, 12, 0));  // full-width separator
 
-    int ty  = fy + (FOOTER_H - 16) / 2;   // vertically center size-2 text
-    int uby = fy + (FOOTER_H - 15) / 2;   // vertically center umbrella (15 px tall)
-    int x   = PAD;
+    uint8_t fsz = large_font ? 3 : 2;
+    int     fh  = large_font ? 28 : 16;
+    int     ty  = fy + (FOOTER_H - fh) / 2;
+    int     uby = fy + (FOOTER_H - 15) / 2;  // umbrella icon vertical center
+    int     x   = PAD;
 
     if (weather_str && strlen(weather_str) > 0) {
         String s = to_latin1(weather_str);
-        draw_text(s, x, ty, 2, COLOR_ROWS);
-        x += text_w(s, 2) + 14;
+        draw_text(s, x, ty, fsz, COLOR_ROW0);
+        x += text_w(s, fsz) + 14;
     }
     if (rain_today) {
         if (rain_pct > 0) {
             char pct_buf[6];
             snprintf(pct_buf, sizeof(pct_buf), "%d%%", rain_pct);
             String ps = pct_buf;
-            draw_text(ps, x, ty, 2, COLOR_ROWS);
-            x += text_w(ps, 2) + 10;   // wider gap before umbrella
+            draw_text(ps, x, ty, fsz, COLOR_ROW0);
+            x += text_w(ps, fsz) + 10;
         }
-        draw_umbrella(x, uby, COLOR_ROWS);
-        x += 28;                        // wider gap after umbrella
+        draw_umbrella(x, uby, COLOR_ROW0);
+        x += 28;
     }
     if (uv_str && strlen(uv_str) > 0) {
         String s = to_latin1(uv_str);
-        draw_text(s, x, ty, 2, COLOR_ROWS);
-        x += text_w(s, 2) + 16;
+        draw_text(s, x, ty, fsz, COLOR_ROW0);
     }
+}
 
-    // Refresh age — right-aligned
+// ── Footer — dynamic region (age counter + status dot) ────────────────────────
+// Erases + redraws only the right FOOTER_AGE_REGION_W pixels every second.
+// Starts erase at fy+1 to preserve the separator line drawn by draw_footer_static.
+static void draw_footer_dynamic(int fy, bool from_cache, bool wifi_ok,
+                                int age_seconds, bool large_font) {
+    gfx->fillRect(SCREEN_W - FOOTER_AGE_REGION_W, fy + 1,
+                  FOOTER_AGE_REGION_W, FOOTER_H - 1, BLACK);
+
+    uint8_t fsz = large_font ? 3 : 2;
+    int     fh  = large_font ? 28 : 16;
+    int     ty  = fy + (FOOTER_H - fh) / 2;
+    int     uby = fy + (FOOTER_H - 15) / 2;
+
     char age_buf[16];
-    if (from_cache)       snprintf(age_buf, sizeof(age_buf), "cached");
+    if (from_cache)            snprintf(age_buf, sizeof(age_buf), "cached");
     else if (age_seconds < 60) snprintf(age_buf, sizeof(age_buf), "now");
-    else                  snprintf(age_buf, sizeof(age_buf), "%dm", age_seconds / 60);
+    else                       snprintf(age_buf, sizeof(age_buf), "%dm", age_seconds / 60);
     String as = age_buf;
-    draw_text(as, SCREEN_W - PAD - 14 - text_w(as, 2), ty, 2, COLOR_ROWS);
+    draw_text(as, SCREEN_W - PAD - 14 - text_w(as, fsz), ty, fsz, COLOR_ROW0);
 
-    // Status dot
     uint16_t dot;
     if (!wifi_ok) dot = ((millis() / 500) % 2 == 0) ? rgb(180, 30, 0) : BLACK;
     else if (from_cache) dot = COLOR_DIM;
@@ -371,16 +405,17 @@ static void draw_footer(const char* weather_str, const char* uv_str,
 }
 
 // ── Partial board redraw (called every second from main loop) ─────────────────
-// Header redraws only on minute changes (clock digit flip).
-// Rows redraw only when fetch_time advances (new API data arrived).
-// Footer redraws every call — it's 22 px and shows the live age counter.
+// Header:        redraws only on minute change
+// Rows:          redraws only when fetch_time changes (new data arrived)
+// Footer static: redraws only when weather changes (~15 min)
+// Footer dynamic: redraws every call (age counter increments every second)
 void display_draw_board(
     const char* stop_name, int stop_index, int stop_count,
     const std::vector<Departure>& departures,
     const char* weather_str, const char* uv_str,
     bool rain_today, int rain_pct,
     bool from_cache, bool wifi_ok, int age_seconds,
-    time_t fetch_time)
+    time_t fetch_time, bool large_font_mode)
 {
     if (!gfx) return;
     apply_night_brightness();
@@ -392,15 +427,22 @@ void display_draw_board(
 
     if (cur_minute != s_last_clock_minute) {
         s_last_clock_minute = cur_minute;
-        draw_header(stop_name, stop_index, stop_count, false);
+        draw_header(stop_name, stop_index, stop_count, false, large_font_mode);
     }
 
     if (fetch_time != s_last_fetch_time) {
         s_last_fetch_time = fetch_time;
-        draw_rows(departures, fetch_time);
+        draw_rows(departures, fetch_time, large_font_mode);
     }
 
-    draw_footer(weather_str, uv_str, rain_today, rain_pct, from_cache, wifi_ok, age_seconds);
+    int fy = SCREEN_H - FOOTER_H;
+    uint32_t wh = weather_hash(weather_str, uv_str, rain_today, rain_pct);
+    if (wh != s_last_weather_hash || !s_footer_static_drawn) {
+        s_last_weather_hash   = wh;
+        s_footer_static_drawn = true;
+        draw_footer_static(fy, weather_str, uv_str, rain_today, rain_pct, large_font_mode);
+    }
+    draw_footer_dynamic(fy, from_cache, wifi_ok, age_seconds, large_font_mode);
 }
 
 // ── Boot animation ────────────────────────────────────────────────────────────
