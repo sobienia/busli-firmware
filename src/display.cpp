@@ -7,7 +7,11 @@
 
 #include "display.h"
 #include "../include/config.h"
+#include "../include/tramli_fonts.h"
 #include <Arduino_GFX_Library.h>
+
+static const int SMALL_ASCENT = 15;   // TramliSmall 16px
+static const int LARGE_ASCENT = 22;   // TramliLarge 24px
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 #define BOARD_TFT_DC    9
@@ -40,37 +44,39 @@ static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
-// ── UTF-8 to ASCII transliteration ───────────────────────────────────────────
-// Arduino_GFX's built-in font doesn't include ö, ü, ä etc.
-// We convert them to closest ASCII equivalents before drawing.
-static String to_ascii(const String& src) {
+// ── UTF-8 → Latin-1 conversion ───────────────────────────────────────────────
+// TramliSmall/Large cover 0x20–0xFF (Latin-1), so we map UTF-8 multibyte
+// sequences to their Latin-1 equivalents instead of falling back to ASCII.
+static String to_latin1(const String& src) {
     String out;
     out.reserve(src.length());
     size_t i = 0;
     while (i < src.length()) {
         uint8_t b = (uint8_t)src[i];
-        if (b < 0x80) {                         // plain ASCII
+        if (b < 0x80) {
             out += (char)b;
             i++;
         } else if (b == 0xC3 && i + 1 < src.length()) {
             uint8_t b2 = (uint8_t)src[i + 1];
+            char c = '?';
             switch (b2) {
-                case 0xA4: out += "ae"; break;  // ä
-                case 0xB6: out += "oe"; break;  // ö
-                case 0xBC: out += "ue"; break;  // ü
-                case 0x84: out += "Ae"; break;  // Ä
-                case 0x96: out += "Oe"; break;  // Ö
-                case 0x9C: out += "Ue"; break;  // Ü
-                case 0x9F: out += "ss"; break;  // ß
-                case 0xA9: out += "e";  break;  // é
-                case 0xA8: out += "e";  break;  // è
-                case 0xAA: out += "e";  break;  // ê
-                case 0xA0: out += "a";  break;  // à
-                default:   out += "?";  break;
+                case 0xA4: c = '\xE4'; break;  // ä
+                case 0xB6: c = '\xF6'; break;  // ö
+                case 0xBC: c = '\xFC'; break;  // ü
+                case 0x84: c = '\xC4'; break;  // Ä
+                case 0x96: c = '\xD6'; break;  // Ö
+                case 0x9C: c = '\xDC'; break;  // Ü
+                case 0x9F: c = '\xDF'; break;  // ß
+                case 0xA9: c = '\xE9'; break;  // é
+                case 0xA8: c = '\xE8'; break;  // è
+                case 0xAA: c = '\xEA'; break;  // ê
+                case 0xA0: c = '\xE0'; break;  // à
+                default:   c = '?';    break;
             }
+            out += c;
             i += 2;
         } else if (b >= 0xC0 && b < 0xE0) { out += '?'; i += 2; }
-        else if (b >= 0xE0 && b < 0xF0)   { out += '-'; i += 3; }
+        else if (b >= 0xE0 && b < 0xF0)   { out += '?'; i += 3; }
         else                               { out += '?'; i++; }
     }
     return out;
@@ -78,19 +84,23 @@ static String to_ascii(const String& src) {
 
 // ── Text width helper ─────────────────────────────────────────────────────────
 static int16_t text_w(const String& s, uint8_t size) {
-    int16_t x1, y1;
-    uint16_t w, h;
-    gfx->setTextSize(size);
+    if (size == 2) gfx->setFont(&TramliSmall);
+    else           gfx->setFont(&TramliLarge);
+    gfx->setTextSize(1);
+    int16_t x1, y1; uint16_t w, h;
     gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
     return (int16_t)w;
 }
 
-// ── Draw text at x,y ─────────────────────────────────────────────────────────
+// ── Draw text at x,y (y = top of the character cell) ─────────────────────────
 static void draw_text(const String& s, int16_t x, int16_t y,
                       uint8_t size, uint16_t color) {
-    gfx->setTextSize(size);
-    gfx->setTextColor(color, BLACK);
-    gfx->setCursor(x, y);
+    int asc;
+    if (size == 2) { gfx->setFont(&TramliSmall); asc = SMALL_ASCENT; }
+    else           { gfx->setFont(&TramliLarge);  asc = LARGE_ASCENT; }
+    gfx->setTextSize(1);
+    gfx->setTextColor(color);
+    gfx->setCursor(x, y + asc);   // GFX fonts use baseline as cursor origin
     gfx->print(s);
 }
 
@@ -144,7 +154,7 @@ void display_show_status(const char* message) {
     s_last_fetch_time   = -1;   // force full redraw on next display_draw_board
     s_last_clock_minute = -1;
     gfx->fillScreen(BLACK);
-    String s = to_ascii(message);
+    String s = to_latin1(message);
     int16_t w = text_w(s, 2);
     draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 8, 2, COLOR_ROWS);
 }
@@ -218,7 +228,7 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     int dots_x  = (dots_w > 0) ? (rx -= 8, rx -= dots_w, rx) : rx;
 
     // Stop label (strip "City, " prefix if too long)
-    String label = to_ascii(stop_name);
+    String label = to_latin1(stop_name);
     int label_max = dots_x - PAD - 8;
     if (text_w(label, 2) > label_max) {
         int comma = label.indexOf(", ");
@@ -267,18 +277,18 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
     for (int i = 0; i < count; i++) {
         const Departure& dep = departures[i];
         int y      = rows_top + i * row_h;
-        int text_y = y + (row_h - 24) / 2;
+        int text_y = y + (row_h - 28) / 2;
 
         bool disrupted = (dep.delay >= 2);
         uint16_t color = disrupted ? COLOR_DIM
                         : (i == 0  ? COLOR_ROW0 : COLOR_ROWS);
 
         // Line number — right-aligned in number column
-        String ln = to_ascii(dep.line);
+        String ln = to_latin1(dep.line);
         draw_text(ln, num_col_end - text_w(ln, 3), text_y, 3, color);
 
         // Destination — truncated to fit, leaving room for delay badge + time
-        String dest     = to_ascii(dep.destination);
+        String dest     = to_latin1(dep.destination);
         int dest_max_w  = SCREEN_W - dest_start - right_margin - PAD;
         if (disrupted) dest_max_w -= 52;  // extra room for "+Xm" badge
         while (dest.length() > 1 && text_w(dest, 3) > dest_max_w)
@@ -323,7 +333,7 @@ static void draw_footer(const char* weather_str, const char* uv_str,
     int x   = PAD;
 
     if (weather_str && strlen(weather_str) > 0) {
-        String s = to_ascii(weather_str);
+        String s = to_latin1(weather_str);
         draw_text(s, x, ty, 2, COLOR_ROWS);
         x += text_w(s, 2) + 14;
     }
@@ -339,7 +349,7 @@ static void draw_footer(const char* weather_str, const char* uv_str,
         x += 28;                        // wider gap after umbrella
     }
     if (uv_str && strlen(uv_str) > 0) {
-        String s = to_ascii(uv_str);
+        String s = to_latin1(uv_str);
         draw_text(s, x, ty, 2, COLOR_ROWS);
         x += text_w(s, 2) + 16;
     }
@@ -396,6 +406,7 @@ void display_draw_board(
 // ── Boot animation ────────────────────────────────────────────────────────────
 void display_boot_animation(uint16_t duration_ms) {
     if (!gfx) return;
+    gfx->setFont((GFXfont*)nullptr);   // built-in font for the rain effect
 
     const int CW   = 12;            // char width at textSize 2
     const int CH   = 16;            // char height at textSize 2
