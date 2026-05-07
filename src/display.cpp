@@ -39,6 +39,10 @@ static time_t    s_last_fetch_time    = -1;
 static int       s_last_clock_minute  = -1;
 static uint32_t  s_last_weather_hash  = 0xFFFFFFFF;
 static bool      s_footer_static_drawn = false;
+// Flight screen partial-redraw state
+static int    s_flight_last_slot   = -1;
+static int    s_flight_last_minute = -1;
+static time_t s_flight_last_fetch  = -1;
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -181,6 +185,9 @@ void display_invalidate() {
     s_last_fetch_time     = -1;
     s_last_clock_minute   = -1;
     s_footer_static_drawn = false;
+    s_flight_last_slot    = -1;
+    s_flight_last_minute  = -1;
+    s_flight_last_fetch   = -1;
 }
 
 // ── Umbrella icon ─────────────────────────────────────────────────────────────
@@ -492,65 +499,256 @@ void display_draw_board(
     draw_footer_dynamic(fy, from_cache, wifi_ok, age_seconds, large_font_mode, countdown_target, countdown_icon);
 }
 
-// ── Boot animation ────────────────────────────────────────────────────────────
-void display_boot_animation(uint16_t duration_ms) {
-    if (!gfx) return;
+// ── Flight screen ─────────────────────────────────────────────────────────────
 
-    const int CW   = MATRIX_FONT_W;          // 8px — monospace cell width
-    const int CH   = MATRIX_FONT_H;          // 17px — cell height (yAdvance)
-    const int ASC  = MATRIX_FONT_ASC;        // 14px — baseline offset from cell top
-    const int COLS = SCREEN_W / CW;          // 60 columns
-    const int ROWS = SCREEN_H / CH;          // 13 rows
+// Plane icon pointing right, centered at (cx, cy), ~14×10 px
+static void draw_plane_right(int cx, int cy, uint16_t col) {
+    gfx->fillRect(cx - 6, cy - 1, 12, 3, col);  // fuselage
+    gfx->fillRect(cx + 5, cy,      2, 1, col);  // nose tip
+    gfx->fillRect(cx - 1, cy - 5,  3, 11, col); // main wing
+    gfx->fillRect(cx - 6, cy - 3,  3, 7, col);  // tail body
+}
+
+// Heading arrow: simple 6×6 compass indicator
+static const char* heading_label(float deg) {
+    if (deg < 22.5f || deg >= 337.5f)  return "N";
+    if (deg < 67.5f)  return "NE";
+    if (deg < 112.5f) return "E";
+    if (deg < 157.5f) return "SE";
+    if (deg < 202.5f) return "S";
+    if (deg < 247.5f) return "SW";
+    if (deg < 292.5f) return "W";
+    return "NW";
+}
+
+static void draw_flight_footer(time_t now_t, const FlightInfo& fi, bool wifi_ok) {
+    int fy = SCREEN_H - FOOTER_H;
+    gfx->drawFastHLine(0, fy, SCREEN_W, rgb(20, 12, 0));
+
+    char age_buf[16] = "no data";
+    if (fi.fetched_at > 0 && now_t >= fi.fetched_at) {
+        int age_s = (int)(now_t - fi.fetched_at);
+        if (age_s < 60)        snprintf(age_buf, sizeof(age_buf), "now");
+        else if (age_s < 3600) snprintf(age_buf, sizeof(age_buf), "%dm", age_s / 60);
+        else                   snprintf(age_buf, sizeof(age_buf), "%dh", age_s / 3600);
+    }
+    String age_str = age_buf;
+    int ty = fy + (FOOTER_H - 16) / 2;
+    int16_t aw = text_w(age_str, 2);
+    draw_text(age_str, SCREEN_W - PAD - 14 - aw, ty, 2, COLOR_ROW0);
+
+    String hint = "swipe left for stops";
+    draw_text(hint, PAD, ty, 2, COLOR_META);
+
+    uint16_t dot = wifi_ok ? COLOR_META : ((millis() / 500) % 2 == 0 ? rgb(180,30,0) : BLACK);
+    gfx->fillRect(SCREEN_W - PAD - 6, fy + (FOOTER_H - 6) / 2, 6, 6, dot);
+}
+
+static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
+    const int CTY    = HEADER_H + 4;
+    const int CTH    = SCREEN_H - FOOTER_H - HEADER_H - 4;
+    const int APT_Y  = CTY + 4;
+    const int BAR_Y  = CTY + 60;
+    const int STATS_Y = CTY + 86;
+    const int TIMES_Y = CTY + 112;
+
+    if (fi.callsign.isEmpty()) {
+        String msg = "No flight configured";
+        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + CTH / 2 - 8, 2, COLOR_META);
+        return;
+    }
+    if (!fi.valid) {
+        String msg = "Searching...";
+        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + CTH / 2 - 8, 2, COLOR_META);
+        return;
+    }
+
+    // Airport codes
+    String dep = fi.dep_icao.length() > 0 ? fi.dep_icao : "????";
+    String arr = fi.arr_icao.length() > 0 ? fi.arr_icao : "????";
+    int16_t dep_w = text_w(dep, 3);
+    int16_t arr_w = text_w(arr, 3);
+    draw_text(dep, PAD,                        APT_Y, 3, COLOR_ROW0);
+    draw_text(arr, SCREEN_W - PAD - arr_w,     APT_Y, 3, COLOR_ROW0);
+
+    // Status label (centered, below airport codes)
+    String status_str;
+    if (fi.airborne)                                    status_str = "In flight";
+    else if (fi.arr_time > 0 && now_t > fi.arr_time)   status_str = "Landed";
+    else if (fi.dep_time > 0 && now_t < fi.dep_time)   status_str = "Pre-flight";
+    else if (!fi.on_ground)                             status_str = "In flight";
+    else                                                status_str = "On ground";
+    draw_text(status_str, (SCREEN_W - text_w(status_str, 2)) / 2, APT_Y + 30, 2, COLOR_META);
+
+    // Progress bar + plane marker
+    float progress = 0.0f;
+    if (fi.dep_time > 0 && fi.arr_time > 0) {
+        if (now_t <= fi.dep_time)      progress = 0.0f;
+        else if (now_t >= fi.arr_time) progress = 1.0f;
+        else progress = (float)(now_t - fi.dep_time) / (float)(fi.arr_time - fi.dep_time);
+    } else if (fi.dep_time > 0 && fi.arr_time == 0 && fi.airborne) {
+        long elapsed = (long)(now_t - fi.dep_time);
+        progress = elapsed / (10.0f * 3600.0f);
+        if (progress > 0.95f) progress = 0.95f;
+    }
+
+    const int BAR_LX = PAD + dep_w + 14;
+    const int BAR_RX = SCREEN_W - PAD - arr_w - 14;
+    const int BAR_W  = BAR_RX - BAR_LX;
+    if (BAR_W > 20) {
+        gfx->drawFastHLine(BAR_LX, BAR_Y + 1, BAR_W, COLOR_META);
+        int plane_cx = BAR_LX + (int)(progress * BAR_W);
+        if (plane_cx < BAR_LX + 7) plane_cx = BAR_LX + 7;
+        if (plane_cx > BAR_RX - 7) plane_cx = BAR_RX - 7;
+        draw_plane_right(plane_cx, BAR_Y, COLOR_ROW0);
+    }
+
+    // Stats row: altitude, speed, heading (only when airborne + data present)
+    if (fi.airborne && fi.alt_ft > 0) {
+        char alt_buf[16], spd_buf[12], hdg_buf[6];
+        snprintf(alt_buf, sizeof(alt_buf), "%dft",  (int)roundf(fi.alt_ft / 100.0f) * 100);
+        snprintf(spd_buf, sizeof(spd_buf), "%dkm/h", (int)roundf(fi.speed_kmh));
+        snprintf(hdg_buf, sizeof(hdg_buf), "%s",     heading_label(fi.heading));
+        String alt_s = alt_buf, spd_s = spd_buf, hdg_s = hdg_buf;
+        int gap = 22;
+        int total_w = text_w(alt_s, 2) + gap + text_w(spd_s, 2) + gap + text_w(hdg_s, 2);
+        int sx = (SCREEN_W - total_w) / 2;
+        draw_text(alt_s, sx, STATS_Y, 2, COLOR_ROW0);  sx += text_w(alt_s, 2) + gap;
+        draw_text(spd_s, sx, STATS_Y, 2, COLOR_ROW0);  sx += text_w(spd_s, 2) + gap;
+        draw_text(hdg_s, sx, STATS_Y, 2, COLOR_ROW0);
+    }
+
+    // Times row: dep_time > arr_time
+    if (fi.dep_time > 0 || fi.arr_time > 0) {
+        char dep_tbuf[12] = "--:--";
+        char arr_tbuf[14] = "--:--";
+        if (fi.dep_time > 0) {
+            struct tm td; localtime_r(&fi.dep_time, &td);
+            snprintf(dep_tbuf, sizeof(dep_tbuf), "%02d:%02d", td.tm_hour, td.tm_min);
+        }
+        if (fi.arr_time > 0) {
+            struct tm ta; localtime_r(&fi.arr_time, &ta);
+            if (fi.dep_time > 0) {
+                struct tm td2; localtime_r(&fi.dep_time, &td2);
+                int delta_days = ta.tm_yday - td2.tm_yday;
+                if (delta_days != 0)
+                    snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d+%d",
+                             ta.tm_hour, ta.tm_min, delta_days);
+                else
+                    snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
+            } else {
+                snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
+            }
+        }
+        String dep_ts = dep_tbuf, arr_ts = arr_tbuf, arrow = " > ";
+        int16_t dw = text_w(dep_ts, 2), arw = text_w(arrow, 2), aw2 = text_w(arr_ts, 2);
+        int tx = (SCREEN_W - dw - arw - aw2) / 2;
+        draw_text(dep_ts, tx,       TIMES_Y, 2, COLOR_ROW0); tx += dw;
+        draw_text(arrow,  tx,       TIMES_Y, 2, COLOR_META); tx += arw;
+        draw_text(arr_ts, tx,       TIMES_Y, 2, COLOR_ROW0);
+    } else {
+        String nd = "No schedule data";
+        draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, TIMES_Y, 2, COLOR_META);
+    }
+}
+
+void display_draw_flight(int slot, int flight_count, const FlightInfo& fi, bool wifi_ok) {
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now_t, &tm_now);
+    int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
+
+    bool slot_changed   = (slot != s_flight_last_slot);
+    bool minute_changed = (cur_minute != s_flight_last_minute);
+    bool data_changed   = (fi.fetched_at != s_flight_last_fetch);
+    if (!slot_changed && !minute_changed && !data_changed) return;
+
+    s_flight_last_slot   = slot;
+    s_flight_last_minute = cur_minute;
+    s_flight_last_fetch  = fi.fetched_at;
+
+    gfx->fillScreen(BLACK);
+
+    // Header
+    {
+        char clock_buf[6] = "--:--";
+        if (now_t > 1700000000)
+            snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d", tm_now.tm_hour, tm_now.tm_min);
+        String clock_str = clock_buf;
+        int clock_x = SCREEN_W - PAD - text_w(clock_str, 2);
+        int dots_x  = clock_x - 8 - flight_count * 12;
+        int dot_y   = (HEADER_H - 6) / 2;
+        for (int i = 0; i < flight_count; i++)
+            gfx->fillRect(dots_x + i * 12, dot_y, 6, 6, (i == slot) ? COLOR_ROW0 : COLOR_META);
+        String cs = fi.callsign.length() > 0 ? fi.callsign : "Flight";
+        draw_plane_right(PAD + 7, HEADER_H / 2, COLOR_ROW0);
+        draw_text(cs,         PAD + 18, (HEADER_H - 16) / 2, 2, COLOR_ROW0);
+        draw_text(clock_str,  clock_x,  (HEADER_H - 16) / 2, 2, COLOR_ROW0);
+        gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, COLOR_META);
+    }
+
+    draw_flight_content(now_t, fi);
+    draw_flight_footer(now_t, fi, wifi_ok);
+}
+
+// ── Boot animation — runs as a FreeRTOS task so setup() can proceed alongside ──
+static volatile bool  s_anim_running      = false;
+static TaskHandle_t   s_anim_task_handle  = nullptr;
+
+static const uint16_t TRAIL[] = { COLOR_ROW0, COLOR_ROWS, COLOR_DIM, COLOR_META };
+
+static void anim_task_fn(void*) {
+    const int CW   = MATRIX_FONT_W;
+    const int CH   = MATRIX_FONT_H;
+    const int ASC  = MATRIX_FONT_ASC;
+    const int COLS = SCREEN_W / CW;
+    const int ROWS = SCREEN_H / CH;
 
     gfx->setFont(&MatrixCode);
     gfx->setTextSize(1);
     gfx->fillScreen(BLACK);
 
-    // Stagger column starts so they don't all fall together
     int8_t heads[64];
     for (int i = 0; i < COLS && i < 64; i++)
         heads[i] = (int8_t)(-random(ROWS * 2));
 
-    uint32_t start = millis(), last = 0;
-    while (millis() - start < duration_ms) {
-        if (millis() - last < 80) { delay(5); continue; }
-        last = millis();
+    uint32_t last = 0;
+    while (s_anim_running) {
+        uint32_t now = millis();
+        if (now - last < 70) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+        last = now;
+
+        gfx->setFont(&MatrixCode);
+        gfx->setTextSize(1);
 
         for (int c = 0; c < COLS && c < 64; c++) {
             int x = c * CW;
-
-            // Fade old head to medium color
-            int p1 = heads[c] - 1;
-            if (p1 >= 0 && p1 < ROWS) {
-                gfx->setTextColor(COLOR_ROWS, BLACK);
-                gfx->setCursor(x, p1 * CH + ASC);
-                gfx->print((char)(33 + random(94)));
+            for (int t = 0; t < 4; t++) {
+                int row = heads[c] - 1 - t;
+                if (row >= 0 && row < ROWS) {
+                    gfx->setTextColor(TRAIL[t], BLACK);
+                    gfx->setCursor(x, row * CH + ASC);
+                    gfx->print((char)(33 + random(94)));
+                }
             }
-            // Older trail to dim
-            int p3 = heads[c] - 3;
-            if (p3 >= 0 && p3 < ROWS) {
-                gfx->setTextColor(COLOR_DIM, BLACK);
-                gfx->setCursor(x, p3 * CH + ASC);
-                gfx->print((char)(33 + random(94)));
-            }
-            // Erase tail end
-            int pe = heads[c] - 5;
+            int pe = heads[c] - 6;
             if (pe >= 0 && pe < ROWS)
                 gfx->fillRect(x, pe * CH, CW, CH, BLACK);
-
-            // Bright head
             if (heads[c] >= 0 && heads[c] < ROWS) {
                 gfx->setTextColor(WHITE, BLACK);
                 gfx->setCursor(x, heads[c] * CH + ASC);
                 gfx->print((char)(33 + random(94)));
             }
-
-            if (++heads[c] > ROWS + 5)
+            if (++heads[c] > ROWS + 6)
                 heads[c] = (int8_t)(-random(ROWS / 2));
         }
+
     }
 
-    // Wipe screen with random column order
+    // Wipe with random column order then signal done
     int order[64];
     for (int i = 0; i < COLS && i < 64; i++) order[i] = i;
     for (int i = COLS - 1; i > 0; i--) {
@@ -559,6 +757,21 @@ void display_boot_animation(uint16_t duration_ms) {
     }
     for (int i = 0; i < COLS && i < 64; i++) {
         gfx->fillRect(order[i] * CW, 0, CW, SCREEN_H, BLACK);
-        delay(8);
+        vTaskDelay(pdMS_TO_TICKS(8));
     }
+
+    s_anim_task_handle = nullptr;
+    vTaskDelete(nullptr);
+}
+
+void display_boot_animation_start() {
+    if (!gfx) return;
+    s_anim_running = true;
+    xTaskCreatePinnedToCore(anim_task_fn, "boot_anim", 4096, nullptr,
+                            1, &s_anim_task_handle, 1);
+}
+
+void display_boot_animation_stop() {
+    s_anim_running = false;
+    while (s_anim_task_handle != nullptr) vTaskDelay(pdMS_TO_TICKS(10));
 }

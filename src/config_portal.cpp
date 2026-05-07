@@ -24,8 +24,10 @@
 #define NVS_KEY_WIFI        "wifi"
 #define NVS_KEY_STOPS       "stops"
 #define NVS_KEY_COUNTDOWN   "countdown"
+#define NVS_KEY_FLIGHTS     "flights"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
+#define MAX_FLIGHTS     2
 
 static WebServer  s_server(80);
 static DNSServer  s_dns;
@@ -90,9 +92,31 @@ bool config_load_countdown(String& label, String& target_str, int& icon) {
     return target_str.length() >= 16;
 }
 
+int config_load_flights(FlightEntry entries[]) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_FLIGHTS, "");
+    prefs.end();
+    if (json.isEmpty()) return 0;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return 0;
+    JsonArray arr = doc.as<JsonArray>();
+    int n = 0;
+    for (JsonObject o : arr) {
+        if (n >= MAX_FLIGHTS) break;
+        entries[n].callsign = o["c"] | "";
+        entries[n].dep_date = o["d"] | "";
+        entries[n].callsign.trim();
+        if (entries[n].callsign.length() > 0) n++;
+    }
+    return n;
+}
+
 static void save_to_nvs(String ssids[], String passes[], int n_wifi,
                          StopEntry stops[], int n_stops,
-                         const String& cd_label, const String& cd_target, int cd_icon) {
+                         const String& cd_label, const String& cd_target, int cd_icon,
+                         FlightEntry flights[], int n_flights) {
     // WiFi JSON
     JsonDocument wdoc;
     JsonArray warr = wdoc.to<JsonArray>();
@@ -133,9 +157,25 @@ static void save_to_nvs(String ssids[], String passes[], int n_wifi,
     } else {
         prefs.remove(NVS_KEY_COUNTDOWN);
     }
+
+    // Flights JSON
+    if (n_flights > 0) {
+        JsonDocument fldoc;
+        JsonArray flarr = fldoc.to<JsonArray>();
+        for (int i = 0; i < n_flights; i++) {
+            JsonObject o = flarr.add<JsonObject>();
+            o["c"] = flights[i].callsign;
+            o["d"] = flights[i].dep_date;
+        }
+        String fl_json;
+        serializeJson(fldoc, fl_json);
+        prefs.putString(NVS_KEY_FLIGHTS, fl_json);
+    } else {
+        prefs.remove(NVS_KEY_FLIGHTS);
+    }
     prefs.end();
 
-    Serial.printf("[Portal] Saved %d WiFi, %d stops to NVS\n", n_wifi, n_stops);
+    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS\n", n_wifi, n_stops, n_flights);
 }
 
 // ── HTML builder ──────────────────────────────────────────────────────────────
@@ -155,7 +195,8 @@ static String html_encode(const String& s) {
 
 static String build_page(String ssids[], String passes[],
                           StopEntry stops[], int n_stops,
-                          const String& cd_label, const String& cd_target, int cd_icon) {
+                          const String& cd_label, const String& cd_target, int cd_icon,
+                          FlightEntry flights[], int n_flights) {
     String h;
     h.reserve(10000);
 
@@ -267,6 +308,29 @@ static String build_page(String ssids[], String passes[],
          + String(cd_icon) + "'>";
     h += F("</div>");
 
+    // ── Flights section ──────────────────────────────────────────────────────
+    h += F("<h2>Flights</h2>"
+           "<p class='hint' style='margin:-4px 0 10px'>Swipe down/up on the device to see flight status. "
+           "Enter the ICAO callsign (e.g. <b>SWR161</b> for Swiss LX161 &mdash; "
+           "find it on flightradar24.com).</p>");
+    const char* swipe_label[] = { "swipe down", "swipe up" };
+    for (int i = 0; i < MAX_FLIGHTS; i++) {
+        String cs  = (i < n_flights) ? flights[i].callsign : "";
+        String dat = (i < n_flights) ? flights[i].dep_date : "";
+        h += "<div class='card'><div class='ct'>Flight ";
+        h += String(i + 1);
+        h += " <span style='font-weight:normal;color:#666'>(";
+        h += swipe_label[i];
+        h += ")</span></div>";
+        h += "<label>ICAO callsign <span class='hint'>e.g. SWR161, EZS3QV</span></label>"
+             "<input type='text' name='fl" + String(i) + "c' placeholder='e.g. SWR161' value='"
+             + html_encode(cs) + "'>";
+        h += "<label>Departure date</label>"
+             "<input type='date' name='fl" + String(i) + "d' value='"
+             + html_encode(dat) + "'>";
+        h += "</div>";
+    }
+
     h += F("<button type='submit'>&#128190;&nbsp; Save &amp; Reboot</button>"
            "</form>"
            "<script>"
@@ -325,9 +389,13 @@ static int s_n_stops = 0;
 static String s_cd_label;
 static String s_cd_target;
 static int    s_cd_icon = 0;
+static FlightEntry s_flights[MAX_FLIGHTS];
+static int         s_n_flights = 0;
 
 static void handle_root() {
-    String page = build_page(s_ssids, s_passes, s_stops, s_n_stops, s_cd_label, s_cd_target, s_cd_icon);
+    String page = build_page(s_ssids, s_passes, s_stops, s_n_stops,
+                             s_cd_label, s_cd_target, s_cd_icon,
+                             s_flights, s_n_flights);
     s_server.send(200, "text/html", page);
 }
 
@@ -369,7 +437,21 @@ static void handle_save() {
     int    cd_icon   = s_server.arg("cd_icon").toInt();
     if (cd_icon < 0 || cd_icon > 3) cd_icon = 0;
 
-    save_to_nvs(new_ssids, new_passes, n_wifi, new_stops, n_stops, cd_label, cd_target, cd_icon);
+    // Parse flights
+    FlightEntry new_flights[MAX_FLIGHTS];
+    int n_flights = 0;
+    for (int i = 0; i < MAX_FLIGHTS; i++) {
+        String cs  = s_server.arg("fl" + String(i) + "c"); cs.trim();
+        String dat = s_server.arg("fl" + String(i) + "d"); dat.trim();
+        if (cs.length() > 0) {
+            new_flights[n_flights].callsign = cs;
+            new_flights[n_flights].dep_date = dat;
+            n_flights++;
+        }
+    }
+
+    save_to_nvs(new_ssids, new_passes, n_wifi, new_stops, n_stops,
+                cd_label, cd_target, cd_icon, new_flights, n_flights);
 
     s_server.send(200, "text/html",
         F("<!DOCTYPE html><html><head>"
@@ -429,8 +511,9 @@ void config_portal_run(uint32_t timeoutMs) {
     int n_wifi = config_load_wifi(s_ssids, s_passes);
     // Fill empty slots so the form shows blanks
     for (int i = n_wifi; i < MAX_WIFI; i++) { s_ssids[i] = ""; s_passes[i] = ""; }
-    s_n_stops = config_load_stops(s_stops);
+    s_n_stops  = config_load_stops(s_stops);
     config_load_countdown(s_cd_label, s_cd_target, s_cd_icon);
+    s_n_flights = config_load_flights(s_flights);
 
     // Start AP
     WiFi.disconnect(true);

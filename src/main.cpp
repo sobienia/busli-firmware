@@ -15,6 +15,7 @@
 #include "display.h"
 #include "api.h"
 #include "weather.h"
+#include "../include/flight_tracker.h"
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  HARDCODED STOP DEFAULTS — used when NVS has no saved stops               ║
@@ -104,6 +105,13 @@ static uint32_t last_redraw_ms    = 0;
 static time_t   g_countdown_target = 0;
 static int      g_countdown_icon   = 0;
 
+// Flight tracking
+enum View { VIEW_BOARD, VIEW_FLIGHT0, VIEW_FLIGHT1 };
+static View     g_view            = VIEW_BOARD;
+static int      g_flight_count    = 0;
+static uint32_t g_last_flight_ms[2] = {0, 0};
+#define FLIGHT_REFRESH_MS  (5UL * 60 * 1000)
+
 static WeatherData weather_data    = {};
 static uint32_t    last_weather_ms = 0;
 
@@ -135,7 +143,6 @@ static bool try_connect(const String& ssid, const String& pass, uint32_t timeout
 }
 
 static bool connect_wifi() {
-    display_show_status("Connecting...");
     WiFi.mode(WIFI_STA);
 
     // Try NVS-stored networks first
@@ -149,7 +156,6 @@ static bool connect_wifi() {
     if (try_connect(WIFI_SSID, WIFI_PASSWORD)) return true;
 
     Serial.println("[WiFi] All credentials failed");
-    display_show_status("WiFi failed");
     return false;
 }
 
@@ -159,7 +165,6 @@ static bool connect_wifi() {
 
 static void sync_clock() {
     Serial.println("[NTP] Syncing time...");
-    display_show_status("Syncing time...");
     configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
     uint32_t start = millis();
     time_t now = 0;
@@ -176,6 +181,7 @@ static void sync_clock() {
 }
 
 static void switch_stop(int new_idx) {
+    g_view           = VIEW_BOARD;
     current_stop_idx = new_idx;
     fetch_task_set_active_stop(new_idx);
     display_invalidate();
@@ -227,15 +233,34 @@ static void check_touch() {
             break;
         case TOUCH_LONG_PRESS:
             Serial.println("[Touch] Long press → force refresh");
-            fetch_task_force_refresh();
+            if (g_view == VIEW_BOARD) {
+                fetch_task_force_refresh();
+            } else {
+                int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
+                flight_tracker_refresh(slot);
+                g_last_flight_ms[slot] = millis();
+                display_invalidate();
+            }
             break;
         case TOUCH_DOUBLE_TAP:
             Serial.println("[Touch] Double tap → toggle font size");
             large_font_mode = !large_font_mode;
             display_invalidate();
             break;
-        case TOUCH_SWIPE_UP:
         case TOUCH_SWIPE_DOWN:
+            if (g_flight_count > 0) {
+                Serial.println("[Touch] Swipe down → flight 1");
+                if (g_view != VIEW_FLIGHT0) { g_view = VIEW_FLIGHT0; display_invalidate(); }
+            }
+            break;
+        case TOUCH_SWIPE_UP:
+            if (g_flight_count > 1) {
+                Serial.println("[Touch] Swipe up → flight 2");
+                if (g_view != VIEW_FLIGHT1) { g_view = VIEW_FLIGHT1; display_invalidate(); }
+            } else if (g_flight_count == 1) {
+                Serial.println("[Touch] Swipe up → flight 1");
+                if (g_view != VIEW_FLIGHT0) { g_view = VIEW_FLIGHT0; display_invalidate(); }
+            }
             break;
         default:
             break;
@@ -258,7 +283,7 @@ void setup() {
 
     display_init();
     touch_init();
-    display_boot_animation(2500);
+    display_boot_animation_start();
 
     setup_stops();
 
@@ -288,11 +313,23 @@ void setup() {
         }
     }
 
-    display_show_status("Loading...");
     fetch_task_start(g_stop_configs, g_num_stops);
+
+    {
+        FlightEntry fl_entries[2];
+        g_flight_count = config_load_flights(fl_entries);
+        if (g_flight_count > 0) {
+            Serial.printf("[Flights] %d flight(s) configured\n", g_flight_count);
+            flight_tracker_init(fl_entries, g_flight_count);
+            for (int i = 0; i < g_flight_count; i++)
+                g_last_flight_ms[i] = millis();
+        }
+    }
 
     weather_fetch(weather_data);
     last_weather_ms = millis();
+
+    display_boot_animation_stop();  // wipes screen, then returns
 }
 
 void loop() {
@@ -307,46 +344,66 @@ void loop() {
         last_weather_ms = now_ms;
     }
 
+    // Background flight data refresh (every 5 min per slot, non-blocking check)
+    if (g_flight_count > 0) {
+        for (int i = 0; i < g_flight_count; i++) {
+            if (now_ms - g_last_flight_ms[i] >= FLIGHT_REFRESH_MS) {
+                flight_tracker_refresh(i);
+                g_last_flight_ms[i] = millis();
+                if (g_view == VIEW_FLIGHT0 && i == 0) display_invalidate();
+                if (g_view == VIEW_FLIGHT1 && i == 1) display_invalidate();
+                break;  // refresh one slot per loop to avoid long blocking back-to-back
+            }
+        }
+    }
+
     // Redraw every second (clock + age counter)
     if (now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
 
-        std::vector<Departure> departures;
-        time_t fetch_time;
-        bool   from_cache;
-        fetch_task_get(current_stop_idx, departures, fetch_time, from_cache);
+        if (g_view == VIEW_BOARD) {
+            std::vector<Departure> departures;
+            time_t fetch_time;
+            bool   from_cache;
+            fetch_task_get(current_stop_idx, departures, fetch_time, from_cache);
 
-        const StopConfig& stop = g_stop_configs[current_stop_idx];
-        time_t now_t  = time(nullptr);
-        int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
+            const StopConfig& stop = g_stop_configs[current_stop_idx];
+            time_t now_t  = time(nullptr);
+            int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
 
-        char weather_str[20] = "";
-        char uv_str[10]      = "";
-        if (weather_data.valid) {
-            snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
-                     (int)roundf(weather_data.temp_c),
-                     (int)roundf(weather_data.temp_max_c));
-            snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
-                     weather_data.uv_index, weather_data.uv_index_max);
+            char weather_str[20] = "";
+            char uv_str[10]      = "";
+            if (weather_data.valid) {
+                snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
+                         (int)roundf(weather_data.temp_c),
+                         (int)roundf(weather_data.temp_max_c));
+                snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
+                         weather_data.uv_index, weather_data.uv_index_max);
+            }
+
+            display_draw_board(
+                stop.label,
+                current_stop_idx,
+                g_num_stops,
+                departures,
+                weather_str,
+                uv_str,
+                weather_data.valid && weather_data.rain_today,
+                weather_data.valid ? weather_data.precip_prob_pct : 0,
+                from_cache,
+                WiFi.status() == WL_CONNECTED,
+                age_s,
+                fetch_time,
+                large_font_mode,
+                g_countdown_target,
+                g_countdown_icon
+            );
+        } else {
+            int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
+            FlightInfo fi;
+            flight_tracker_get(slot, fi);
+            display_draw_flight(slot, g_flight_count, fi, WiFi.status() == WL_CONNECTED);
         }
-
-        display_draw_board(
-            stop.label,
-            current_stop_idx,
-            g_num_stops,
-            departures,
-            weather_str,
-            uv_str,
-            weather_data.valid && weather_data.rain_today,
-            weather_data.valid ? weather_data.precip_prob_pct : 0,
-            from_cache,
-            WiFi.status() == WL_CONNECTED,
-            age_s,
-            fetch_time,
-            large_font_mode,
-            g_countdown_target,
-            g_countdown_icon
-        );
     }
 
     // Reconnect WiFi if dropped — 30s interval avoids AUTH_LEAVE floods

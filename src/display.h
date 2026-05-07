@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <vector>
+#include "../include/flight_tracker.h"
 
 // One transit departure (used by both display and api modules)
 struct Departure {
@@ -49,5 +50,13 @@ void display_draw_board(
 // or any other event that clears the screen externally).
 void display_invalidate();
 
-// Boot animation (Matrix-style cascading characters)
-void display_boot_animation(uint16_t duration_ms);
+// Draw the flight tracking screen for one slot.
+// slot/flight_count drive the dot indicator in the header (like stop dots).
+// If fi.callsign is empty, shows a "No flight configured" placeholder.
+void display_draw_flight(int slot, int flight_count, const FlightInfo& fi, bool wifi_ok);
+
+// Boot animation (Matrix-style cascading characters).
+// Start it before the blocking setup steps; update the status text as each
+// phase begins; stop it when the board is ready to appear.
+void display_boot_animation_start();
+void display_boot_animation_stop();
