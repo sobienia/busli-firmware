@@ -33,9 +33,18 @@ static void do_fetch(int idx) {
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (ok) {
-        s_cache[idx].departures   = fresh;
-        s_cache[idx].fetch_time   = time(nullptr);
-        s_cache[idx].from_cache   = false;
+        bool had_data    = !s_cache[idx].departures.empty();
+        bool cache_stale = !s_cache[idx].ever_fetched ||
+                           (time(nullptr) - s_cache[idx].fetch_time) > 600;
+
+        if (!fresh.empty() || !had_data || cache_stale) {
+            // Accept new result: either it has data, we had nothing, or cache is old enough
+            // that 0 results likely means genuine end of service.
+            s_cache[idx].departures = fresh;
+            s_cache[idx].fetch_time = time(nullptr);
+            s_cache[idx].from_cache = false;
+        }
+        // else: transient empty result — keep previous departures, don't update fetch_time
         s_cache[idx].ever_fetched = true;
     } else {
         s_cache[idx].from_cache = true;
@@ -93,6 +102,11 @@ void fetch_task_get(int stop_idx,
 
 void fetch_task_set_active_stop(int new_idx) {
     s_active_stop = new_idx;
+    // If this stop has never been fetched, prioritise it immediately
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool needs_fetch = !s_cache[new_idx].ever_fetched;
+    xSemaphoreGive(s_mutex);
+    if (needs_fetch) s_force_refresh = true;
 }
 
 void fetch_task_force_refresh() {

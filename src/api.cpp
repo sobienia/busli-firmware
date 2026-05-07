@@ -6,50 +6,43 @@
 #include "../include/config.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>
 #include <time.h>
 
-// Convert ISO 8601 timestamp to a time_t (UTC epoch).
-// Handles formats with explicit timezone offsets:
-//   "2026-04-28T18:30:00+0200"  → 16:30 UTC
-//   "2026-04-28T18:30:00+02:00" → 16:30 UTC
-//   "2026-04-28T18:30:00Z"      → 18:30 UTC
-//   "2026-04-28T18:30:00"       → assumed UTC (fallback)
-// Returns 0 on parse error.
+// Compute UTC epoch from calendar fields without any TZ manipulation.
+// Thread-safe: no global state touched.
+static time_t make_utc(int yr, int mo, int dy, int hr, int mn, int sc) {
+    static const uint16_t MOFF[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    bool leap = (yr % 4 == 0) && (yr % 100 != 0 || yr % 400 == 0);
+    int yday  = MOFF[mo - 1] + dy - 1 + (leap && mo > 2 ? 1 : 0);
+    int y1    = yr - 1;
+    int leaps = (y1/4 - 492) - (y1/100 - 19) + (y1/400 - 4);
+    long days = (long)(yr - 1970) * 365 + leaps + yday;
+    return (time_t)(days * 86400L + (long)hr * 3600L + (long)mn * 60L + sc);
+}
+
+// Convert ISO 8601 timestamp to UTC epoch.
+// Handles "+0200", "+02:00", "Z", and bare local time (treated as UTC).
+// Returns 0 on parse error. Thread-safe — no setenv/tzset.
 static time_t parse_iso8601(const String& iso) {
     if (iso.length() < 19) return 0;
 
-    struct tm t = {};
-    t.tm_year = iso.substring(0, 4).toInt() - 1900;
-    t.tm_mon  = iso.substring(5, 7).toInt() - 1;
-    t.tm_mday = iso.substring(8, 10).toInt();
-    t.tm_hour = iso.substring(11, 13).toInt();
-    t.tm_min  = iso.substring(14, 16).toInt();
-    t.tm_sec  = iso.substring(17, 19).toInt();
+    int yr = iso.substring(0,  4).toInt();
+    int mo = iso.substring(5,  7).toInt();
+    int dy = iso.substring(8,  10).toInt();
+    int hr = iso.substring(11, 13).toInt();
+    int mn = iso.substring(14, 16).toInt();
+    int sc = iso.substring(17, 19).toInt();
 
-    // Treat the H:M:S as UTC first using timegm-style conversion.
-    // Arduino doesn't have timegm(), so we compute it manually:
-    // mktime() respects the current TZ env, so we temporarily switch TZ
-    // to UTC, call mktime, then restore.
-    char old_tz[64] = "";
-    const char* cur_tz = getenv("TZ");
-    if (cur_tz) strncpy(old_tz, cur_tz, sizeof(old_tz) - 1);
-    setenv("TZ", "UTC0", 1);
-    tzset();
-    time_t epoch = mktime(&t);
-    if (old_tz[0]) setenv("TZ", old_tz, 1);
-    else           unsetenv("TZ");
-    tzset();
+    if (yr < 2000 || mo < 1 || mo > 12 || dy < 1) return 0;
 
+    time_t epoch = make_utc(yr, mo, dy, hr, mn, sc);
     if (epoch <= 0) return 0;
 
-    // Now adjust for the timezone offset given in the string
     int offset_seconds = 0;
     if (iso.length() >= 20) {
         char sign = iso.charAt(19);
-        if (sign == 'Z') {
-            offset_seconds = 0;
-        } else if (sign == '+' || sign == '-') {
-            // Find offset hours/minutes — handle both "+0200" and "+02:00"
+        if (sign == '+' || sign == '-') {
             int hh = 0, mm = 0;
             if (iso.length() >= 22) hh = iso.substring(20, 22).toInt();
             if (iso.length() >= 24) {
@@ -59,8 +52,6 @@ static time_t parse_iso8601(const String& iso) {
             offset_seconds = (hh * 3600 + mm * 60) * (sign == '-' ? -1 : 1);
         }
     }
-
-    // Subtract the offset to get UTC epoch
     return epoch - offset_seconds;
 }
 
@@ -100,6 +91,81 @@ static bool matches_line(const String& line, const StopConfig& stop) {
     return false;
 }
 
+// Parse JSON body and extract matching departures.
+// Takes const char* so ArduinoJson copies strings — caller may free buf immediately after.
+static bool process_json_body(
+    const char* json, size_t json_len,
+    const StopConfig& stop,
+    std::vector<Departure>& out_departures,
+    int max_results
+) {
+    JsonDocument filter;
+    filter["stationboard"][0]["number"]                         = true;
+    filter["stationboard"][0]["to"]                             = true;
+    filter["stationboard"][0]["stop"]["departure"]              = true;
+    filter["stationboard"][0]["stop"]["prognosis"]["departure"] = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, json, json_len,
+                                               DeserializationOption::Filter(filter));
+    if (err) {
+        Serial.print("[API] JSON error: ");
+        Serial.println(err.c_str());
+        return false;
+    }
+    Serial.println("[API] JSON OK");
+
+    std::vector<Departure> results;
+    JsonArray board = doc["stationboard"];
+
+    time_t now = time(nullptr);
+    Serial.printf("[API] board=%d entries, now=%ld\n", (int)board.size(), (long)now);
+
+    int dbg_noparse = 0, dbg_past = 0, dbg_filt = 0;
+
+    for (JsonObject entry : board) {
+        String line = String((const char*)(entry["number"] | ""));
+        String dest = format_destination(
+            String((const char*)(entry["to"] | ""))
+        );
+
+        if (!matches_line(line, stop))      { dbg_filt++; continue; }
+        if (!matches_direction(dest, stop)) { dbg_filt++; continue; }
+
+        const char* sched_iso = entry["stop"]["departure"]              | "";
+        const char* prog_iso  = entry["stop"]["prognosis"]["departure"] | "";
+
+        time_t scheduled = parse_iso8601(String(sched_iso));
+        time_t actual    = (strlen(prog_iso) > 0)
+                            ? parse_iso8601(String(prog_iso))
+                            : scheduled;
+
+        if (actual == 0) { dbg_noparse++; continue; }
+
+        int delay_minutes = scheduled > 0
+            ? (int)((actual - scheduled) / 60)
+            : 0;
+        int mins_until = (int)((actual - now) / 60);
+
+        if (mins_until < 0) { dbg_past++; continue; }
+        if (mins_until > 99) mins_until = 99;
+
+        Departure d;
+        d.line        = line;
+        d.destination = dest;
+        d.minutes     = mins_until;
+        d.delay       = delay_minutes;
+        results.push_back(d);
+
+        if ((int)results.size() >= max_results) break;
+    }
+
+    out_departures = results;
+    Serial.printf("[API] Got %d departures (filt=%d noparse=%d past=%d)\n",
+                  (int)results.size(), dbg_filt, dbg_noparse, dbg_past);
+    return true;
+}
+
 bool api_fetch_departures(
     const StopConfig& stop,
     std::vector<Departure>& out_departures,
@@ -108,7 +174,6 @@ bool api_fetch_departures(
     // Build URL
     String url = API_BASE_URL;
     url += "?station=";
-    // URL-encode the station name
     String station = stop.station;
     String encoded = "";
     for (size_t i = 0; i < station.length(); i++) {
@@ -122,14 +187,14 @@ bool api_fetch_departures(
         }
     }
     url += encoded;
-    url += "&limit=6";
+    url += "&limit=" + String(API_FETCH_LIMIT);
 
     Serial.print("[API] Fetching: ");
     Serial.println(url);
 
     HTTPClient http;
     http.setTimeout(API_TIMEOUT_MS);
-    http.setReuse(false);  // fresh connection each time — more reliable on flaky WiFi
+    http.setReuse(false);
 
     if (!http.begin(url)) {
         Serial.println("[API] http.begin() failed");
@@ -145,80 +210,99 @@ bool api_fetch_departures(
         return false;
     }
 
-    // getString() handles chunked transfer encoding correctly.
-    // The field filter below keeps the parsed document tiny regardless of body size.
-    String body = http.getString();
+    int content_len = http.getSize();
+    Serial.printf("[API] Body: ~%d bytes\n", content_len);
+
+    if (content_len < 0) {
+        // Chunked transfer encoding — decode directly into a PSRAM buffer.
+        // Using heap_caps_malloc (explicit PSRAM) instead of Arduino String avoids
+        // the DRAM→PSRAM realloc path in String::concat, which silently misaligns
+        // writes when the buffer crosses from DRAM into PSRAM.
+        const int MAX_BODY = 210000;
+        char* buf = (char*)heap_caps_malloc(MAX_BODY + 1,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            http.end();
+            Serial.println("[API] PSRAM alloc failed");
+            return false;
+        }
+        int buf_len = 0;
+
+        WiFiClient& stream = http.getStream();
+        uint8_t  rb[512]; int ri = 0, rn = 0;
+        uint32_t deadline = millis() + API_TIMEOUT_MS;
+
+        auto refill = [&]() -> bool {
+            for (;;) {
+                if (millis() >= deadline) return false;
+                int got = stream.read(rb, sizeof(rb));
+                if (got > 0) { ri = 0; rn = got; return true; }
+                if (!stream.connected() && !stream.available()) return false;
+                delay(1);
+            }
+        };
+        auto rb_get = [&]() -> int {
+            if (ri >= rn && !refill()) return -1;
+            return (uint8_t)rb[ri++];
+        };
+
+        for (bool running = true; running; ) {
+            // Read chunk-size line (hex digits terminated by \r\n)
+            char hx[12]; int hl = 0;
+            for (;;) {
+                int c = rb_get();
+                if (c < 0) { running = false; break; }
+                if (c == '\n') break;
+                if (c != '\r' && hl < 11) hx[hl++] = (char)c;
+            }
+            if (!running) break;
+            hx[hl] = '\0';
+            int sz = (int)strtol(hx, nullptr, 16);
+            if (sz <= 0) break;
+
+            for (int rem = sz; rem > 0; ) {
+                if (ri >= rn && !refill()) { running = false; break; }
+                int take = min(rem, rn - ri);
+                if (buf_len + take <= MAX_BODY) {
+                    memcpy(buf + buf_len, rb + ri, take);
+                    buf_len += take;
+                }
+                ri += take; rem -= take;
+            }
+            yield();
+
+            if (rb_get() < 0 || rb_get() < 0) break;
+        }
+        buf[buf_len] = '\0';
+
+        http.end();
+        Serial.printf("[API] chunked: %d bytes\n", buf_len);
+
+        bool ok = (buf_len > 0) &&
+                  process_json_body((const char*)buf, buf_len, stop, out_departures, max_results);
+        heap_caps_free(buf);
+        return ok;
+    }
+
+    // Content-Length path — bulk read through _rxBuffer (works for smaller responses).
+    String body;
+    body.reserve(content_len + 1);
+    {
+        WiFiClient& stream = http.getStream();
+        uint32_t deadline  = millis() + API_TIMEOUT_MS;
+        uint8_t  buf[512];
+        for (int rem = content_len; rem > 0 && millis() < deadline; ) {
+            int got = stream.read(buf, min(rem, (int)sizeof(buf)));
+            if (got > 0) { body.concat((const char*)buf, got); rem -= got; }
+            else          { delay(1); }
+        }
+    }
+
     http.end();
 
-    Serial.printf("[API] Body: %d bytes\n", body.length());
-
-    if (body.length() < 10) {
-        Serial.println("[API] Body too short");
+    if (body.isEmpty()) {
+        Serial.println("[API] Empty response body");
         return false;
     }
-
-    // Only parse the four fields we need — parsed doc stays small even for 80 KB+ bodies.
-    JsonDocument filter;
-    filter["stationboard"][0]["number"]                         = true;
-    filter["stationboard"][0]["to"]                             = true;
-    filter["stationboard"][0]["stop"]["departure"]              = true;
-    filter["stationboard"][0]["stop"]["prognosis"]["departure"] = true;
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body,
-                                               DeserializationOption::Filter(filter));
-    if (err) {
-        Serial.print("[API] JSON error: ");
-        Serial.println(err.c_str());
-        return false;
-    }
-    Serial.println("[API] JSON OK");
-
-    // Extract departures, applying direction + line filters
-    std::vector<Departure> results;
-    JsonArray board = doc["stationboard"];
-
-    time_t now = time(nullptr);
-
-    for (JsonObject entry : board) {
-        String line = String((const char*)(entry["number"] | ""));
-        String dest = format_destination(
-            String((const char*)(entry["to"] | ""))
-        );
-
-        if (!matches_line(line, stop))      continue;
-        if (!matches_direction(dest, stop)) continue;
-
-        // Compute minutes until departure
-        const char* sched_iso = entry["stop"]["departure"]              | "";
-        const char* prog_iso  = entry["stop"]["prognosis"]["departure"] | "";
-
-        time_t scheduled = parse_iso8601(String(sched_iso));
-        time_t actual    = (strlen(prog_iso) > 0)
-                            ? parse_iso8601(String(prog_iso))
-                            : scheduled;
-
-        if (actual == 0) continue;
-
-        int delay_minutes = scheduled > 0
-            ? (int)((actual - scheduled) / 60)
-            : 0;
-        int mins_until = (int)((actual - now) / 60);
-
-        if (mins_until < 0) continue;        // past departures
-        if (mins_until > 99) mins_until = 99; // clamp display
-
-        Departure d;
-        d.line        = line;
-        d.destination = dest;
-        d.minutes     = mins_until;
-        d.delay       = delay_minutes;
-        results.push_back(d);
-
-        if ((int)results.size() >= max_results) break;
-    }
-
-    out_departures = results;
-    Serial.printf("[API] Got %d departures\n", (int)results.size());
-    return true;
+    return process_json_body(body.c_str(), body.length(), stop, out_departures, max_results);
 }

@@ -85,8 +85,9 @@
 // ║  TRANSIT API                                                              ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define API_BASE_URL  "http://transport.opendata.ch/v1/stationboard"
-#define API_TIMEOUT_MS 10000
+#define API_BASE_URL       "http://transport.opendata.ch/v1/stationboard"
+#define API_TIMEOUT_MS     10000
+#define API_FETCH_LIMIT    20    // entries requested per stop; more headroom for busy stations
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  WEATHER (Open-Meteo — free, no API key required)                         ║
@@ -97,3 +98,9 @@
 #define WEATHER_REFRESH_SEC     900     // 15 minutes
 #define WEATHER_TIMEOUT_MS     5000
 #define WEATHER_RAIN_PROB_PCT    30     // umbrella if daily precip probability >= this
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  CONFIG PORTAL                                                            ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define PORTAL_TIMEOUT_MS  300000  // 5 minutes; 0 = no timeout
