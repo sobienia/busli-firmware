@@ -18,6 +18,11 @@ int  config_load_wifi(String ssids[], String passes[]);
 // Returns number of stops stored (0 if nothing saved yet).
 int  config_load_stops(StopEntry entries[]);
 
+// Load countdown from NVS. Returns true if a countdown is configured.
+// target_str format: "YYYY-MM-DD HH:MM"
+// icon: 0=none 1=palm 2=calendar 3=plane
+bool config_load_countdown(String& label, String& target_str, int& icon);
+
 // Run the AP config portal. Blocks until the user saves (then reboots)
 // or until timeoutMs elapses (then returns so normal boot can continue).
 // Pass timeoutMs=0 for no timeout.

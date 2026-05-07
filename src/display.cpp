@@ -193,6 +193,19 @@ static void draw_umbrella(int x, int y, uint16_t color) {
     gfx->fillRect(x + 2, y + 13, 4, 2, color);  // crook
 }
 
+// ── Countdown icon ────────────────────────────────────────────────────────────
+static void draw_countdown_icon(int icon, int x, int y, uint16_t col) {
+    if (icon != 2) return;
+    // Calendar (12×12): box outline, header bar, two rings, 3×2 date grid
+    gfx->drawRect(x, y + 2, 12, 10, col);
+    gfx->fillRect(x + 1, y + 3, 10, 3, col);
+    gfx->fillRect(x + 3, y,     2,  4, col);
+    gfx->fillRect(x + 7, y,     2,  4, col);
+    for (int r = 0; r < 2; r++)
+        for (int c = 0; c < 3; c++)
+            gfx->fillRect(x + 2 + c * 4, y + 7 + r * 3, 2, 2, col);
+}
+
 // ── Bus icon ──────────────────────────────────────────────────────────────────
 static void draw_bus_icon(int x, int y, uint16_t color) {
     gfx->fillRect(x - 4,  y + 7,  4, 4, color);  // left mirror
@@ -387,7 +400,8 @@ static void draw_footer_static(int fy, const char* weather_str, const char* uv_s
 // Erases + redraws only the right FOOTER_AGE_REGION_W pixels every second.
 // Starts erase at fy+1 to preserve the separator line drawn by draw_footer_static.
 static void draw_footer_dynamic(int fy, bool from_cache, bool wifi_ok,
-                                int age_seconds, bool large_font) {
+                                int age_seconds, bool large_font,
+                                time_t countdown_target, int countdown_icon) {
     gfx->fillRect(SCREEN_W - FOOTER_AGE_REGION_W, fy + 1,
                   FOOTER_AGE_REGION_W, FOOTER_H - 1, BLACK);
 
@@ -396,12 +410,38 @@ static void draw_footer_dynamic(int fy, bool from_cache, bool wifi_ok,
     int     ty  = fy + (FOOTER_H - fh) / 2;
     int     uby = fy + (FOOTER_H - 15) / 2;
 
-    char age_buf[16];
-    if (from_cache)            snprintf(age_buf, sizeof(age_buf), "cached");
-    else if (age_seconds < 60) snprintf(age_buf, sizeof(age_buf), "now");
-    else                       snprintf(age_buf, sizeof(age_buf), "%dm", age_seconds / 60);
-    String as = age_buf;
-    draw_text(as, SCREEN_W - PAD - 14 - text_w(as, fsz), ty, fsz, COLOR_ROW0);
+    char text_buf[16];
+    time_t now = time(nullptr);
+    long   secs_left = (countdown_target > 0) ? (long)(countdown_target - now) : -1;
+
+    if (secs_left > 0) {
+        if (secs_left >= 86400)
+            snprintf(text_buf, sizeof(text_buf), "%ldd%ldh",
+                     secs_left / 86400, (secs_left % 86400) / 3600);
+        else if (secs_left >= 3600)
+            snprintf(text_buf, sizeof(text_buf), "%ldh%ldm",
+                     secs_left / 3600, (secs_left % 3600) / 60);
+        else if (secs_left >= 60)
+            snprintf(text_buf, sizeof(text_buf), "%ldm%lds",
+                     secs_left / 60, secs_left % 60);
+        else
+            snprintf(text_buf, sizeof(text_buf), "%lds", secs_left);
+    } else {
+        if (from_cache)            snprintf(text_buf, sizeof(text_buf), "cached");
+        else if (age_seconds < 60) snprintf(text_buf, sizeof(text_buf), "now");
+        else                       snprintf(text_buf, sizeof(text_buf), "%dm", age_seconds / 60);
+    }
+
+    String ts = text_buf;
+    int text_x = SCREEN_W - PAD - 14 - text_w(ts, fsz);
+    draw_text(ts, text_x, ty, fsz, COLOR_ROW0);
+
+    if (secs_left > 0 && countdown_icon > 0) {
+        int icon_x = text_x - 4 - 12;
+        int icon_y = fy + (FOOTER_H - 10) / 2;
+        if (icon_x >= SCREEN_W - FOOTER_AGE_REGION_W)
+            draw_countdown_icon(countdown_icon, icon_x, icon_y, COLOR_ROW0);
+    }
 
     uint16_t dot;
     if (!wifi_ok) dot = ((millis() / 500) % 2 == 0) ? rgb(180, 30, 0) : BLACK;
@@ -421,7 +461,8 @@ void display_draw_board(
     const char* weather_str, const char* uv_str,
     bool rain_today, int rain_pct,
     bool from_cache, bool wifi_ok, int age_seconds,
-    time_t fetch_time, bool large_font_mode)
+    time_t fetch_time, bool large_font_mode,
+    time_t countdown_target, int countdown_icon)
 {
     if (!gfx) return;
     apply_night_brightness();
@@ -448,7 +489,7 @@ void display_draw_board(
         s_footer_static_drawn = true;
         draw_footer_static(fy, weather_str, uv_str, rain_today, rain_pct, large_font_mode);
     }
-    draw_footer_dynamic(fy, from_cache, wifi_ok, age_seconds, large_font_mode);
+    draw_footer_dynamic(fy, from_cache, wifi_ok, age_seconds, large_font_mode, countdown_target, countdown_icon);
 }
 
 // ── Boot animation ────────────────────────────────────────────────────────────

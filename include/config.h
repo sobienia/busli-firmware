@@ -54,7 +54,7 @@
 // ║  BACKGROUND FETCH TASK                                                    ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define FETCH_TASK_STACK      8192   // FreeRTOS task stack (bytes)
+#define FETCH_TASK_STACK      12288  // FreeRTOS task stack (bytes)
 #define FETCH_TASK_PRIORITY   1      // Low priority — runs on WiFi core 0
 #define FETCH_INTERVAL_MS     60000  // Full cycle time across all stops (ms)
 
@@ -79,15 +79,15 @@
 // ║  FOOTER LAYOUT                                                            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define FOOTER_AGE_REGION_W  90  // right-anchored dynamic region (age + dot)
+#define FOOTER_AGE_REGION_W  120 // right-anchored dynamic region (age/countdown + dot)
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  TRANSIT API                                                              ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 #define API_BASE_URL       "http://transport.opendata.ch/v1/stationboard"
-#define API_TIMEOUT_MS     10000
-#define API_FETCH_LIMIT    20    // entries requested per stop; more headroom for busy stations
+#define API_TIMEOUT_MS     15000
+#define API_FETCH_LIMIT    20    // entries requested per stop
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  WEATHER (Open-Meteo — free, no API key required)                         ║

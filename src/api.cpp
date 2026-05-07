@@ -119,8 +119,6 @@ static bool process_json_body(
     JsonArray board = doc["stationboard"];
 
     time_t now = time(nullptr);
-    Serial.printf("[API] board=%d entries, now=%ld\n", (int)board.size(), (long)now);
-
     int dbg_noparse = 0, dbg_past = 0, dbg_filt = 0;
 
     for (JsonObject entry : board) {
@@ -218,7 +216,7 @@ bool api_fetch_departures(
         // Using heap_caps_malloc (explicit PSRAM) instead of Arduino String avoids
         // the DRAM→PSRAM realloc path in String::concat, which silently misaligns
         // writes when the buffer crosses from DRAM into PSRAM.
-        const int MAX_BODY = 210000;
+        const int MAX_BODY = 300000;
         char* buf = (char*)heap_caps_malloc(MAX_BODY + 1,
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!buf) {

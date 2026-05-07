@@ -20,9 +20,10 @@
 #include <ArduinoJson.h>
 
 #define PORTAL_SSID    "Busli-Config"
-#define NVS_NAMESPACE  "busli"
-#define NVS_KEY_WIFI   "wifi"
-#define NVS_KEY_STOPS  "stops"
+#define NVS_NAMESPACE       "busli"
+#define NVS_KEY_WIFI        "wifi"
+#define NVS_KEY_STOPS       "stops"
+#define NVS_KEY_COUNTDOWN   "countdown"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 
@@ -74,8 +75,24 @@ int config_load_stops(StopEntry entries[]) {
     return n;
 }
 
+bool config_load_countdown(String& label, String& target_str, int& icon) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_COUNTDOWN, "");
+    prefs.end();
+    if (json.isEmpty()) return false;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return false;
+    label      = doc["l"] | "";
+    target_str = doc["t"] | "";
+    icon       = doc["i"] | 0;
+    return target_str.length() >= 16;
+}
+
 static void save_to_nvs(String ssids[], String passes[], int n_wifi,
-                         StopEntry stops[], int n_stops) {
+                         StopEntry stops[], int n_stops,
+                         const String& cd_label, const String& cd_target, int cd_icon) {
     // WiFi JSON
     JsonDocument wdoc;
     JsonArray warr = wdoc.to<JsonArray>();
@@ -100,10 +117,22 @@ static void save_to_nvs(String ssids[], String passes[], int n_wifi,
     String stops_json;
     serializeJson(sdoc, stops_json);
 
+    // Countdown JSON
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, false);
     prefs.putString(NVS_KEY_WIFI,  wifi_json);
     prefs.putString(NVS_KEY_STOPS, stops_json);
+    if (cd_target.length() >= 16) {
+        JsonDocument cddoc;
+        cddoc["l"] = cd_label;
+        cddoc["t"] = cd_target;
+        cddoc["i"] = cd_icon;
+        String cd_json;
+        serializeJson(cddoc, cd_json);
+        prefs.putString(NVS_KEY_COUNTDOWN, cd_json);
+    } else {
+        prefs.remove(NVS_KEY_COUNTDOWN);
+    }
     prefs.end();
 
     Serial.printf("[Portal] Saved %d WiFi, %d stops to NVS\n", n_wifi, n_stops);
@@ -125,7 +154,8 @@ static String html_encode(const String& s) {
 }
 
 static String build_page(String ssids[], String passes[],
-                          StopEntry stops[], int n_stops) {
+                          StopEntry stops[], int n_stops,
+                          const String& cd_label, const String& cd_target, int cd_icon) {
     String h;
     h.reserve(10000);
 
@@ -158,6 +188,12 @@ static String build_page(String ssids[], String passes[],
                       "border-top:1px solid #2a2a2a}"
            ".drop div:first-child{border-top:none}"
            ".drop div:active{background:#252525}"
+           ".iprow{display:flex;gap:8px;margin-top:8px}"
+           ".ip{display:flex;align-items:center;justify-content:center;"
+               "width:52px;height:52px;border:2px solid #383838;border-radius:8px;"
+               "cursor:pointer;font-size:26px;color:#888;transition:border-color .15s,"
+               "color .15s}"
+           ".ip.sel{border-color:#f7b500;color:#f7b500}"
            "</style></head><body>"
            "<h1>Busli</h1>"
            "<p class='sub'>Connected to <b>Busli&#8209;Config</b> &mdash; "
@@ -202,14 +238,34 @@ static String build_page(String ssids[], String passes[],
              + html_encode(sta) + "' oninput='st(this)' autocomplete='off'>"
              "<div class='drop'></div>"
              "</div>";
-        h += "<label>Line filter <span class='hint'>comma-separated, blank&nbsp;=&nbsp;all &mdash; e.g. 2,3,10</span></label>"
-             "<input type='text' name='s" + String(i) + "i' value='"
+        h += "<label>Line filter <span class='hint'>comma-separated line numbers, blank&nbsp;=&nbsp;all &mdash; e.g. 2,20</span></label>"
+             "<input type='text' name='s" + String(i) + "i' placeholder='e.g. 2,20' value='"
              + html_encode(li) + "'>";
-        h += "<label>Direction filter <span class='hint'>comma-separated, blank&nbsp;=&nbsp;all &mdash; e.g. Triemli,Milchbuck</span></label>"
-             "<input type='text' name='s" + String(i) + "d' value='"
+        h += "<label>Direction filter <span class='hint'>end-station substrings, blank&nbsp;=&nbsp;both directions &mdash; e.g. Klusplatz,Altstetten</span></label>"
+             "<input type='text' name='s" + String(i) + "d' placeholder='e.g. Klusplatz,Altstetten' value='"
              + html_encode(di) + "'>";
         h += "</div>";
     }
+
+    // ── Countdown section ────────────────────────────────────────────────────
+    h += F("<h2>Countdown</h2>"
+           "<div class='card'>"
+           "<div class='ct'>Event timer <span style='font-weight:normal;color:#666'>(optional)</span></div>"
+           "<p class='hint' style='margin:4px 0 8px'>Shows a live countdown in the footer. Leave blank to disable.</p>");
+    h += "<label>Label <span class='hint'>shown in config only</span></label>"
+         "<input type='text' name='cd_label' placeholder='e.g. Flight to Berlin' value='"
+         + html_encode(cd_label) + "'>";
+    h += "<label>Target date &amp; time <span class='hint'>local time, format YYYY-MM-DD HH:MM</span></label>"
+         "<input type='text' name='cd_target' placeholder='e.g. 2026-06-15 18:30' value='"
+         + html_encode(cd_target) + "'>";
+    h += F("<label>Icon</label>"
+           "<div class='iprow' id='iprow'>"
+           "<div class='ip' data-v='0' onclick='pickIco(this)'>&#8212;</div>"
+           "<div class='ip' data-v='2' onclick='pickIco(this)'>&#128197;</div>"
+           "</div>");
+    h += "<input type='hidden' name='cd_icon' id='cd_icon' value='"
+         + String(cd_icon) + "'>";
+    h += F("</div>");
 
     h += F("<button type='submit'>&#128190;&nbsp; Save &amp; Reboot</button>"
            "</form>"
@@ -244,6 +300,17 @@ static String build_page(String ssids[], String passes[],
                "for(var i=0;i<ds.length;i++)ds[i].style.display='none';"
              "}"
            "});"
+           "function pickIco(el){"
+             "document.querySelectorAll('#iprow .ip').forEach(function(e){e.classList.remove('sel');});"
+             "el.classList.add('sel');"
+             "document.getElementById('cd_icon').value=el.getAttribute('data-v');"
+           "}"
+           "(function(){"
+             "var v=document.getElementById('cd_icon').value;"
+             "document.querySelectorAll('#iprow .ip').forEach(function(e){"
+               "if(e.getAttribute('data-v')===v)e.classList.add('sel');"
+             "});"
+           "})();"
            "</script>"
            "</body></html>");
     return h;
@@ -255,9 +322,12 @@ static String s_ssids[MAX_WIFI];
 static String s_passes[MAX_WIFI];
 static StopEntry s_stops[MAX_STOPS];
 static int s_n_stops = 0;
+static String s_cd_label;
+static String s_cd_target;
+static int    s_cd_icon = 0;
 
 static void handle_root() {
-    String page = build_page(s_ssids, s_passes, s_stops, s_n_stops);
+    String page = build_page(s_ssids, s_passes, s_stops, s_n_stops, s_cd_label, s_cd_target, s_cd_icon);
     s_server.send(200, "text/html", page);
 }
 
@@ -294,7 +364,12 @@ static void handle_save() {
         }
     }
 
-    save_to_nvs(new_ssids, new_passes, n_wifi, new_stops, n_stops);
+    String cd_label  = s_server.arg("cd_label");  cd_label.trim();
+    String cd_target = s_server.arg("cd_target"); cd_target.trim();
+    int    cd_icon   = s_server.arg("cd_icon").toInt();
+    if (cd_icon < 0 || cd_icon > 3) cd_icon = 0;
+
+    save_to_nvs(new_ssids, new_passes, n_wifi, new_stops, n_stops, cd_label, cd_target, cd_icon);
 
     s_server.send(200, "text/html",
         F("<!DOCTYPE html><html><head>"
@@ -355,6 +430,7 @@ void config_portal_run(uint32_t timeoutMs) {
     // Fill empty slots so the form shows blanks
     for (int i = n_wifi; i < MAX_WIFI; i++) { s_ssids[i] = ""; s_passes[i] = ""; }
     s_n_stops = config_load_stops(s_stops);
+    config_load_countdown(s_cd_label, s_cd_target, s_cd_icon);
 
     // Start AP
     WiFi.disconnect(true);

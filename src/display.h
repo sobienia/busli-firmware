@@ -40,7 +40,9 @@ void display_draw_board(
     bool wifi_ok,
     int age_seconds,
     time_t fetch_time,
-    bool large_font_mode
+    bool large_font_mode,
+    time_t countdown_target, // 0 = disabled; shows remaining time in footer when > now
+    int    countdown_icon    // 0=none 1=palm 2=calendar 3=plane
 );
 
 // Force a full redraw on the next display_draw_board call (call after stop changes,

@@ -101,6 +101,8 @@ static void setup_stops() {
 static int      current_stop_idx  = 0;
 static bool     large_font_mode   = false;
 static uint32_t last_redraw_ms    = 0;
+static time_t   g_countdown_target = 0;
+static int      g_countdown_icon   = 0;
 
 static WeatherData weather_data    = {};
 static uint32_t    last_weather_ms = 0;
@@ -269,6 +271,23 @@ void setup() {
 
     sync_clock();
 
+    {
+        String cd_label, cd_target_str;
+        if (config_load_countdown(cd_label, cd_target_str, g_countdown_icon) && cd_target_str.length() >= 16) {
+            // configTzTime was called in sync_clock() so mktime() now uses Swiss local time
+            struct tm t = {};
+            t.tm_year  = cd_target_str.substring(0,  4).toInt() - 1900;
+            t.tm_mon   = cd_target_str.substring(5,  7).toInt() - 1;
+            t.tm_mday  = cd_target_str.substring(8,  10).toInt();
+            t.tm_hour  = cd_target_str.substring(11, 13).toInt();
+            t.tm_min   = cd_target_str.substring(14, 16).toInt();
+            t.tm_isdst = -1;
+            g_countdown_target = mktime(&t);
+            Serial.printf("[Countdown] '%s' → %s → epoch %ld\n",
+                          cd_label.c_str(), cd_target_str.c_str(), (long)g_countdown_target);
+        }
+    }
+
     display_show_status("Loading...");
     fetch_task_start(g_stop_configs, g_num_stops);
 
@@ -324,7 +343,9 @@ void loop() {
             WiFi.status() == WL_CONNECTED,
             age_s,
             fetch_time,
-            large_font_mode
+            large_font_mode,
+            g_countdown_target,
+            g_countdown_icon
         );
     }
 
