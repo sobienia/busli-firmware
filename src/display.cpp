@@ -8,6 +8,7 @@
 #include "display.h"
 #include "../include/config.h"
 #include "../include/tramli_fonts.h"
+#include "../include/matrix_font.h"
 #include <Arduino_GFX_Library.h>
 
 static const int SMALL_ASCENT  = 15;   // TramliSmall  16px
@@ -453,15 +454,16 @@ void display_draw_board(
 // ── Boot animation ────────────────────────────────────────────────────────────
 void display_boot_animation(uint16_t duration_ms) {
     if (!gfx) return;
-    gfx->setFont((GFXfont*)nullptr);   // built-in font for the rain effect
 
-    const int CW   = 12;            // char width at textSize 2
-    const int CH   = 16;            // char height at textSize 2
-    const int COLS = SCREEN_W / CW; // ~40 columns
-    const int ROWS = SCREEN_H / CH; // ~13 rows
+    const int CW   = MATRIX_FONT_W;          // 8px — monospace cell width
+    const int CH   = MATRIX_FONT_H;          // 17px — cell height (yAdvance)
+    const int ASC  = MATRIX_FONT_ASC;        // 14px — baseline offset from cell top
+    const int COLS = SCREEN_W / CW;          // 60 columns
+    const int ROWS = SCREEN_H / CH;          // 13 rows
 
+    gfx->setFont(&MatrixCode);
+    gfx->setTextSize(1);
     gfx->fillScreen(BLACK);
-    gfx->setTextSize(2);
 
     // Stagger column starts so they don't all fall together
     int8_t heads[64];
@@ -480,14 +482,14 @@ void display_boot_animation(uint16_t duration_ms) {
             int p1 = heads[c] - 1;
             if (p1 >= 0 && p1 < ROWS) {
                 gfx->setTextColor(COLOR_ROWS, BLACK);
-                gfx->setCursor(x, p1 * CH);
+                gfx->setCursor(x, p1 * CH + ASC);
                 gfx->print((char)(33 + random(94)));
             }
-            // Older to dim
+            // Older trail to dim
             int p3 = heads[c] - 3;
             if (p3 >= 0 && p3 < ROWS) {
                 gfx->setTextColor(COLOR_DIM, BLACK);
-                gfx->setCursor(x, p3 * CH);
+                gfx->setCursor(x, p3 * CH + ASC);
                 gfx->print((char)(33 + random(94)));
             }
             // Erase tail end
@@ -498,7 +500,7 @@ void display_boot_animation(uint16_t duration_ms) {
             // Bright head
             if (heads[c] >= 0 && heads[c] < ROWS) {
                 gfx->setTextColor(WHITE, BLACK);
-                gfx->setCursor(x, heads[c] * CH);
+                gfx->setCursor(x, heads[c] * CH + ASC);
                 gfx->print((char)(33 + random(94)));
             }
 
