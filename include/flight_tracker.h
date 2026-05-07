@@ -8,9 +8,10 @@
 
 struct FlightInfo {
     bool   valid       = false;
-    String callsign;           // ICAO callsign as entered by user
+    String callsign;           // display name (what user entered, e.g. "TG971")
     String dep_icao;           // departure airport ICAO (e.g. "LSZH"), "" = unknown
     String arr_icao;           // arrival airport ICAO (e.g. "VTBS"),   "" = unknown
+    String dep_date;           // departure date from config "YYYY-MM-DD", for display fallback
     time_t dep_time    = 0;    // firstSeen unix epoch (departure), 0 = unknown
     time_t arr_time    = 0;    // lastSeen  unix epoch (arrival),   0 = still flying
     float  alt_ft      = 0;    // current barometric altitude in feet
@@ -18,7 +19,7 @@ struct FlightInfo {
     float  heading     = 0;    // current true track in degrees (0 = North)
     bool   on_ground   = true; // aircraft on ground right now
     bool   airborne    = false; // live state data available
-    time_t fetched_at  = 0;   // unix timestamp of last successful fetch
+    time_t fetched_at  = 0;    // unix timestamp of last successful fetch
 };
 
 // Call once in setup() — does a first blocking fetch, caches data.

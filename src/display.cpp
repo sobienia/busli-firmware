@@ -563,22 +563,37 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
         return;
     }
 
-    // Airport codes
-    String dep = fi.dep_icao.length() > 0 ? fi.dep_icao : "????";
-    String arr = fi.arr_icao.length() > 0 ? fi.arr_icao : "????";
+    // Determine status first — used to decide colors below
+    bool no_signal = !fi.airborne && fi.dep_icao.isEmpty() && fi.arr_icao.isEmpty()
+                     && fi.dep_time == 0 && fi.arr_time == 0;
+    String status_str;
+    if      (fi.airborne)                                  status_str = "In flight";
+    else if (fi.arr_time > 0 && now_t > fi.arr_time)      status_str = "Landed";
+    else if (fi.dep_time > 0 && now_t < fi.dep_time)      status_str = "Pre-flight";
+    else if (!fi.on_ground && fi.dep_time > 0)             status_str = "In flight";
+    else if (no_signal)                                    status_str = "No signal";
+    else                                                   status_str = "On ground";
+
+    // Airport codes — dim to COLOR_META when no live data, show "---" when unknown
+    uint16_t apt_col = no_signal ? COLOR_META : COLOR_ROW0;
+    String dep = fi.dep_icao.length() > 0 ? fi.dep_icao : "---";
+    String arr = fi.arr_icao.length() > 0 ? fi.arr_icao : "---";
     int16_t dep_w = text_w(dep, 3);
     int16_t arr_w = text_w(arr, 3);
-    draw_text(dep, PAD,                        APT_Y, 3, COLOR_ROW0);
-    draw_text(arr, SCREEN_W - PAD - arr_w,     APT_Y, 3, COLOR_ROW0);
+    draw_text(dep, PAD,                        APT_Y, 3, apt_col);
+    draw_text(arr, SCREEN_W - PAD - arr_w,     APT_Y, 3, apt_col);
 
-    // Status label (centered, below airport codes)
-    String status_str;
-    if (fi.airborne)                                    status_str = "In flight";
-    else if (fi.arr_time > 0 && now_t > fi.arr_time)   status_str = "Landed";
-    else if (fi.dep_time > 0 && now_t < fi.dep_time)   status_str = "Pre-flight";
-    else if (!fi.on_ground)                             status_str = "In flight";
-    else                                                status_str = "On ground";
+    // Status label
     draw_text(status_str, (SCREEN_W - text_w(status_str, 2)) / 2, APT_Y + 30, 2, COLOR_META);
+
+    // When no signal: show departure date as secondary info and skip the rest
+    if (no_signal) {
+        String nd = fi.dep_date.length() > 0
+                    ? "No live data \x7E " + fi.dep_date   // "~" as separator in Latin-1
+                    : "No live data";
+        draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, APT_Y + 50, 2, COLOR_META);
+        return;
+    }
 
     // Progress bar + plane marker
     float progress = 0.0f;
@@ -647,7 +662,7 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
         draw_text(arrow,  tx,       TIMES_Y, 2, COLOR_META); tx += arw;
         draw_text(arr_ts, tx,       TIMES_Y, 2, COLOR_ROW0);
     } else {
-        String nd = "No schedule data";
+        String nd = "No schedule data yet";
         draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, TIMES_Y, 2, COLOR_META);
     }
 }
@@ -711,20 +726,35 @@ static void anim_task_fn(void*) {
     gfx->setTextSize(1);
     gfx->fillScreen(BLACK);
 
-    int8_t heads[64];
-    for (int i = 0; i < COLS && i < 64; i++)
-        heads[i] = (int8_t)(-random(ROWS * 2));
+    int8_t   heads[64];
+    uint32_t col_next[64];   // abs millis when each column should advance
+    uint8_t  col_extra[64];  // random extra ms above base 60ms (range 0–20 → 60–80ms)
 
-    uint32_t last = 0;
+    {
+        uint32_t t0 = millis();
+        for (int i = 0; i < COLS && i < 64; i++) {
+            heads[i]     = (int8_t)(-random(ROWS * 2));
+            col_extra[i] = (uint8_t)random(21);  // 0–20 → interval 60–80ms
+            col_next[i]  = t0 + random(80);      // stagger first fire
+        }
+    }
+
     while (s_anim_running) {
         uint32_t now = millis();
-        if (now - last < 70) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
-        last = now;
+
+        // Check if any column is due — if not, sleep briefly
+        bool any_due = false;
+        for (int c = 0; c < COLS && c < 64; c++) {
+            if ((int32_t)(now - col_next[c]) >= 0) { any_due = true; break; }
+        }
+        if (!any_due) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
 
         gfx->setFont(&MatrixCode);
         gfx->setTextSize(1);
 
         for (int c = 0; c < COLS && c < 64; c++) {
+            if ((int32_t)(now - col_next[c]) < 0) continue;  // not yet
+
             int x = c * CW;
             for (int t = 0; t < 4; t++) {
                 int row = heads[c] - 1 - t;
@@ -742,8 +772,11 @@ static void anim_task_fn(void*) {
                 gfx->setCursor(x, heads[c] * CH + ASC);
                 gfx->print((char)(33 + random(94)));
             }
-            if (++heads[c] > ROWS + 6)
-                heads[c] = (int8_t)(-random(ROWS / 2));
+            if (++heads[c] > ROWS + 6) {
+                heads[c]     = (int8_t)(-random(ROWS / 2));
+                col_extra[c] = (uint8_t)random(21);  // re-randomize speed each cycle
+            }
+            col_next[c] = now + 60 + col_extra[c];
         }
 
     }

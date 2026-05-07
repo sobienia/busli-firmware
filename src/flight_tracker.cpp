@@ -20,6 +20,62 @@ static FlightInfo   s_cache[MAX_FLIGHTS];
 static String       s_icao24[MAX_FLIGHTS];  // cached per slot; avoids re-querying
 static int          s_count = 0;
 
+// ── IATA airline code → ICAO callsign prefix conversion ──────────────────────
+// Allows users to enter standard IATA flight numbers (e.g. TG971, LX161).
+// 3-letter prefixes are treated as ICAO already and passed through unchanged.
+
+static const struct { const char* iata; const char* icao; } AIRLINE_TABLE[] = {
+    // Swiss-relevant
+    {"LX", "SWR"}, {"WK", "EDW"}, {"2L", "OAW"},
+    // European
+    {"LH", "DLH"}, {"OS", "AUA"}, {"AF", "AFR"}, {"BA", "BAW"},
+    {"KL", "KLM"}, {"SK", "SAS"}, {"AY", "FIN"}, {"IB", "IBE"},
+    {"TP", "TAP"}, {"TK", "THY"}, {"LO", "LOT"}, {"AZ", "ITY"},
+    {"BT", "BTI"}, {"PS", "AUI"}, {"FR", "RYR"}, {"U2", "EZY"},
+    {"W6", "WZZ"}, {"4U", "GWI"},
+    // Middle East
+    {"EK", "UAE"}, {"QR", "QTR"}, {"EY", "ETD"}, {"FZ", "FDB"},
+    {"GF", "GFA"}, {"WY", "OMA"},
+    // Africa / Asia
+    {"ET", "ETH"}, {"MS", "MSR"}, {"TG", "THA"}, {"SQ", "SIA"},
+    {"CX", "CPA"}, {"MH", "MAS"}, {"GA", "GIA"}, {"AI", "AIC"},
+    {"NH", "ANA"}, {"JL", "JAL"}, {"KE", "KAL"}, {"OZ", "AAR"},
+    {"CI", "CAL"}, {"BR", "EVA"}, {"TZ", "ATC"}, {"UL", "ALK"},
+    // Americas
+    {"UA", "UAL"}, {"AA", "AAL"}, {"DL", "DAL"}, {"AC", "ACA"},
+    {"WN", "SWA"}, {"B6", "JBU"}, {"AS", "ASA"}, {"LA", "LAN"},
+    {"CM", "CMP"}, {"AM", "AMX"}, {"AR", "ARG"}, {"G3", "GLO"},
+    // Oceania
+    {"QF", "QFA"}, {"NZ", "ANZ"}, {"VA", "VOZ"},
+};
+static const int AIRLINE_TABLE_SIZE = sizeof(AIRLINE_TABLE) / sizeof(AIRLINE_TABLE[0]);
+
+// Convert a user-entered flight number to the ICAO callsign used by the aircraft.
+// "TG971" → "THA971", "LX161" → "SWR161", "THA971" → "THA971" (pass-through).
+static String to_icao_callsign(const String& flight_num) {
+    String fn = flight_num;
+    fn.toUpperCase();
+    fn.trim();
+    if (fn.length() < 3) return fn;
+
+    // Count leading alpha characters
+    int alpha_len = 0;
+    while (alpha_len < (int)fn.length() && isalpha((unsigned char)fn[alpha_len]))
+        alpha_len++;
+
+    if (alpha_len == 3) return fn;  // already 3-letter ICAO prefix
+
+    if (alpha_len == 2) {
+        String prefix = fn.substring(0, 2);
+        String number = fn.substring(2);
+        for (int i = 0; i < AIRLINE_TABLE_SIZE; i++) {
+            if (prefix == AIRLINE_TABLE[i].iata)
+                return String(AIRLINE_TABLE[i].icao) + number;
+        }
+    }
+    return fn;  // no match — pass through as-is
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 static String url_encode(const String& s) {
@@ -187,7 +243,8 @@ static void do_refresh(int slot) {
     if (slot < 0 || slot >= s_count) return;
 
     FlightInfo fi;
-    fi.callsign = s_entries[slot].callsign;
+    fi.callsign = s_entries[slot].callsign;   // keep user-entered name for display
+    fi.dep_date = s_entries[slot].dep_date;
     fi.valid    = true;
 
     // Preserve known route info from previous cache
@@ -196,9 +253,10 @@ static void do_refresh(int slot) {
     fi.dep_time  = s_cache[slot].dep_time;
     fi.arr_time  = s_cache[slot].arr_time;
 
-    // Step 1: live state (gives position + icao24)
+    // Step 1: live state — use ICAO callsign for the API, keep display name in fi.callsign
+    String api_cs = to_icao_callsign(s_entries[slot].callsign);
     String icao24 = s_icao24[slot];
-    bool live = fetch_states(fi.callsign, fi, icao24);
+    bool live = fetch_states(api_cs, fi, icao24);
     if (live && icao24.length() > 0)
         s_icao24[slot] = icao24;
 
@@ -221,6 +279,7 @@ void flight_tracker_init(const FlightEntry* entries, int count) {
         s_entries[i] = entries[i];
         s_cache[i]   = FlightInfo{};
         s_cache[i].callsign = entries[i].callsign;
+        s_cache[i].dep_date = entries[i].dep_date;
         s_icao24[i]  = "";
     }
     // Initial blocking fetch so the first flight view has data

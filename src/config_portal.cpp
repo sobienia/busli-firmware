@@ -311,8 +311,8 @@ static String build_page(String ssids[], String passes[],
     // ── Flights section ──────────────────────────────────────────────────────
     h += F("<h2>Flights</h2>"
            "<p class='hint' style='margin:-4px 0 10px'>Swipe down/up on the device to see flight status. "
-           "Enter the ICAO callsign (e.g. <b>SWR161</b> for Swiss LX161 &mdash; "
-           "find it on flightradar24.com).</p>");
+           "Enter the flight number (IATA like <b>LX161</b> or ICAO like <b>SWR161</b>). "
+           "Both work. IATA is the number on your ticket.</p>");
     const char* swipe_label[] = { "swipe down", "swipe up" };
     for (int i = 0; i < MAX_FLIGHTS; i++) {
         String cs  = (i < n_flights) ? flights[i].callsign : "";
@@ -322,8 +322,8 @@ static String build_page(String ssids[], String passes[],
         h += " <span style='font-weight:normal;color:#666'>(";
         h += swipe_label[i];
         h += ")</span></div>";
-        h += "<label>ICAO callsign <span class='hint'>e.g. SWR161, EZS3QV</span></label>"
-             "<input type='text' name='fl" + String(i) + "c' placeholder='e.g. SWR161' value='"
+        h += "<label>Flight number <span class='hint'>IATA (e.g. LX161, TG971) or ICAO callsign (SWR161, THA971)</span></label>"
+             "<input type='text' name='fl" + String(i) + "c' placeholder='e.g. LX161 or TG971' value='"
              + html_encode(cs) + "'>";
         h += "<label>Departure date</label>"
              "<input type='date' name='fl" + String(i) + "d' value='"

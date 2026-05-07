@@ -248,18 +248,25 @@ static void check_touch() {
             display_invalidate();
             break;
         case TOUCH_SWIPE_DOWN:
+            // Cycle forward: BOARD → FLIGHT0 → FLIGHT1 → BOARD
             if (g_flight_count > 0) {
-                Serial.println("[Touch] Swipe down → flight 1");
-                if (g_view != VIEW_FLIGHT0) { g_view = VIEW_FLIGHT0; display_invalidate(); }
+                View nv;
+                if      (g_view == VIEW_BOARD)   nv = VIEW_FLIGHT0;
+                else if (g_view == VIEW_FLIGHT0)  nv = (g_flight_count > 1) ? VIEW_FLIGHT1 : VIEW_BOARD;
+                else                              nv = VIEW_BOARD;
+                Serial.printf("[Touch] Swipe down → view %d\n", (int)nv);
+                if (nv != g_view) { g_view = nv; display_invalidate(); }
             }
             break;
         case TOUCH_SWIPE_UP:
-            if (g_flight_count > 1) {
-                Serial.println("[Touch] Swipe up → flight 2");
-                if (g_view != VIEW_FLIGHT1) { g_view = VIEW_FLIGHT1; display_invalidate(); }
-            } else if (g_flight_count == 1) {
-                Serial.println("[Touch] Swipe up → flight 1");
-                if (g_view != VIEW_FLIGHT0) { g_view = VIEW_FLIGHT0; display_invalidate(); }
+            // Cycle backward: BOARD → FLIGHT1 → FLIGHT0 → BOARD
+            if (g_flight_count > 0) {
+                View nv;
+                if      (g_view == VIEW_BOARD)  nv = (g_flight_count > 1) ? VIEW_FLIGHT1 : VIEW_FLIGHT0;
+                else if (g_view == VIEW_FLIGHT1) nv = VIEW_FLIGHT0;
+                else                             nv = VIEW_BOARD;
+                Serial.printf("[Touch] Swipe up → view %d\n", (int)nv);
+                if (nv != g_view) { g_view = nv; display_invalidate(); }
             }
             break;
         default:
