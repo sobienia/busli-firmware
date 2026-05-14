@@ -23,6 +23,14 @@ void display_init();
 // Set backlight brightness (0–100)
 void display_set_brightness(uint8_t percent);
 
+// Switch color theme at runtime. Call before the first draw.
+// row0=100%, rows=80%, dim=50%, meta=30% — all RGB565.
+void display_set_theme(uint16_t row0, uint16_t rows, uint16_t dim, uint16_t meta);
+
+// Flip display orientation 180°. Invalidates all partial-redraw state so the
+// next draw call does a full repaint in the new orientation.
+void display_set_flipped(bool flipped);
+
 // Step through day-brightness levels: 100→90→80→70→60→50→100 (wraps).
 // Night mode is unaffected — it still overrides to NIGHT_BRIGHTNESS automatically.
 void display_step_brightness();

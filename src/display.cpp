@@ -31,6 +31,13 @@ static const int XLARGE_ASCENT = 26;   // TramliXLarge 28px
 static Arduino_DataBus *bus = nullptr;
 static Arduino_GFX     *gfx = nullptr;
 
+// ── Runtime color palette — set by display_set_theme(), defaults to Zürich Amber ──
+static uint16_t c_row0 = 0xF480;  // 100% — main text
+static uint16_t c_rows = 0xC3A0;  //  80% — boot animation trail
+static uint16_t c_dim  = 0x7A40;  //  50% — delays / stale
+static uint16_t c_meta = 0x4960;  //  30% — separators / inactive dots
+static uint16_t TRAIL[4] = { 0xF480, 0xC3A0, 0x7A40, 0x4960 };
+
 // ── Partial-redraw state ──────────────────────────────────────────────────────
 // Header redraws on minute change, rows on new fetch data, footer is split:
 //   static region (weather/UV) redraws on weather change (~15 min)
@@ -152,10 +159,12 @@ static void draw_text_safe(const String& s, int x_start, int text_y,
     const GFXfont* font = (fsz == 2) ? &TramliSmall
                         : (fsz == 4) ? &TramliXLarge
                         :               &TramliLarge;
-    // Left-clip: advance past chars whose cursor would land before (x_min + 1).
-    // The +1 ensures that even a glyph with xOffset=-1 starts at >= x_min.
+    // Left-clip: advance past chars whose cursor would start before x_min.
+    // No +1 guard here — Arduino_GFX clips individual pixels against its own
+    // [0, width) window, so a single glyph pixel at x=-1 is silently dropped
+    // by the library rather than corrupting the display controller address state.
     int cum = 0, ci = 0;
-    while (ci < (int)s.length() && x_start + cum < x_min + 1) {
+    while (ci < (int)s.length() && x_start + cum < x_min) {
         cum += glyph_xadvance(font, s[ci]);
         ci++;
     }
@@ -206,7 +215,8 @@ void display_init() {
         0,             // rotation 0 (portrait) — we call setRotation(3) below
         true,          // IPS panel
         222, 480,      // native width x height
-        49, 0          // column offset, row offset
+        49, 0,         // col_offset1, row_offset1 (rotation 0 and 3)
+        49, 0          // col_offset2, row_offset2 (rotation 1 and 2)
     );
 
     gfx->begin();
@@ -244,7 +254,7 @@ void display_show_status(const char* message) {
     gfx->fillScreen(BLACK);
     String s = to_latin1(message);
     int16_t w = text_w(s, 3);
-    draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 14, 3, COLOR_ROW0);
+    draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 14, 3, c_row0);
 }
 
 void display_invalidate() {
@@ -351,8 +361,8 @@ static void apply_night_brightness() {
 }
 
 void display_step_brightness() {
-    // Cycle: 100→90→80→70→60→50→100
-    s_day_brightness = (s_day_brightness > 50) ? s_day_brightness - 10 : 100;
+    // Cycle: 100→80→60→40→20→100
+    s_day_brightness = (s_day_brightness > 20) ? s_day_brightness - 20 : 100;
     if (!is_night_hours()) display_set_brightness(s_day_brightness);
     Serial.printf("[Display] Day brightness → %d%%\n", s_day_brightness);
 }
@@ -400,13 +410,13 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
             label = label.substring(0, label.length() - 1);
     }
 
-    draw_text(label, PAD, ty, fsz, COLOR_ROW0);
-    draw_text(clock_str, clock_x, ty, fsz, COLOR_ROW0);
+    draw_text(label, PAD, ty, fsz, c_row0);
+    draw_text(clock_str, clock_x, ty, fsz, c_row0);
 
     // Battery icon: 20×10 box + 2×4 terminal nub on the right
     if (battery_x >= 0) {
         int by = (HEADER_H - 10) / 2;
-        uint16_t bat_col = (battery_pct <= 20) ? COLOR_DIM : COLOR_ROW0;
+        uint16_t bat_col = (battery_pct <= 20) ? c_dim : c_row0;
         gfx->drawRect(battery_x, by, 20, 10, bat_col);          // outer box
         gfx->fillRect(battery_x + 20, by + 3, 2, 4, bat_col);   // + terminal nub
         int fill_w = battery_pct * 18 / 100;
@@ -415,16 +425,16 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     }
 
     if (umbrella_x >= 0)
-        draw_umbrella(umbrella_x, ty, COLOR_ROW0);
+        draw_umbrella(umbrella_x, ty, c_row0);
 
     // Stop indicator dots — center them vertically in header
     int dot_y = (HEADER_H - 6) / 2;
     for (int i = 0; i < stop_count; i++) {
-        uint16_t c = (i == stop_index) ? COLOR_ROW0 : COLOR_META;
+        uint16_t c = (i == stop_index) ? c_row0 : c_meta;
         gfx->fillRect(dots_x + i * 12, dot_y, 6, 6, c);
     }
 
-    gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, COLOR_META);
+    gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, c_meta);
 }
 
 // ── Rows ──────────────────────────────────────────────────────────────────────
@@ -441,7 +451,7 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
         String msg = (fetch_time > 0) ? "No more departures" : "Loading...";
         uint8_t fsz = large_font ? 3 : 2;
         draw_text(msg, (SCREEN_W - text_w(msg, fsz)) / 2,
-                  rows_top + rows_h / 2 - 14, fsz, COLOR_META);
+                  rows_top + rows_h / 2 - 14, fsz, c_meta);
         return;
     }
 
@@ -462,7 +472,7 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
 
         // Line number — right-aligned in number column
         String ln = to_latin1(dep.line);
-        draw_text(ln, num_col_end - text_w(ln, row_fsz), text_y, row_fsz, COLOR_ROW0);
+        draw_text(ln, num_col_end - text_w(ln, row_fsz), text_y, row_fsz, c_row0);
 
         // Destination — truncated to fit, leaving room for delay badge + time
         String dest    = to_latin1(dep.destination);
@@ -470,7 +480,7 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
         if (disrupted) dest_max_w -= 40;
         while (dest.length() > 1 && text_w(dest, row_fsz) > dest_max_w)
             dest = dest.substring(0, dest.length() - 1);
-        draw_text(dest, dest_start, text_y, row_fsz, COLOR_ROW0);
+        draw_text(dest, dest_start, text_y, row_fsz, c_row0);
 
         // Delay badge
         if (disrupted && dep.delay > 0) {
@@ -478,22 +488,22 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
             snprintf(badge, sizeof(badge), "+%dm", dep.delay);
             String bs = badge;
             int bx = SCREEN_W - PAD - right_margin - text_w(bs, 2) - 4;
-            draw_text(bs, bx, text_y + 4, 2, COLOR_ROW0);
+            draw_text(bs, bx, text_y + 4, 2, c_row0);
         }
 
         // Time or bus icon
         if (dep.minutes == 0) {
-            draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, COLOR_ROW0);
+            draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, c_row0);
         } else {
             char tbuf[8];
             snprintf(tbuf, sizeof(tbuf), "%d'", dep.minutes);
             String ts = tbuf;
-            draw_text(ts, SCREEN_W - PAD - text_w(ts, row_fsz), text_y, row_fsz, COLOR_ROW0);
+            draw_text(ts, SCREEN_W - PAD - text_w(ts, row_fsz), text_y, row_fsz, c_row0);
         }
 
         // Row separator
         if (i < count - 1)
-            gfx->drawFastHLine(0, y + row_h - 1, SCREEN_W, rgb(20, 12, 0));
+            gfx->drawFastHLine(0, y + row_h - 1, SCREEN_W, c_meta);
     }
 }
 
@@ -505,7 +515,7 @@ static void draw_footer_static(int fy, const char* weather_str, const char* uv_s
                                 bool snow_today, bool clear_today,
                                 bool large_font) {
     gfx->fillRect(0, fy, SCREEN_W - FOOTER_AGE_REGION_W, FOOTER_H, BLACK);
-    gfx->drawFastHLine(0, fy, SCREEN_W, rgb(20, 12, 0));  // full-width separator
+    gfx->drawFastHLine(0, fy, SCREEN_W, c_meta);  // full-width separator
 
     uint8_t fsz = large_font ? 3 : 2;
     int     fh  = large_font ? 28 : 16;
@@ -516,16 +526,16 @@ static void draw_footer_static(int fy, const char* weather_str, const char* uv_s
 
     // Condition icon: sun (clear) or snowflake (snowy), left of temperature
     if (clear_today && !snow_today && !rain_today) {
-        draw_sun(x, icy, COLOR_ROW0);
+        draw_sun(x, icy, c_row0);
         x += 13;
     } else if (snow_today) {
-        draw_snowflake(x, icy + 1, COLOR_ROW0);  // +1 to center the 9px icon
+        draw_snowflake(x, icy + 1, c_row0);  // +1 to center the 9px icon
         x += 11;
     }
 
     if (weather_str && strlen(weather_str) > 0) {
         String s = to_latin1(weather_str);
-        draw_text(s, x, ty, fsz, COLOR_ROW0);
+        draw_text(s, x, ty, fsz, c_row0);
         x += text_w(s, fsz) + 14;
     }
 
@@ -535,16 +545,16 @@ static void draw_footer_static(int fy, const char* weather_str, const char* uv_s
             char pct_buf[6];
             snprintf(pct_buf, sizeof(pct_buf), "%d%%", rain_pct);
             String ps = pct_buf;
-            draw_text(ps, x, ty, fsz, COLOR_ROW0);
+            draw_text(ps, x, ty, fsz, c_row0);
             x += text_w(ps, fsz) + 14;  // same gap as temperature → next item
         }
-        draw_umbrella(x, uby, COLOR_ROW0);
+        draw_umbrella(x, uby, c_row0);
         x += 12 + 14;  // umbrella icon width (12px) + consistent gap
     }
 
     if (uv_str && strlen(uv_str) > 0) {
         String s = to_latin1(uv_str);
-        draw_text(s, x, ty, fsz, COLOR_ROW0);
+        draw_text(s, x, ty, fsz, c_row0);
     }
 }
 
@@ -586,19 +596,19 @@ static void draw_footer_dynamic(int fy, bool from_cache, bool wifi_ok,
 
     String ts = text_buf;
     int text_x = SCREEN_W - PAD - 14 - text_w(ts, fsz);
-    draw_text(ts, text_x, ty, fsz, COLOR_ROW0);
+    draw_text(ts, text_x, ty, fsz, c_row0);
 
     if (secs_left > 0 && countdown_icon > 0) {
         int icon_x = text_x - 4 - 12;
         int icon_y = fy + (FOOTER_H - 10) / 2;
         if (icon_x >= SCREEN_W - FOOTER_AGE_REGION_W)
-            draw_countdown_icon(countdown_icon, icon_x, icon_y, COLOR_ROW0);
+            draw_countdown_icon(countdown_icon, icon_x, icon_y, c_row0);
     }
 
     uint16_t dot;
     if (!wifi_ok) dot = ((millis() / 500) % 2 == 0) ? rgb(180, 30, 0) : BLACK;
-    else if (from_cache) dot = COLOR_DIM;
-    else                 dot = COLOR_META;
+    else if (from_cache) dot = c_dim;
+    else                 dot = c_meta;
     gfx->fillRect(SCREEN_W - PAD - 6, uby + 4, 6, 6, dot);
 }
 
@@ -664,7 +674,7 @@ static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_
             gfx->fillRect(0, rows_top, SCREEN_W, rows_h, BLACK);
             String msg = (data.fetch_time > 0) ? "No connections" : "Loading...";
             draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2,
-                      rows_top + rows_h / 2 - 8, 2, COLOR_META);
+                      rows_top + rows_h / 2 - 8, 2, c_meta);
         }
         return;
     }
@@ -710,16 +720,16 @@ static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_
             // always refresh time column (mins can cross boundary at any second)
             if (full_redraw) {
                 gfx->fillRect(0, y, time_col_x, mask_h, BLACK);
-                draw_text(ln,  num_col_end - text_w(ln, fsz), text_y, fsz, COLOR_ROW0);
-                draw_text(mid, dest_start,                    text_y, fsz, COLOR_ROW0);
+                draw_text(ln,  num_col_end - text_w(ln, fsz), text_y, fsz, c_row0);
+                draw_text(mid, dest_start,                    text_y, fsz, c_row0);
             }
             gfx->fillRect(time_col_x, y, time_col_w, mask_h, BLACK);
             if (mins == 0) {
-                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, COLOR_ROW0);
+                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, c_row0);
             } else {
                 char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%d'", mins);
                 String ts = tbuf;
-                draw_text(ts, SCREEN_W - PAD - text_w(ts, fsz), text_y, fsz, COLOR_ROW0);
+                draw_text(ts, SCREEN_W - PAD - text_w(ts, fsz), text_y, fsz, c_row0);
             }
         } else {
             // Marquee row: clear only the destination column, then draw both text
@@ -735,21 +745,21 @@ static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_
             int x1 = dest_start - offset;
             int x2 = x1 + cycle;
 
-            draw_text_safe(mid, x1, text_y, fsz, COLOR_ROW0, dest_start, time_col_x);
-            draw_text_safe(mid, x2, text_y, fsz, COLOR_ROW0, dest_start, time_col_x);
+            draw_text_safe(mid, x1, text_y, fsz, c_row0, dest_start, time_col_x);
+            draw_text_safe(mid, x2, text_y, fsz, c_row0, dest_start, time_col_x);
 
             if (full_redraw) {
                 gfx->fillRect(0, y, dest_start, mask_h, BLACK);
-                draw_text(ln, num_col_end - text_w(ln, fsz), text_y, fsz, COLOR_ROW0);
+                draw_text(ln, num_col_end - text_w(ln, fsz), text_y, fsz, c_row0);
             }
 
             gfx->fillRect(time_col_x, y, time_col_w, mask_h, BLACK);
             if (mins == 0) {
-                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, COLOR_ROW0);
+                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, c_row0);
             } else {
                 char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%d'", mins);
                 String ts = tbuf;
-                draw_text(ts, SCREEN_W - PAD - text_w(ts, fsz), text_y, fsz, COLOR_ROW0);
+                draw_text(ts, SCREEN_W - PAD - text_w(ts, fsz), text_y, fsz, c_row0);
             }
         }
 
@@ -757,7 +767,7 @@ static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_
         if (r < n_rows - 1) {
             bool inter_conn = (row_info[r+1].conn != row_info[r].conn);
             gfx->drawFastHLine(0, y + row_h - 1, SCREEN_W,
-                               inter_conn ? COLOR_META : rgb(20, 12, 0));
+                               inter_conn ? c_meta : c_meta);
         }
     }
 }
@@ -864,7 +874,7 @@ static const char* heading_label(float deg) {
 
 static void draw_flight_footer(time_t now_t, const FlightInfo& fi, bool wifi_ok) {
     int fy = SCREEN_H - FOOTER_H;
-    gfx->drawFastHLine(0, fy, SCREEN_W, rgb(20, 12, 0));
+    gfx->drawFastHLine(0, fy, SCREEN_W, c_meta);
 
     char age_buf[16] = "no data";
     if (fi.fetched_at > 0 && now_t >= fi.fetched_at) {
@@ -876,12 +886,12 @@ static void draw_flight_footer(time_t now_t, const FlightInfo& fi, bool wifi_ok)
     String age_str = age_buf;
     int ty = fy + (FOOTER_H - 16) / 2;
     int16_t aw = text_w(age_str, 2);
-    draw_text(age_str, SCREEN_W - PAD - 14 - aw, ty, 2, COLOR_ROW0);
+    draw_text(age_str, SCREEN_W - PAD - 14 - aw, ty, 2, c_row0);
 
     String hint = "swipe left for stops";
-    draw_text(hint, PAD, ty, 2, COLOR_META);
+    draw_text(hint, PAD, ty, 2, c_meta);
 
-    uint16_t dot = wifi_ok ? COLOR_META : ((millis() / 500) % 2 == 0 ? rgb(180,30,0) : BLACK);
+    uint16_t dot = wifi_ok ? c_meta : ((millis() / 500) % 2 == 0 ? rgb(180,30,0) : BLACK);
     gfx->fillRect(SCREEN_W - PAD - 6, fy + (FOOTER_H - 6) / 2, 6, 6, dot);
 }
 
@@ -901,12 +911,12 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
 
     if (fi.callsign.isEmpty()) {
         String msg = "No flight configured";
-        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + 70, 2, COLOR_META);
+        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + 70, 2, c_meta);
         return;
     }
     if (!fi.valid) {
         String msg = "Searching...";
-        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + 70, 2, COLOR_META);
+        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + 70, 2, c_meta);
         return;
     }
 
@@ -921,7 +931,7 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
     else                                               status_str = "On ground";
 
     // Airport codes — size=4, dim when no live data
-    uint16_t apt_col = no_signal ? COLOR_META : COLOR_ROW0;
+    uint16_t apt_col = no_signal ? c_meta : c_row0;
     String dep_iata = fi.dep_icao.length() > 0 ? fi.dep_icao : "---";
     String arr_iata = fi.arr_icao.length() > 0 ? fi.arr_icao : "---";
     int16_t dep_w = text_w(dep_iata, 4);
@@ -951,7 +961,7 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
             snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
         }
     }
-    uint16_t time_col = no_signal ? COLOR_META : COLOR_ROW0;
+    uint16_t time_col = no_signal ? c_meta : c_row0;
     String dep_ts = dep_tbuf, arr_ts = arr_tbuf;
     draw_text(dep_ts, PAD, TIME_Y, 2, time_col);
     draw_text(arr_ts, SCREEN_W - PAD - text_w(arr_ts, 2), TIME_Y, 2, time_col);
@@ -963,13 +973,13 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
 
     if (no_signal) {
         if (BAR_W > 20)
-            gfx->drawFastHLine(BAR_LX, BAR_CY, BAR_W, COLOR_META);
+            gfx->drawFastHLine(BAR_LX, BAR_CY, BAR_W, c_meta);
         draw_text(status_str,
-                  (SCREEN_W - text_w(status_str, 2)) / 2, STATUS_Y, 2, COLOR_META);
+                  (SCREEN_W - text_w(status_str, 2)) / 2, STATUS_Y, 2, c_meta);
         String nd = fi.dep_date.length() > 0
                     ? "No live data \x7E " + fi.dep_date
                     : "No live data";
-        draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, STATUS_Y + 22, 2, COLOR_META);
+        draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, STATUS_Y + 22, 2, c_meta);
         return;
     }
 
@@ -985,16 +995,16 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
     }
 
     if (BAR_W > 20) {
-        gfx->drawFastHLine(BAR_LX, BAR_CY, BAR_W, COLOR_META);
+        gfx->drawFastHLine(BAR_LX, BAR_CY, BAR_W, c_meta);
         int plane_cx = BAR_LX + (int)(progress * BAR_W);
         // Clamp: tail reaches cx-18, nose tip reaches cx+27
         if (plane_cx < BAR_LX + 18) plane_cx = BAR_LX + 18;
         if (plane_cx > BAR_RX - 27) plane_cx = BAR_RX - 27;
-        draw_plane_large(plane_cx, BAR_CY, COLOR_ROW0);
+        draw_plane_large(plane_cx, BAR_CY, c_row0);
     }
 
     draw_text(status_str,
-              (SCREEN_W - text_w(status_str, 2)) / 2, STATUS_Y, 2, COLOR_ROW0);
+              (SCREEN_W - text_w(status_str, 2)) / 2, STATUS_Y, 2, c_row0);
 
     // Alt / speed / heading (airborne only)
     if (fi.airborne && fi.alt_ft > 0) {
@@ -1006,9 +1016,9 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
         int gap = 22;
         int total_w = text_w(alt_s, 2) + gap + text_w(spd_s, 2) + gap + text_w(hdg_s, 2);
         int sx = (SCREEN_W - total_w) / 2;
-        draw_text(alt_s, sx, STATS_Y, 2, COLOR_ROW0);  sx += text_w(alt_s, 2) + gap;
-        draw_text(spd_s, sx, STATS_Y, 2, COLOR_ROW0);  sx += text_w(spd_s, 2) + gap;
-        draw_text(hdg_s, sx, STATS_Y, 2, COLOR_ROW0);
+        draw_text(alt_s, sx, STATS_Y, 2, c_row0);  sx += text_w(alt_s, 2) + gap;
+        draw_text(spd_s, sx, STATS_Y, 2, c_row0);  sx += text_w(spd_s, 2) + gap;
+        draw_text(hdg_s, sx, STATS_Y, 2, c_row0);
     }
 }
 
@@ -1042,30 +1052,46 @@ void display_draw_flight(int slot, int flight_count, const FlightInfo& fi, bool 
         int dots_x  = clock_x - 8 - flight_count * 12;
         int dot_y   = (HEADER_H - 6) / 2;
         for (int i = 0; i < flight_count; i++)
-            gfx->fillRect(dots_x + i * 12, dot_y, 6, 6, (i == slot) ? COLOR_ROW0 : COLOR_META);
+            gfx->fillRect(dots_x + i * 12, dot_y, 6, 6, (i == slot) ? c_row0 : c_meta);
         String cs = fi.callsign.length() > 0 ? fi.callsign : "Flight";
-        draw_plane_right(PAD + 7, HEADER_H / 2, COLOR_ROW0);
-        draw_text(cs,         PAD + 18, (HEADER_H - 16) / 2, 2, COLOR_ROW0);
-        draw_text(clock_str,  clock_x,  (HEADER_H - 16) / 2, 2, COLOR_ROW0);
-        gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, COLOR_META);
+        draw_plane_right(PAD + 7, HEADER_H / 2, c_row0);
+        draw_text(cs,         PAD + 18, (HEADER_H - 16) / 2, 2, c_row0);
+        draw_text(clock_str,  clock_x,  (HEADER_H - 16) / 2, 2, c_row0);
+        gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, c_meta);
     }
 
     draw_flight_content(now_t, fi);
     draw_flight_footer(now_t, fi, wifi_ok);
 }
 
+// ── Theme switching ───────────────────────────────────────────────────────────
+void display_set_theme(uint16_t row0, uint16_t rows, uint16_t dim, uint16_t meta) {
+    c_row0 = TRAIL[0] = row0;
+    c_rows = TRAIL[1] = rows;
+    c_dim  = TRAIL[2] = dim;
+    c_meta = TRAIL[3] = meta;
+}
+
+// ── Display orientation ───────────────────────────────────────────────────────
+// rotation 3 = landscape, USB-C left (normal)
+// rotation 1 = landscape, USB-C right (flipped 180°)
+void display_set_flipped(bool flipped) {
+    if (!gfx) return;
+    gfx->setRotation(flipped ? 1 : 3);
+    gfx->fillScreen(BLACK);   // clear stale content before next frame renders
+    display_invalidate();
+}
+
 // ── Boot animation — runs as a FreeRTOS task so setup() can proceed alongside ──
 static volatile bool  s_anim_running      = false;
 static TaskHandle_t   s_anim_task_handle  = nullptr;
 
-static const uint16_t TRAIL[] = { COLOR_ROW0, COLOR_ROWS, COLOR_DIM, COLOR_META };
-
 static void anim_task_fn(void*) {
-    const int CW   = MATRIX_FONT_W;
-    const int CH   = MATRIX_FONT_H;
-    const int ASC  = MATRIX_FONT_ASC;
-    const int COLS = SCREEN_W / CW;
-    const int ROWS = SCREEN_H / CH;
+    const int CW   = MATRIX_FONT_W;   // 8
+    const int CH   = MATRIX_FONT_H;   // 17
+    const int ASC  = MATRIX_FONT_ASC; // 14
+    const int COLS = SCREEN_W / CW;   // 60
+    const int ROWS = SCREEN_H / CH;   // 13
 
     gfx->setFont(&MatrixCode);
     gfx->setTextSize(1);
@@ -1087,7 +1113,6 @@ static void anim_task_fn(void*) {
     while (s_anim_running) {
         uint32_t now = millis();
 
-        // Check if any column is due — if not, sleep briefly
         bool any_due = false;
         for (int c = 0; c < COLS && c < 64; c++) {
             if ((int32_t)(now - col_next[c]) >= 0) { any_due = true; break; }
@@ -1098,7 +1123,7 @@ static void anim_task_fn(void*) {
         gfx->setTextSize(1);
 
         for (int c = 0; c < COLS && c < 64; c++) {
-            if ((int32_t)(now - col_next[c]) < 0) continue;  // not yet
+            if ((int32_t)(now - col_next[c]) < 0) continue;
 
             int x = c * CW;
             for (int t = 0; t < 4; t++) {
@@ -1113,17 +1138,16 @@ static void anim_task_fn(void*) {
             if (pe >= 0 && pe < ROWS)
                 gfx->fillRect(x, pe * CH, CW, CH, BLACK);
             if (heads[c] >= 0 && heads[c] < ROWS) {
-                gfx->setTextColor(WHITE, BLACK);
+                gfx->setTextColor(0xFFFF, BLACK);  // white head
                 gfx->setCursor(x, heads[c] * CH + ASC);
                 gfx->print((char)(33 + random(94)));
             }
             if (++heads[c] > ROWS + 6) {
                 heads[c]     = (int8_t)(-random(ROWS / 2));
-                col_extra[c] = (uint8_t)random(36);  // re-randomize speed each cycle
+                col_extra[c] = (uint8_t)random(36);
             }
             col_next[c] = now + 52 + col_extra[c];
         }
-
     }
 
     // Wipe with random column order then signal done

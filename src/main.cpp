@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wpa2.h>
+#include <Preferences.h>
 #include <time.h>
 
 #include "../include/config.h"
@@ -152,9 +153,12 @@ static bool     config_hint_shown     = false;
 static bool     s_btn_bright_was_pressed  = false;
 static uint32_t s_btn_bright_press_start  = 0;
 
-// Button debounce state — bottom-left button (zoom toggle)
+// Button debounce state — circular button (GPIO 38): long press = flip orientation
 static bool     s_btn_zoom_was_pressed    = false;
 static uint32_t s_btn_zoom_press_start    = 0;
+
+// Display orientation state (persisted to NVS)
+static bool g_display_flipped = false;
 
 // Build the page list from transit stops + commute pages.
 // Call after setup_stops() and after commute is resolved.
@@ -288,8 +292,13 @@ static void switch_page(int new_page) {
 // ║  INPUT HANDLERS                                                           ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
+// When flipped 180°, the top-left (GPIO 0) and bottom-right (GPIO 12) buttons
+// physically swap roles so the function stays at the same visual corner.
+// PIN_BOOT_BUTTON (GPIO 0) = nav/config in normal; brightness in flipped.
+// PIN_BTN_BRIGHT  (GPIO 12) = brightness in normal; nav/config in flipped.
 static void check_button() {
-    bool pressed = (digitalRead(PIN_BOOT_BUTTON) == LOW);
+    int pin = g_display_flipped ? PIN_BTN_BRIGHT : PIN_BOOT_BUTTON;
+    bool pressed = (digitalRead(pin) == LOW);
 
     if (pressed && !button_was_pressed) {
         button_press_start_ms = millis();
@@ -319,7 +328,8 @@ static void check_button() {
 }
 
 static void check_btn_bright() {
-    bool pressed = (digitalRead(PIN_BTN_BRIGHT) == LOW);
+    int pin = g_display_flipped ? PIN_BOOT_BUTTON : PIN_BTN_BRIGHT;
+    bool pressed = (digitalRead(pin) == LOW);
     if (pressed && !s_btn_bright_was_pressed) {
         s_btn_bright_press_start = millis();
     } else if (!pressed && s_btn_bright_was_pressed) {
@@ -331,18 +341,96 @@ static void check_btn_bright() {
     s_btn_bright_was_pressed = pressed;
 }
 
+// GPIO 38 button — currently diagnostic only (short press prints to Serial).
+// Orientation flip has been moved to GPIO 16 long press (theme button).
 static void check_btn_zoom() {
     bool pressed = (digitalRead(PIN_BTN_ZOOM) == LOW);
     if (pressed && !s_btn_zoom_was_pressed) {
         s_btn_zoom_press_start = millis();
+        Serial.println("[GPIO38] DOWN — button detected");
     } else if (!pressed && s_btn_zoom_was_pressed) {
-        if (millis() - s_btn_zoom_press_start >= 50) {
-            Serial.println("[BtnZoom] toggle large font");
-            large_font_mode = !large_font_mode;
-            display_invalidate();
-        }
+        uint32_t held_ms = millis() - s_btn_zoom_press_start;
+        Serial.printf("[GPIO38] UP — held %lu ms\n", held_ms);
     }
     s_btn_zoom_was_pressed = pressed;
+}
+
+// ── Color themes ──────────────────────────────────────────────────────────────
+// RGB565 values: R=5bit G=6bit B=5bit.
+// Each theme has 4 brightness levels: 100%/80%/50%/30%.
+struct Theme {
+    const char* name;
+    uint16_t row0, rows, dim, meta;
+};
+
+// Palette derivation (all verified bit-by-bit):
+//  Zürich Amber  base #F09000 (R30 G36 B0):  G/R≈0.6  → warm amber
+//  Matrix Green  base #00FC00 (R0  G63 B0):  pure phosphor green
+//  Tron Blue     base #00A0F8 (R0  G40 B31): electric cyan-blue
+//  Stranger Red  base #F81800 (R31 G6  B0):  deep neon red
+static const Theme THEMES[] = {
+    { "Zurich Amber",   0xF480, 0xC3A0, 0x7A40, 0x4960 },
+    { "Matrix Green",   0x07E0, 0x0640, 0x0400, 0x0260 },
+    { "Tron Blue",      0x051F, 0x0419, 0x0290, 0x0189 },
+    { "Stranger Red",   0xF8C0, 0xC8A0, 0x7860, 0x4840 },
+};
+static const int N_THEMES = sizeof(THEMES) / sizeof(THEMES[0]);
+static int g_theme_idx = 0;
+
+static void apply_theme(int idx) {
+    g_theme_idx = idx;
+    const Theme& t = THEMES[idx];
+    display_set_theme(t.row0, t.rows, t.dim, t.meta);
+    display_invalidate();
+    Serial.printf("[Theme] %s\n", t.name);
+}
+
+static void load_theme() {
+    Preferences prefs;
+    prefs.begin("tramli", true);
+    int idx = prefs.getInt("theme", 0);
+    prefs.end();
+    if (idx < 0 || idx >= N_THEMES) idx = 0;
+    g_theme_idx = idx;
+    const Theme& t = THEMES[idx];
+    display_set_theme(t.row0, t.rows, t.dim, t.meta);
+    Serial.printf("[Theme] Loaded: %s\n", t.name);
+}
+
+static void save_theme(int idx) {
+    Preferences prefs;
+    prefs.begin("tramli", false);
+    prefs.putInt("theme", idx);
+    prefs.end();
+}
+
+// ── Theme button (GPIO 16) ────────────────────────────────────────────────────
+static bool     s_btn_theme_was_pressed = false;
+static uint32_t s_btn_theme_press_start = 0;
+
+static void check_btn_theme() {
+    bool pressed = (digitalRead(PIN_BTN_THEME) == LOW);
+    if (pressed && !s_btn_theme_was_pressed) {
+        s_btn_theme_press_start = millis();
+    } else if (!pressed && s_btn_theme_was_pressed) {
+        uint32_t held = millis() - s_btn_theme_press_start;
+        if (held >= TOUCH_LONG_PRESS_MS) {
+            // Long press → flip orientation 180° and persist
+            g_display_flipped = !g_display_flipped;
+            display_set_flipped(g_display_flipped);
+            Preferences prefs;
+            prefs.begin("tramli", false);
+            prefs.putBool("flipped", g_display_flipped);
+            prefs.end();
+            Serial.printf("[Theme] Long press → orientation flipped=%d\n", g_display_flipped);
+        } else if (held >= 50) {
+            // Short press → cycle color theme
+            int new_idx = (g_theme_idx + 1) % N_THEMES;
+            apply_theme(new_idx);
+            save_theme(new_idx);
+        }
+    }
+    s_btn_theme_was_pressed = pressed;
 }
 
 static void check_touch() {
@@ -439,8 +527,17 @@ void setup() {
     pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
     pinMode(PIN_BTN_BRIGHT,  INPUT_PULLUP);
     pinMode(PIN_BTN_ZOOM,    INPUT_PULLUP);
+    pinMode(PIN_BTN_THEME,   INPUT_PULLUP);
 
     display_init();
+    load_theme();
+    {
+        Preferences prefs;
+        prefs.begin("tramli", true);
+        g_display_flipped = prefs.getBool("flipped", false);
+        prefs.end();
+        if (g_display_flipped) display_set_flipped(true);
+    }
     touch_init();
     display_boot_animation_start();
 
@@ -513,13 +610,14 @@ void setup() {
         g_last_commute_ms = millis();
     }
 
-    display_boot_animation_stop();  // wipes screen, then returns
+    display_boot_animation_stop();
 }
 
 void loop() {
     check_button();
     check_btn_bright();
     check_btn_zoom();
+    check_btn_theme();
     check_touch();
 
     uint32_t now_ms = millis();

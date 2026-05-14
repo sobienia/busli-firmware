@@ -74,12 +74,10 @@
 // ║  HARDWARE PINS                                                            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define PIN_BOOT_BUTTON   0     // BOOT button: short press = next stop, long = refresh, 3s = config
-// Physical bottom-left button: short press toggles large-font mode.
-// Physical bottom-right button: short press cycles brightness 100→90→…→50→100.
-// *** GPIOs below are placeholders — check serial [GPIO] probe output while pressing each button ***
-#define PIN_BTN_ZOOM     38     // bottom-left button (GPIO not yet confirmed — check serial probe)
-#define PIN_BTN_BRIGHT   12     // bottom-right button (confirmed GPIO 12)
+#define PIN_BOOT_BUTTON   0     // BOOT button: short press = prev stop, long = refresh, 3s = config
+#define PIN_BTN_ZOOM     38     // bottom-left button:  short press toggles large-font mode
+#define PIN_BTN_BRIGHT   12     // bottom-right button: short press cycles brightness
+#define PIN_BTN_THEME    16     // side button (confirmed GPIO 16): short press cycles color theme
 #define PIN_BATTERY_ADC   4     // battery ADC: reads half the battery voltage through a 1:2 divider
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
