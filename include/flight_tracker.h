@@ -17,10 +17,15 @@ struct FlightInfo {
     float  alt_ft      = 0;    // current barometric altitude in feet
     float  speed_kmh   = 0;    // current ground speed in km/h
     float  heading     = 0;    // current true track in degrees (0 = North)
-    bool   on_ground   = true; // aircraft on ground right now
-    bool   airborne    = false; // live state data available
-    time_t fetched_at  = 0;    // unix timestamp of last successful fetch
+    bool   on_ground    = true;  // aircraft on ground right now
+    bool   airborne     = false; // live state data available
+    bool   route_checked = false; // true once route fetch was attempted (avoid retrying)
+    time_t fetched_at   = 0;    // unix timestamp of last successful fetch
 };
+
+// Set OpenSky Basic Auth credentials. Call before init() or any refresh.
+// Without credentials the server ignores the callsign filter (returns ~5 MB — unusable).
+void flight_tracker_set_opensky_auth(const String& user, const String& pass);
 
 // Call once in setup() — does a first blocking fetch, caches data.
 void flight_tracker_init(const FlightEntry* entries, int count);

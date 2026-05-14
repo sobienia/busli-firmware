@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wpa2.h>
 #include <time.h>
 
 #include "../include/config.h"
@@ -11,6 +12,7 @@
 #include "../include/fetch_task.h"
 #include "../include/touch_handler.h"
 #include "../include/config_portal.h"
+#include "../include/commute.h"
 
 #include "display.h"
 #include "api.h"
@@ -96,6 +98,18 @@ static void setup_stops() {
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  PAGE SYSTEM                                                              ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+struct PageInfo {
+    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK } type;
+    int transit_idx; // only meaningful for TRANSIT pages
+};
+static PageInfo g_pages[12];
+static int      g_num_pages    = 0;
+static int      g_current_page = 0;
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  RUNTIME STATE                                                            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
@@ -112,28 +126,93 @@ static int      g_flight_count    = 0;
 static uint32_t g_last_flight_ms[2] = {0, 0};
 #define FLIGHT_REFRESH_MS  (5UL * 60 * 1000)
 
+// Commute
+static CommuteData g_commute_home  = {};
+static CommuteData g_commute_work  = {};
+static String      g_home_station;
+static String      g_work_station;
+static int         g_commute_conn_idx = 0;  // which connection to show at top
+static uint32_t    g_last_commute_ms  = 0;
+#define COMMUTE_REFRESH_MS  (60UL * 1000)
+
 static WeatherData weather_data    = {};
 static uint32_t    last_weather_ms = 0;
 
-// Button debounce state
+// Battery
+static int      g_battery_pct    = -1;   // -1 until first read
+static uint32_t last_battery_ms  = 0;
+
+// Button debounce state — BOOT button
 static bool     button_was_pressed    = false;
 static uint32_t button_press_start_ms = 0;
 static bool     config_hint_shown     = false;
+
+// Button debounce state — bottom-right button (brightness cycle)
+// ≥50ms hold required to filter GPIO glitches and touch-IRQ pulses.
+static bool     s_btn_bright_was_pressed  = false;
+static uint32_t s_btn_bright_press_start  = 0;
+
+// Button debounce state — bottom-left button (zoom toggle)
+static bool     s_btn_zoom_was_pressed    = false;
+static uint32_t s_btn_zoom_press_start    = 0;
+
+// Build the page list from transit stops + commute pages.
+// Call after setup_stops() and after commute is resolved.
+static bool commute_configured() {
+    return g_home_station.length() > 0 && g_work_station.length() > 0;
+}
+
+static void setup_pages() {
+    g_num_pages = 0;
+    for (int i = 0; i < g_num_stops && g_num_pages < 12; i++) {
+        g_pages[g_num_pages++] = { PageInfo::TRANSIT, i };
+    }
+    // Both stations required: home commute = work→home, work commute = home→work
+    if (commute_configured()) {
+        if (g_num_pages < 12) g_pages[g_num_pages++] = { PageInfo::COMMUTE_HOME, 0 };
+        if (g_num_pages < 12) g_pages[g_num_pages++] = { PageInfo::COMMUTE_WORK, 0 };
+    }
+    Serial.printf("[Pages] %d pages (%d transit, %d commute)\n",
+                  g_num_pages, g_num_stops, g_num_pages - g_num_stops);
+}
+
+// Set initial page based on time: morning → work commute, afternoon/evening → home commute.
+static void set_initial_page() {
+    time_t now_t = time(nullptr);
+    if (now_t < 1700000000) return; // clock not synced, keep page 0
+    struct tm tm_now; localtime_r(&now_t, &tm_now);
+    bool is_morning = (tm_now.tm_hour < 12);
+    for (int i = 0; i < g_num_pages; i++) {
+        if (is_morning && g_pages[i].type == PageInfo::COMMUTE_WORK)  { g_current_page = i; return; }
+        if (!is_morning && g_pages[i].type == PageInfo::COMMUTE_HOME) { g_current_page = i; return; }
+    }
+}
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  WIFI — try NVS credentials first, fall back to secrets.h                 ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-static bool try_connect(const String& ssid, const String& pass, uint32_t timeout_ms = 12000) {
+static bool try_connect(const String& ssid, const String& pass,
+                        const String& user = "", uint32_t timeout_ms = 12000) {
     if (ssid.isEmpty()) return false;
-    Serial.printf("[WiFi] Trying '%s'...\n", ssid.c_str());
-    WiFi.begin(ssid.c_str(), pass.c_str());
+    if (user.length() > 0) {
+        Serial.printf("[WiFi] Trying enterprise '%s' user='%s'...\n", ssid.c_str(), user.c_str());
+        esp_wifi_sta_wpa2_ent_set_identity((uint8_t*)user.c_str(), user.length());
+        esp_wifi_sta_wpa2_ent_set_username((uint8_t*)user.c_str(), user.length());
+        esp_wifi_sta_wpa2_ent_set_password((uint8_t*)pass.c_str(), pass.length());
+        esp_wifi_sta_wpa2_ent_enable();
+        WiFi.begin(ssid.c_str());
+    } else {
+        Serial.printf("[WiFi] Trying '%s'...\n", ssid.c_str());
+        WiFi.begin(ssid.c_str(), pass.c_str());
+    }
     uint32_t t = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t < timeout_ms) {
         delay(300);
         Serial.print(".");
     }
     Serial.println();
+    if (user.length() > 0) esp_wifi_sta_wpa2_ent_disable();
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
         return true;
@@ -146,10 +225,10 @@ static bool connect_wifi() {
     WiFi.mode(WIFI_STA);
 
     // Try NVS-stored networks first
-    String ssids[3], passes[3];
-    int n = config_load_wifi(ssids, passes);
+    String ssids[3], passes[3], users[3];
+    int n = config_load_wifi(ssids, passes, users);
     for (int i = 0; i < n; i++) {
-        if (try_connect(ssids[i], passes[i])) return true;
+        if (try_connect(ssids[i], passes[i], users[i])) return true;
     }
 
     // Fall back to hardcoded secrets.h credential
@@ -180,10 +259,28 @@ static void sync_clock() {
                   t.tm_hour, t.tm_min, t.tm_sec);
 }
 
-static void switch_stop(int new_idx) {
-    g_view           = VIEW_BOARD;
-    current_stop_idx = new_idx;
-    fetch_task_set_active_stop(new_idx);
+// Read battery percentage from the ADC voltage divider (GPIO 4, 1:2 divider).
+// Uses analogReadMilliVolts() for built-in ADC calibration — no manual attenuation setup needed.
+// Returns -1 when no battery is detected (battery_mv < 1000 mV = clearly unpowered).
+static int read_battery_pct() {
+    uint32_t adc_mv   = analogReadMilliVolts(PIN_BATTERY_ADC);
+    uint32_t batt_mv  = adc_mv * 2;          // 1:2 divider: actual = adc × 2
+    if (batt_mv < 1000) return -1;            // no battery or wrong GPIO
+    // LiPo range: 3000 mV (empty) → 4200 mV (full)
+    int pct = (int)((batt_mv - 3000) * 100 / (4200 - 3000));
+    return (pct < 0) ? 0 : (pct > 100) ? 100 : pct;
+}
+
+static void switch_page(int new_page) {
+    g_current_page     = new_page;
+    g_commute_conn_idx = 0;
+    g_view             = VIEW_BOARD;
+    last_redraw_ms     = 0;   // force immediate redraw
+    PageInfo& p = g_pages[new_page];
+    if (p.type == PageInfo::TRANSIT) {
+        current_stop_idx = p.transit_idx;
+        fetch_task_set_active_stop(current_stop_idx);
+    }
     display_invalidate();
 }
 
@@ -214,32 +311,63 @@ static void check_button() {
             Serial.println("[Button] Long press → force refresh");
             fetch_task_force_refresh();
         } else if (held_ms >= 50) {
-            Serial.println("[Button] Short press → next stop");
-            switch_stop((current_stop_idx + 1) % g_num_stops);
+            Serial.println("[Button] Short press → prev page");
+            switch_page((g_current_page - 1 + g_num_pages) % g_num_pages);
         }
     }
     button_was_pressed = pressed;
 }
 
+static void check_btn_bright() {
+    bool pressed = (digitalRead(PIN_BTN_BRIGHT) == LOW);
+    if (pressed && !s_btn_bright_was_pressed) {
+        s_btn_bright_press_start = millis();
+    } else if (!pressed && s_btn_bright_was_pressed) {
+        if (millis() - s_btn_bright_press_start >= 50) {
+            Serial.println("[BtnBright] cycle brightness");
+            display_step_brightness();
+        }
+    }
+    s_btn_bright_was_pressed = pressed;
+}
+
+static void check_btn_zoom() {
+    bool pressed = (digitalRead(PIN_BTN_ZOOM) == LOW);
+    if (pressed && !s_btn_zoom_was_pressed) {
+        s_btn_zoom_press_start = millis();
+    } else if (!pressed && s_btn_zoom_was_pressed) {
+        if (millis() - s_btn_zoom_press_start >= 50) {
+            Serial.println("[BtnZoom] toggle large font");
+            large_font_mode = !large_font_mode;
+            display_invalidate();
+        }
+    }
+    s_btn_zoom_was_pressed = pressed;
+}
+
 static void check_touch() {
     switch (touch_poll()) {
         case TOUCH_SWIPE_LEFT:
-            Serial.println("[Touch] Swipe left → next stop");
-            switch_stop((current_stop_idx + 1) % g_num_stops);
+            Serial.println("[Touch] Swipe left → next page");
+            switch_page((g_current_page + 1) % g_num_pages);
             break;
         case TOUCH_SWIPE_RIGHT:
-            Serial.println("[Touch] Swipe right → prev stop");
-            switch_stop((current_stop_idx - 1 + g_num_stops) % g_num_stops);
+            Serial.println("[Touch] Swipe right → prev page");
+            switch_page((g_current_page - 1 + g_num_pages) % g_num_pages);
             break;
         case TOUCH_LONG_PRESS:
             Serial.println("[Touch] Long press → force refresh");
-            if (g_view == VIEW_BOARD) {
-                fetch_task_force_refresh();
+            if (g_pages[g_current_page].type == PageInfo::TRANSIT) {
+                if (g_view == VIEW_BOARD) fetch_task_force_refresh();
+                else {
+                    int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
+                    flight_tracker_refresh(slot);
+                    g_last_flight_ms[slot] = millis();
+                    display_invalidate();
+                }
             } else {
-                int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
-                flight_tracker_refresh(slot);
-                g_last_flight_ms[slot] = millis();
-                display_invalidate();
+                // Commute: force immediate refresh of both directions
+                g_last_commute_ms = 0;
             }
             break;
         case TOUCH_DOUBLE_TAP:
@@ -248,25 +376,47 @@ static void check_touch() {
             display_invalidate();
             break;
         case TOUCH_SWIPE_DOWN:
-            // Cycle forward: BOARD → FLIGHT0 → FLIGHT1 → BOARD
-            if (g_flight_count > 0) {
-                View nv;
-                if      (g_view == VIEW_BOARD)   nv = VIEW_FLIGHT0;
-                else if (g_view == VIEW_FLIGHT0)  nv = (g_flight_count > 1) ? VIEW_FLIGHT1 : VIEW_BOARD;
-                else                              nv = VIEW_BOARD;
-                Serial.printf("[Touch] Swipe down → view %d\n", (int)nv);
-                if (nv != g_view) { g_view = nv; display_invalidate(); }
+            if (g_pages[g_current_page].type == PageInfo::TRANSIT) {
+                // Cycle forward: BOARD → FLIGHT0 → FLIGHT1 → BOARD
+                if (g_flight_count > 0) {
+                    View nv;
+                    if      (g_view == VIEW_BOARD)  nv = VIEW_FLIGHT0;
+                    else if (g_view == VIEW_FLIGHT0) nv = (g_flight_count > 1) ? VIEW_FLIGHT1 : VIEW_BOARD;
+                    else                             nv = VIEW_BOARD;
+                    Serial.printf("[Touch] Swipe down → flight view %d\n", (int)nv);
+                    if (nv != g_view) { g_view = nv; display_invalidate(); }
+                }
+            } else {
+                // Commute: advance to next connection
+                CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
+                                  ? g_commute_home : g_commute_work;
+                if (cd.connection_count > 1) {
+                    g_commute_conn_idx = (g_commute_conn_idx + 1) % cd.connection_count;
+                    Serial.printf("[Touch] Commute → connection %d\n", g_commute_conn_idx);
+                    display_invalidate();
+                }
             }
             break;
         case TOUCH_SWIPE_UP:
-            // Cycle backward: BOARD → FLIGHT1 → FLIGHT0 → BOARD
-            if (g_flight_count > 0) {
-                View nv;
-                if      (g_view == VIEW_BOARD)  nv = (g_flight_count > 1) ? VIEW_FLIGHT1 : VIEW_FLIGHT0;
-                else if (g_view == VIEW_FLIGHT1) nv = VIEW_FLIGHT0;
-                else                             nv = VIEW_BOARD;
-                Serial.printf("[Touch] Swipe up → view %d\n", (int)nv);
-                if (nv != g_view) { g_view = nv; display_invalidate(); }
+            if (g_pages[g_current_page].type == PageInfo::TRANSIT) {
+                // Cycle backward: BOARD → FLIGHT1 → FLIGHT0 → BOARD
+                if (g_flight_count > 0) {
+                    View nv;
+                    if      (g_view == VIEW_BOARD)   nv = (g_flight_count > 1) ? VIEW_FLIGHT1 : VIEW_FLIGHT0;
+                    else if (g_view == VIEW_FLIGHT1)  nv = VIEW_FLIGHT0;
+                    else                              nv = VIEW_BOARD;
+                    Serial.printf("[Touch] Swipe up → flight view %d\n", (int)nv);
+                    if (nv != g_view) { g_view = nv; display_invalidate(); }
+                }
+            } else {
+                // Commute: go back to previous connection
+                CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
+                                  ? g_commute_home : g_commute_work;
+                if (cd.connection_count > 1) {
+                    g_commute_conn_idx = (g_commute_conn_idx - 1 + cd.connection_count) % cd.connection_count;
+                    Serial.printf("[Touch] Commute → connection %d\n", g_commute_conn_idx);
+                    display_invalidate();
+                }
             }
             break;
         default:
@@ -287,6 +437,8 @@ void setup() {
     Serial.println("============================================");
 
     pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
+    pinMode(PIN_BTN_BRIGHT,  INPUT_PULLUP);
+    pinMode(PIN_BTN_ZOOM,    INPUT_PULLUP);
 
     display_init();
     touch_init();
@@ -320,6 +472,20 @@ void setup() {
         }
     }
 
+    // Load commute station names from NVS
+    {
+        CommuteConfig cc;
+        if (config_load_commute(cc)) {
+            g_home_station = cc.home_station;
+            g_work_station = cc.work_station;
+            Serial.printf("[Commute] Home: '%s'  Work: '%s'\n",
+                          g_home_station.c_str(), g_work_station.c_str());
+        }
+    }
+
+    setup_pages();
+    set_initial_page();
+
     fetch_task_start(g_stop_configs, g_num_stops);
 
     {
@@ -327,6 +493,9 @@ void setup() {
         g_flight_count = config_load_flights(fl_entries);
         if (g_flight_count > 0) {
             Serial.printf("[Flights] %d flight(s) configured\n", g_flight_count);
+            String osky_u, osky_p;
+            if (config_load_opensky(osky_u, osky_p))
+                flight_tracker_set_opensky_auth(osky_u, osky_p);
             flight_tracker_init(fl_entries, g_flight_count);
             for (int i = 0; i < g_flight_count; i++)
                 g_last_flight_ms[i] = millis();
@@ -336,14 +505,33 @@ void setup() {
     weather_fetch(weather_data);
     last_weather_ms = millis();
 
+    // Initial commute fetch (blocking — gives data before first redraw)
+    // home commute = work→home; work commute = home→work
+    if (commute_configured()) {
+        commute_fetch(g_work_station, g_home_station, g_commute_home);
+        commute_fetch(g_home_station, g_work_station, g_commute_work);
+        g_last_commute_ms = millis();
+    }
+
     display_boot_animation_stop();  // wipes screen, then returns
 }
 
 void loop() {
     check_button();
+    check_btn_bright();
+    check_btn_zoom();
     check_touch();
 
     uint32_t now_ms = millis();
+
+    // Read battery voltage once per minute (ADC reads are slow; no need for higher rate)
+    if (last_battery_ms == 0 || now_ms - last_battery_ms >= 60000) {
+        last_battery_ms = now_ms;
+        g_battery_pct   = read_battery_pct();
+        uint32_t adc_mv = analogReadMilliVolts(PIN_BATTERY_ADC);
+        Serial.printf("[Batt] GPIO%d adc=%umV batt=%umV pct=%d\n",
+                      PIN_BATTERY_ADC, adc_mv, adc_mv * 2, g_battery_pct);
+    }
 
     // Refresh weather every WEATHER_REFRESH_SEC
     if (now_ms - last_weather_ms >= WEATHER_REFRESH_SEC * 1000UL) {
@@ -364,20 +552,78 @@ void loop() {
         }
     }
 
-    // Redraw every second (clock + age counter)
+    // Commute refresh every 5 minutes
+    if (commute_configured() &&
+        (g_last_commute_ms == 0 || now_ms - g_last_commute_ms >= COMMUTE_REFRESH_MS)) {
+        g_last_commute_ms = now_ms;
+        commute_fetch(g_work_station, g_home_station, g_commute_home);
+        commute_fetch(g_home_station, g_work_station, g_commute_work);
+        // Clamp connection index if data shrank
+        if (g_commute_conn_idx >= g_commute_home.connection_count) g_commute_conn_idx = 0;
+        if (g_commute_conn_idx >= g_commute_work.connection_count) g_commute_conn_idx = 0;
+        display_invalidate();
+    }
+
+    // Redraw every second (clock + age counter; commute marquee advances from millis())
+    PageInfo& page = g_pages[g_current_page];
     if (now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
 
-        if (g_view == VIEW_BOARD) {
-            std::vector<Departure> departures;
-            time_t fetch_time;
-            bool   from_cache;
-            fetch_task_get(current_stop_idx, departures, fetch_time, from_cache);
+        if (page.type == PageInfo::TRANSIT) {
+            current_stop_idx = page.transit_idx;
 
-            const StopConfig& stop = g_stop_configs[current_stop_idx];
-            time_t now_t  = time(nullptr);
-            int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
+            if (g_view == VIEW_BOARD) {
+                std::vector<Departure> departures;
+                time_t fetch_time;
+                bool   from_cache;
+                fetch_task_get(current_stop_idx, departures, fetch_time, from_cache);
 
+                const StopConfig& stop = g_stop_configs[current_stop_idx];
+                time_t now_t  = time(nullptr);
+                int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
+
+                char weather_str[20] = "";
+                char uv_str[10]      = "";
+                if (weather_data.valid) {
+                    snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
+                             (int)roundf(weather_data.temp_c),
+                             (int)roundf(weather_data.temp_max_c));
+                    snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
+                             weather_data.uv_index, weather_data.uv_index_max);
+                }
+
+                display_draw_board(
+                    stop.label,
+                    g_current_page,
+                    g_num_pages,
+                    departures,
+                    weather_str,
+                    uv_str,
+                    weather_data.valid && weather_data.rain_today,
+                    weather_data.valid ? weather_data.precip_prob_pct : 0,
+                    from_cache,
+                    WiFi.status() == WL_CONNECTED,
+                    age_s,
+                    fetch_time,
+                    large_font_mode,
+                    g_countdown_target,
+                    g_countdown_icon,
+                    weather_data.valid && weather_data.snow_today,
+                    weather_data.valid && weather_data.clear_today,
+                    g_battery_pct
+                );
+            } else {
+                int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
+                FlightInfo fi;
+                flight_tracker_get(slot, fi);
+                display_draw_flight(slot, g_flight_count, fi, WiFi.status() == WL_CONNECTED);
+            }
+
+        } else {
+            // Commute page
+            bool is_home = (page.type == PageInfo::COMMUTE_HOME);
+            CommuteData& cd = is_home ? g_commute_home : g_commute_work;
+            const char* label = is_home ? "Work -> Home" : "Home -> Work";
             char weather_str[20] = "";
             char uv_str[10]      = "";
             if (weather_data.valid) {
@@ -387,29 +633,14 @@ void loop() {
                 snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
                          weather_data.uv_index, weather_data.uv_index_max);
             }
-
-            display_draw_board(
-                stop.label,
-                current_stop_idx,
-                g_num_stops,
-                departures,
-                weather_str,
-                uv_str,
-                weather_data.valid && weather_data.rain_today,
-                weather_data.valid ? weather_data.precip_prob_pct : 0,
-                from_cache,
-                WiFi.status() == WL_CONNECTED,
-                age_s,
-                fetch_time,
-                large_font_mode,
-                g_countdown_target,
-                g_countdown_icon
-            );
-        } else {
-            int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
-            FlightInfo fi;
-            flight_tracker_get(slot, fi);
-            display_draw_flight(slot, g_flight_count, fi, WiFi.status() == WL_CONNECTED);
+            display_draw_commute(label, g_current_page, g_num_pages,
+                                 cd, g_commute_conn_idx,
+                                 WiFi.status() == WL_CONNECTED, g_battery_pct,
+                                 weather_str, uv_str,
+                                 weather_data.valid && weather_data.rain_today,
+                                 weather_data.valid ? weather_data.precip_prob_pct : 0,
+                                 weather_data.valid && weather_data.snow_today,
+                                 weather_data.valid && weather_data.clear_today);
         }
     }
 

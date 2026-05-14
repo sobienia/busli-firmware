@@ -19,6 +19,13 @@ static FlightEntry  s_entries[MAX_FLIGHTS];
 static FlightInfo   s_cache[MAX_FLIGHTS];
 static String       s_icao24[MAX_FLIGHTS];  // cached per slot; avoids re-querying
 static int          s_count = 0;
+static String       s_opensky_user;
+static String       s_opensky_pass;
+
+void flight_tracker_set_opensky_auth(const String& user, const String& pass) {
+    s_opensky_user = user;
+    s_opensky_pass = pass;
+}
 
 // ── IATA airline code → ICAO callsign prefix conversion ──────────────────────
 // Allows users to enter standard IATA flight numbers (e.g. TG971, LX161).
@@ -115,61 +122,214 @@ static time_t date_utc_epoch(const String& d) {
     return (time_t)(days * 86400L);
 }
 
-// ── OpenSky states API ─────────────────────────────────────────────────────────
-// Returns true if the aircraft was found (airborne or on ground with a state vector).
-// Populates fi (position/speed/heading) and icao24_out.
+// ── HTTP body reader — PSRAM buffer, proper chunked decode ────────────────────
+// Allocates buffer in PSRAM (avoids String realloc corruption).
+// Handles both Content-Length and chunked transfer encoding.
+// Returns bytes written; *out_buf must be free()d by caller (nullptr on failure).
 
-static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_out) {
-    // Pad callsign to 8 chars (OpenSky transmits padded ICAO callsigns)
-    String cs = callsign;
-    cs.toUpperCase();
-    while ((int)cs.length() < 8) cs += ' ';
+static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes) {
+    *out_buf = nullptr;
+    char* buf = (char*)heap_caps_malloc(max_bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) { Serial.println("[Flight] PSRAM alloc failed"); return 0; }
 
-    String url = "https://opensky-network.org/api/states/all?callsign=";
-    url += url_encode(cs);
+    WiFiClient*  s          = http.getStreamPtr();
+    int          clen       = http.getSize();
+    uint32_t     deadline   = millis() + HTTP_TIMEOUT;
+    size_t       total      = 0;
 
-    WiFiClientSecure wc;
-    wc.setInsecure();
-    HTTPClient http;
-    http.setTimeout(HTTP_TIMEOUT);
-    if (!http.begin(wc, url)) return false;
+    if (clen >= 0) {
+        // Known content-length — read directly
+        size_t remaining = min((size_t)clen, max_bytes);
+        while (remaining > 0 && millis() < deadline) {
+            int av = s->available();
+            if (av > 0) {
+                size_t got = s->readBytes(buf + total, min((size_t)av, remaining));
+                total += got; remaining -= got;
+            } else delay(1);
+        }
+    } else {
+        // Chunked transfer encoding — decode chunk-size headers manually.
+        // getStreamPtr() gives the raw TCP stream; chunk-size lines (e.g. "e68\r\n")
+        // would corrupt JSON parsing if not stripped.
+        while (millis() < deadline) {
+            // Read chunk-size line (hex digits + CRLF)
+            char sz[16] = {}; int sl = 0;
+            uint32_t ldl = millis() + 3000;
+            while (millis() < ldl) {
+                if (!s->available()) { delay(1); continue; }
+                char c = (char)s->read();
+                if (c == '\n') break;
+                if (c != '\r' && sl < 15) sz[sl++] = c;
+            }
+            if (sl == 0) continue;
+            size_t chunk_sz = strtoul(sz, nullptr, 16);
+            if (chunk_sz == 0) break;  // final empty chunk
 
-    int code = http.GET();
-    if (code != 200) {
-        Serial.printf("[Flight] states HTTP %d\n", code);
-        http.end();
-        return false;
+            // Read chunk data (drain overflow silently so framing stays intact)
+            size_t rem = chunk_sz;
+            while (rem > 0 && millis() < deadline) {
+                int av = s->available();
+                if (av <= 0) { delay(1); continue; }
+                size_t n = min((size_t)av, rem);
+                if (total + n < max_bytes) {
+                    size_t got = s->readBytes(buf + total, n);
+                    total += got; rem -= got;
+                } else {
+                    uint8_t drain[128];
+                    rem -= s->readBytes(drain, min(n, sizeof(drain)));
+                }
+            }
+            // Skip trailing CRLF after chunk body
+            uint32_t cdl = millis() + 1000;
+            while (millis() < cdl) {
+                if (!s->available()) { delay(1); continue; }
+                if ((char)s->read() == '\n') break;
+            }
+        }
     }
 
-    String body = http.getString();
-    http.end();
+    buf[total] = '\0';
+    *out_buf   = buf;
+    return total;
+}
 
-    JsonDocument doc;
-    if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
+// ── Parse a single state array entry from the PSRAM buffer ───────────────────
+// Extracts fields into fi; icao24_out is set from st[0].
 
-    JsonArray states = doc["states"].as<JsonArray>();
-    if (!states || states.size() == 0) {
-        Serial.printf("[Flight] callsign '%s' not found in live states\n", callsign.c_str());
-        return false;
-    }
-
-    JsonArray st = states[0].as<JsonArray>();
+static bool parse_state_entry(JsonArray st, FlightInfo& fi, String& icao24_out) {
     if (!st || st.size() < 11) return false;
-
-    const char* raw_icao = st[0] | "";
-    icao24_out = raw_icao;
-    icao24_out.trim();
-
+    const char* raw = st[0] | "";
+    icao24_out = raw; icao24_out.trim();
     fi.on_ground  = st[8].as<bool>();
     fi.airborne   = !fi.on_ground;
     if (!st[7].isNull()) fi.alt_ft    = st[7].as<float>() * 3.28084f;
     if (!st[9].isNull()) fi.speed_kmh = st[9].as<float>() * 3.6f;
     if (!st[10].isNull()) fi.heading  = st[10].as<float>();
     fi.fetched_at = time(nullptr);
-
-    Serial.printf("[Flight] live: %s icao24=%s alt=%.0fft spd=%.0fkm/h gnd=%d\n",
-                  callsign.c_str(), icao24_out.c_str(), fi.alt_ft, fi.speed_kmh, fi.on_ground);
     return true;
+}
+
+// ── OpenSky states API ─────────────────────────────────────────────────────────
+// Two paths:
+//  • icao24_out non-empty → ?icao24=<hex>: OpenSky honours this filter, tiny response.
+//  • icao24_out empty     → full global dump (~1-5 MB); scan PSRAM buffer for callsign,
+//                           extract ICAO24 and state data, cache for future calls.
+
+static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_out) {
+    String cs = callsign;
+    cs.toUpperCase(); cs.trim();
+    while ((int)cs.length() < 8) cs += ' ';  // pad to 8 chars for substring match
+
+    bool have_icao = icao24_out.length() > 0;
+    String url = "https://opensky-network.org/api/states/all?";
+    if (have_icao) {
+        url += "icao24=" + icao24_out;
+    } else {
+        // callsign filter is ignored server-side; include it for logging clarity only
+        url += "callsign=" + url_encode(cs);
+    }
+    Serial.printf("[Flight] states URL: %s\n", url.c_str());
+
+    WiFiClientSecure wc; wc.setInsecure();
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT * (have_icao ? 1 : 3));  // extra time for large scan
+    if (!http.begin(wc, url)) { Serial.println("[Flight] http.begin failed"); return false; }
+    if (s_opensky_user.length() > 0)
+        http.setAuthorization(s_opensky_user.c_str(), s_opensky_pass.c_str());
+
+    int code = http.GET();
+    Serial.printf("[Flight] HTTP %d\n", code);
+    if (code != 200) { http.end(); return false; }
+
+    // ── Path A: icao24-filtered — small response, parse normally ─────────────
+    if (have_icao) {
+        String body = http.getString();
+        http.end();
+        Serial.printf("[Flight] icao24 body %u bytes: %s\n",
+                      (unsigned)body.length(), body.c_str());
+
+        JsonDocument doc;
+        if (deserializeJson(doc, body) != DeserializationError::Ok) {
+            Serial.println("[Flight] JSON error"); return false;
+        }
+        JsonVariant sv = doc["states"];
+        if (sv.isNull()) {
+            Serial.println("[Flight] states=null (not airborne)"); return false;
+        }
+        JsonArray st = sv.as<JsonArray>()[0].as<JsonArray>();
+        if (!parse_state_entry(st, fi, icao24_out)) return false;
+        Serial.printf("[Flight] live: %s alt=%.0fft spd=%.0fkm/h gnd=%d\n",
+                      callsign.c_str(), fi.alt_ft, fi.speed_kmh, fi.on_ground);
+        return true;
+    }
+
+    // ── Path B: no icao24 — full global dump, PSRAM buffer, substring scan ───
+    Serial.println("[Flight] no icao24 cached — scanning full global state dump");
+    char* buf = nullptr;
+    size_t total = http_read_psram(http, &buf, 3UL * 1024 * 1024);  // 3 MB cap
+    http.end();
+    if (!buf) return false;
+
+    Serial.printf("[Flight] global body %u bytes\n", (unsigned)total);
+
+    // Search for the quoted padded callsign: ["icao24hex","THA970  ","country",...
+    bool result = false;
+    char needle[12];
+    snprintf(needle, sizeof(needle), "\"%s\"", cs.c_str());  // e.g. "\"THA970  \""
+    char* hit = strstr(buf, needle);
+    if (!hit) {
+        // Also try without trailing spaces (some entries may be stored trimmed)
+        String cs_trim = cs; cs_trim.trim();
+        snprintf(needle, sizeof(needle), "\"%s\"", cs_trim.c_str());
+        hit = strstr(buf, needle);
+    }
+
+    if (!hit) {
+        Serial.printf("[Flight] '%s' not found in %u byte response (not airborne?)\n",
+                      cs.c_str(), (unsigned)total);
+    } else {
+        // Walk back to the [ that opens this state array entry
+        char* entry_start = hit - 1;
+        while (entry_start > buf && *entry_start != '[') entry_start--;
+
+        // The ICAO24 is between [" and ","callsign"
+        char* icao_start = entry_start + 2;  // skip ["
+        char* icao_end   = strchr(icao_start, '"');
+
+        if (icao_end && (icao_end - icao_start) <= 8) {
+            String found_icao(icao_start, icao_end - icao_start);
+            found_icao.trim();
+            Serial.printf("[Flight] found '%s' → icao24=%s\n", cs.c_str(), found_icao.c_str());
+
+            // Find end of this state entry and parse just that slice
+            char* entry_end = strchr(hit, ']');
+            if (entry_end) {
+                size_t entry_len = (entry_end + 1) - entry_start;
+                // Build: {"states":[...entry...]}
+                size_t mini_cap = entry_len + 16;
+                char* mini = (char*)heap_caps_malloc(mini_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (mini) {
+                    int mlen = snprintf(mini, mini_cap, "{\"states\":[%.*s]}", (int)entry_len, entry_start);
+                    JsonDocument doc;
+                    if (deserializeJson(doc, mini, mlen) == DeserializationError::Ok) {
+                        JsonArray st = doc["states"].as<JsonArray>()[0].as<JsonArray>();
+                        if (parse_state_entry(st, fi, icao24_out)) {
+                            icao24_out = found_icao;  // override with directly extracted value
+                            result = true;
+                            Serial.printf("[Flight] live: %s alt=%.0fft spd=%.0fkm/h gnd=%d\n",
+                                          callsign.c_str(), fi.alt_ft, fi.speed_kmh, fi.on_ground);
+                        }
+                    } else {
+                        Serial.println("[Flight] mini-JSON parse error");
+                    }
+                    free(mini);
+                }
+            }
+        }
+    }
+
+    free(buf);
+    return result;
 }
 
 // ── OpenSky flights API ───────────────────────────────────────────────────────
@@ -177,7 +337,10 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
 
 static bool fetch_route(const String& icao24, const String& dep_date, FlightInfo& fi) {
     time_t begin_t = date_utc_epoch(dep_date);
-    if (begin_t == 0) return false;
+    if (begin_t == 0) {
+        Serial.printf("[Flight] route: dep_date empty or invalid ('%s') — skipping\n", dep_date.c_str());
+        return false;
+    }
     time_t end_t = begin_t + 2 * 86400L;  // search +2 days to catch delayed/long flights
 
     String url = "https://opensky-network.org/api/flights/aircraft?icao24=";
@@ -187,23 +350,23 @@ static bool fetch_route(const String& icao24, const String& dep_date, FlightInfo
     url += "&end=";
     url += String((long)end_t);
 
+    Serial.printf("[Flight] route URL: %s\n", url.c_str());
+
     WiFiClientSecure wc;
     wc.setInsecure();
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT);
     if (!http.begin(wc, url)) return false;
+    if (s_opensky_user.length() > 0)
+        http.setAuthorization(s_opensky_user.c_str(), s_opensky_pass.c_str());
 
     int code = http.GET();
-    if (code == 404) { http.end(); return false; }
-    if (code != 200) {
-        Serial.printf("[Flight] route HTTP %d\n", code);
-        http.end();
-        return false;
-    }
-
     String body = http.getString();
     http.end();
 
+    Serial.printf("[Flight] route HTTP %d  body: %s\n", code, body.c_str());
+
+    if (code != 200) return false;
     if (body.isEmpty() || body == "null" || body == "[]") return false;
 
     JsonDocument doc;
@@ -247,11 +410,17 @@ static void do_refresh(int slot) {
     fi.dep_date = s_entries[slot].dep_date;
     fi.valid    = true;
 
-    // Preserve known route info from previous cache
-    fi.dep_icao  = s_cache[slot].dep_icao;
-    fi.arr_icao  = s_cache[slot].arr_icao;
-    fi.dep_time  = s_cache[slot].dep_time;
-    fi.arr_time  = s_cache[slot].arr_time;
+    // User-entered airports take precedence; fall back to previously cached values
+    fi.dep_icao      = s_entries[slot].dep_icao.length() > 0
+                       ? s_entries[slot].dep_icao : s_cache[slot].dep_icao;
+    fi.arr_icao      = s_entries[slot].arr_icao.length() > 0
+                       ? s_entries[slot].arr_icao : s_cache[slot].arr_icao;
+    fi.dep_time      = s_cache[slot].dep_time;
+    fi.arr_time      = s_cache[slot].arr_time;
+    // Skip route API only once timestamps are known or a previous attempt was made.
+    // Do NOT skip just because airports are user-provided — timestamps come from
+    // fetch_route too, and without them progress/times display stays broken.
+    fi.route_checked = (s_cache[slot].dep_time > 0) || s_cache[slot].route_checked;
 
     // Step 1: live state — use ICAO callsign for the API, keep display name in fi.callsign
     String api_cs = to_icao_callsign(s_entries[slot].callsign);
@@ -260,11 +429,32 @@ static void do_refresh(int slot) {
     if (live && icao24.length() > 0)
         s_icao24[slot] = icao24;
 
-    // Step 2: route info — fetch if we have icao24 but no route yet
-    if (s_icao24[slot].length() > 0 &&
-        fi.dep_icao.isEmpty() && fi.arr_icao.isEmpty())
-    {
+    // Step 2: route info — fetch once if we have icao24 and haven't tried yet.
+    // /flights/aircraft requires a researcher account (free accounts get 403);
+    // route_checked prevents burning HTTP calls on every 5-min refresh.
+    if (s_icao24[slot].length() > 0 && !fi.route_checked) {
         fetch_route(s_icao24[slot], s_entries[slot].dep_date, fi);
+        fi.route_checked = true;
+    }
+
+    // Step 3: fall back to user-entered times when API returned nothing.
+    auto make_local_epoch = [](const String& date, const String& hhmm) -> time_t {
+        if (date.length() < 10 || hhmm.length() < 5 || hhmm[2] != ':') return 0;
+        struct tm t = {};
+        t.tm_year  = date.substring(0, 4).toInt() - 1900;
+        t.tm_mon   = date.substring(5, 7).toInt() - 1;
+        t.tm_mday  = date.substring(8, 10).toInt();
+        t.tm_hour  = hhmm.substring(0, 2).toInt();
+        t.tm_min   = hhmm.substring(3, 5).toInt();
+        t.tm_isdst = -1;
+        return mktime(&t);
+    };
+    if (fi.dep_time == 0 && s_entries[slot].dep_time_str.length() >= 5)
+        fi.dep_time = make_local_epoch(s_entries[slot].dep_date, s_entries[slot].dep_time_str);
+    if (fi.arr_time == 0 && s_entries[slot].arr_time_str.length() >= 5) {
+        time_t at = make_local_epoch(s_entries[slot].dep_date, s_entries[slot].arr_time_str);
+        if (at > 0 && fi.dep_time > 0 && at < fi.dep_time) at += 86400;  // overnight flight
+        fi.arr_time = at;
     }
 
     fi.fetched_at = time(nullptr);

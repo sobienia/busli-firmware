@@ -81,12 +81,17 @@ static bool matches_direction(const String& dest, const StopConfig& stop) {
     return false;
 }
 
-// Check if a line number matches the line filter.
-// If no filter is given (count == 0), everything matches.
-static bool matches_line(const String& line, const StopConfig& stop) {
+// Check if a line matches the filter.
+// Accepts either the bare number ("12") or the category-prefixed form ("S12").
+// This handles the transport.opendata.ch API returning category and number separately
+// for train lines (category="S", number="12") vs the user filtering on "S12".
+// If no filter is configured (count == 0), everything matches.
+static bool matches_line(const String& number, const String& category, const StopConfig& stop) {
     if (stop.line_count == 0) return true;
+    String catnum = category + number;  // e.g. "S" + "12" = "S12"
     for (int i = 0; i < stop.line_count; i++) {
-        if (line == String(stop.line_filter[i])) return true;
+        String f = String(stop.line_filter[i]);
+        if (number == f || catnum == f) return true;
     }
     return false;
 }
@@ -101,6 +106,7 @@ static bool process_json_body(
 ) {
     JsonDocument filter;
     filter["stationboard"][0]["number"]                         = true;
+    filter["stationboard"][0]["category"]                       = true;  // needed for "S12" train matching
     filter["stationboard"][0]["to"]                             = true;
     filter["stationboard"][0]["stop"]["departure"]              = true;
     filter["stationboard"][0]["stop"]["prognosis"]["departure"] = true;
@@ -121,14 +127,30 @@ static bool process_json_body(
     time_t now = time(nullptr);
     int dbg_noparse = 0, dbg_past = 0, dbg_filt = 0;
 
+    bool logged_sample = false;
     for (JsonObject entry : board) {
-        String line = String((const char*)(entry["number"] | ""));
-        String dest = format_destination(
-            String((const char*)(entry["to"] | ""))
-        );
+        String number   = String((const char*)(entry["number"]   | ""));
+        String category = String((const char*)(entry["category"] | ""));
+        String dest     = format_destination(String((const char*)(entry["to"] | "")));
 
-        if (!matches_line(line, stop))      { dbg_filt++; continue; }
-        if (!matches_direction(dest, stop)) { dbg_filt++; continue; }
+        // Log the first entry so the serial monitor shows what the API actually returns.
+        // Useful when a line filter produces zero results.
+        if (!logged_sample) {
+            Serial.printf("[API] sample: category='%s' number='%s' to='%s'\n",
+                          category.c_str(), number.c_str(), dest.c_str());
+            logged_sample = true;
+        }
+
+        // Build the display line: for trains prepend category (e.g. "S"+"12" → "S12");
+        // for buses/trams the number alone is already the line name ("80", "7").
+        String line = (category.length() > 0 && category != "B" &&
+                       category != "T" && category != "NFB" && category != "NFT" &&
+                       !number.startsWith(category))
+                      ? category + number
+                      : number;
+
+        if (!matches_line(number, category, stop)) { dbg_filt++; continue; }
+        if (!matches_direction(dest, stop))        { dbg_filt++; continue; }
 
         const char* sched_iso = entry["stop"]["departure"]              | "";
         const char* prog_iso  = entry["stop"]["prognosis"]["departure"] | "";

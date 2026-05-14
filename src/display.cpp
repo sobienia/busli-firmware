@@ -37,12 +37,19 @@ static Arduino_GFX     *gfx = nullptr;
 //   dynamic region (age + dot) redraws every second
 static time_t    s_last_fetch_time    = -1;
 static int       s_last_clock_minute  = -1;
+static int       s_last_battery_pct   = -2;   // -2 = never drawn; triggers first paint
 static uint32_t  s_last_weather_hash  = 0xFFFFFFFF;
 static bool      s_footer_static_drawn = false;
 // Flight screen partial-redraw state
 static int    s_flight_last_slot   = -1;
 static int    s_flight_last_minute = -1;
 static time_t s_flight_last_fetch  = -1;
+// Commute screen partial-redraw state
+static time_t    s_commute_last_fetch  = -1;
+static int       s_commute_last_minute = -1;
+static int       s_commute_last_conn   = -2;
+static uint32_t  s_commute_scroll_ms   = 0;   // millis() when current connection started (for marquee)
+static uint32_t  s_commute_weather_hash = 0xFFFFFFFF;
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -92,6 +99,22 @@ static String to_latin1(const String& src) {
     return out;
 }
 
+// ── Station name trimmer — strips "City, " prefix ────────────────────────────
+// "Zürich, ETH Hönggerberg" → "ETH Hönggerberg"
+static String trim_city(const String& s) {
+    int i = s.indexOf(", ");
+    return (i >= 0) ? s.substring(i + 2) : s;
+}
+
+// ── Per-character xAdvance (PROGMEM safe, no heap) ───────────────────────────
+static int glyph_xadvance(const GFXfont* font, char c) {
+    uint8_t first = pgm_read_byte(&font->first);
+    uint8_t last  = pgm_read_byte(&font->last);
+    if ((uint8_t)c < first || (uint8_t)c > last) return 0;
+    GFXglyph* g = &((GFXglyph*)pgm_read_ptr(&font->glyph))[(uint8_t)c - first];
+    return (int)pgm_read_byte(&g->xAdvance);
+}
+
 // ── Text width helper ─────────────────────────────────────────────────────────
 static int16_t text_w(const String& s, uint8_t size) {
     if      (size == 2) gfx->setFont(&TramliSmall);
@@ -116,10 +139,47 @@ static void draw_text(const String& s, int16_t x, int16_t y,
     gfx->print(s);
 }
 
+// ── Marquee-safe text draw — clips to [x_min, x_max) ────────────────────────
+// Drawing outside [0, SCREEN_W) corrupts the ST7796 address counter and deposits
+// pixels at wrong screen positions. This function skips leading characters until
+// the cursor is at x_min+1 (the +1 guards against glyphs with xOffset=-1 writing
+// one pixel before the cursor) and stops before any character whose advance would
+// push the cursor past x_max.  Defaults clip to the full screen width.
+static void draw_text_safe(const String& s, int x_start, int text_y,
+                            uint8_t fsz, uint16_t color,
+                            int x_min = 0, int x_max = SCREEN_W) {
+    if (s.length() == 0 || x_start >= x_max) return;
+    const GFXfont* font = (fsz == 2) ? &TramliSmall
+                        : (fsz == 4) ? &TramliXLarge
+                        :               &TramliLarge;
+    // Left-clip: advance past chars whose cursor would land before (x_min + 1).
+    // The +1 ensures that even a glyph with xOffset=-1 starts at >= x_min.
+    int cum = 0, ci = 0;
+    while (ci < (int)s.length() && x_start + cum < x_min + 1) {
+        cum += glyph_xadvance(font, s[ci]);
+        ci++;
+    }
+    if (ci >= (int)s.length() || x_start + cum >= x_max) return;
+    // Right-clip: include a character only if its full advance fits within x_max.
+    int ci_end = ci, cum_end = cum;
+    while (ci_end < (int)s.length()) {
+        int xa = glyph_xadvance(font, s[ci_end]);
+        if (x_start + cum_end + xa > x_max) break;
+        cum_end += xa;
+        ci_end++;
+    }
+    if (ci_end <= ci) return;
+    draw_text(s.substring(ci, ci_end), x_start + cum, text_y, fsz, color);
+}
+
 // ── Weather hash for footer static redraw guard ───────────────────────────────
 static uint32_t weather_hash(const char* weather_str, const char* uv_str,
-                              bool rain_today, int rain_pct) {
-    uint32_t h = (rain_today ? 1u : 0u) ^ ((uint32_t)(rain_pct & 0xFF) << 1);
+                              bool rain_today, int rain_pct,
+                              bool snow_today, bool clear_today) {
+    uint32_t h = (rain_today  ? 0x001u : 0u)
+               ^ (snow_today  ? 0x002u : 0u)
+               ^ (clear_today ? 0x004u : 0u)
+               ^ ((uint32_t)(rain_pct & 0xFF) << 4);
     for (const char* p = weather_str; p && *p; p++) h ^= (uint32_t)*p << 8;
     for (const char* p = uv_str;      p && *p; p++) h ^= (uint32_t)*p << 16;
     return h;
@@ -174,7 +234,13 @@ void display_show_status(const char* message) {
     if (!gfx) return;
     s_last_fetch_time     = -1;
     s_last_clock_minute   = -1;
+    s_last_battery_pct    = -2;
     s_footer_static_drawn = false;
+    s_commute_last_fetch   = -1;
+    s_commute_last_minute  = -1;
+    s_commute_last_conn    = -2;
+    s_commute_scroll_ms    = 0;
+    s_commute_weather_hash = 0xFFFFFFFF;
     gfx->fillScreen(BLACK);
     String s = to_latin1(message);
     int16_t w = text_w(s, 3);
@@ -184,13 +250,19 @@ void display_show_status(const char* message) {
 void display_invalidate() {
     s_last_fetch_time     = -1;
     s_last_clock_minute   = -1;
+    s_last_battery_pct    = -2;
     s_footer_static_drawn = false;
     s_flight_last_slot    = -1;
     s_flight_last_minute  = -1;
     s_flight_last_fetch   = -1;
+    s_commute_last_fetch   = -1;
+    s_commute_last_minute  = -1;
+    s_commute_last_conn    = -2;
+    s_commute_scroll_ms    = 0;
+    s_commute_weather_hash = 0xFFFFFFFF;
 }
 
-// ── Umbrella icon ─────────────────────────────────────────────────────────────
+// ── Umbrella icon (12×15) ────────────────────────────────────────────────────
 static void draw_umbrella(int x, int y, uint16_t color) {
     gfx->fillRect(x + 5, y,      2, 2, color);  // tip
     gfx->fillRect(x + 3, y + 2,  6, 2, color);  // canopy top
@@ -199,6 +271,40 @@ static void draw_umbrella(int x, int y, uint16_t color) {
     gfx->fillRect(x + 5, y + 8,  2, 5, color);  // handle
     gfx->fillRect(x + 2, y + 13, 4, 2, color);  // crook
 }
+
+// ── Sun icon (11×11) ─────────────────────────────────────────────────────────
+static void draw_sun(int x, int y, uint16_t color) {
+    gfx->fillRect(x + 3, y + 3, 5, 5, color);   // core disc
+    gfx->fillRect(x + 4, y,     3, 2, color);   // N ray
+    gfx->fillRect(x + 4, y + 9, 3, 2, color);   // S ray
+    gfx->fillRect(x,     y + 4, 2, 3, color);   // W ray
+    gfx->fillRect(x + 9, y + 4, 2, 3, color);   // E ray
+    gfx->fillRect(x + 1, y + 1, 2, 2, color);   // NW diagonal
+    gfx->fillRect(x + 8, y + 1, 2, 2, color);   // NE diagonal
+    gfx->fillRect(x + 1, y + 8, 2, 2, color);   // SW diagonal
+    gfx->fillRect(x + 8, y + 8, 2, 2, color);   // SE diagonal
+}
+
+// ── Snowflake icon (9×9) ─────────────────────────────────────────────────────
+static void draw_snowflake(int x, int y, uint16_t color) {
+    gfx->drawFastHLine(x,   y + 4, 9, color);   // horizontal arm
+    gfx->drawFastVLine(x + 4, y,   9, color);   // vertical arm
+    // Short ticks on arms (lattice branches)
+    gfx->fillRect(x + 2, y + 3, 1, 1, color);
+    gfx->fillRect(x + 2, y + 5, 1, 1, color);
+    gfx->fillRect(x + 6, y + 3, 1, 1, color);
+    gfx->fillRect(x + 6, y + 5, 1, 1, color);
+    gfx->fillRect(x + 3, y + 2, 1, 1, color);
+    gfx->fillRect(x + 5, y + 2, 1, 1, color);
+    gfx->fillRect(x + 3, y + 6, 1, 1, color);
+    gfx->fillRect(x + 5, y + 6, 1, 1, color);
+    // Corner diagonal pixels
+    gfx->fillRect(x + 1, y + 1, 1, 1, color);
+    gfx->fillRect(x + 7, y + 1, 1, 1, color);
+    gfx->fillRect(x + 1, y + 7, 1, 1, color);
+    gfx->fillRect(x + 7, y + 7, 1, 1, color);
+}
+
 
 // ── Countdown icon ────────────────────────────────────────────────────────────
 static void draw_countdown_icon(int icon, int x, int y, uint16_t col) {
@@ -228,21 +334,32 @@ static void draw_bus_icon(int x, int y, uint16_t color) {
 }
 
 // ── Night-mode brightness ─────────────────────────────────────────────────────
-static void apply_night_brightness() {
+static uint8_t s_day_brightness = DAY_BRIGHTNESS;  // manual day level; cycled by display_step_brightness()
+
+static bool is_night_hours() {
     time_t now = time(nullptr);
-    if (now < 1700000000) return;   // clock not synced yet, skip
-    struct tm t;
-    localtime_r(&now, &t);
+    if (now < 1700000000) return false;
+    struct tm t; localtime_r(&now, &t);
     int h = t.tm_hour;
-    bool is_night = (NIGHT_START_HOUR > NIGHT_END_HOUR)
-                    ? (h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR)
-                    : (h >= NIGHT_START_HOUR && h < NIGHT_END_HOUR);
-    display_set_brightness(is_night ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS);
+    return (NIGHT_START_HOUR > NIGHT_END_HOUR)
+        ? (h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR)
+        : (h >= NIGHT_START_HOUR && h < NIGHT_END_HOUR);
+}
+
+static void apply_night_brightness() {
+    display_set_brightness(is_night_hours() ? NIGHT_BRIGHTNESS : s_day_brightness);
+}
+
+void display_step_brightness() {
+    // Cycle: 100→90→80→70→60→50→100
+    s_day_brightness = (s_day_brightness > 50) ? s_day_brightness - 10 : 100;
+    if (!is_night_hours()) display_set_brightness(s_day_brightness);
+    Serial.printf("[Display] Day brightness → %d%%\n", s_day_brightness);
 }
 
 // ── Header ────────────────────────────────────────────────────────────────────
 static void draw_header(const char* stop_name, int stop_index, int stop_count,
-                        bool rain_active, bool large_font) {
+                        bool rain_active, bool large_font, int battery_pct) {
     gfx->fillRect(0, 0, SCREEN_W, HEADER_H, BLACK);
 
     uint8_t fsz = large_font ? 3 : 2;
@@ -259,10 +376,13 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     }
     String clock_str = clock_buf;
 
-    // Build right cluster right-to-left: clock, umbrella, dots
+    // Build right cluster right-to-left: clock | battery | umbrella | dots
     int16_t clock_w = text_w(clock_str, fsz);
     int rx = SCREEN_W - PAD - clock_w;
     int clock_x = rx;
+
+    int battery_x = -1;
+    if (battery_pct >= 0) { rx -= 6; rx -= 22; battery_x = rx; }   // 22px icon + 6px gap
 
     int umbrella_x = -1;
     if (rain_active) { rx -= 16; umbrella_x = rx; }
@@ -282,6 +402,17 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
 
     draw_text(label, PAD, ty, fsz, COLOR_ROW0);
     draw_text(clock_str, clock_x, ty, fsz, COLOR_ROW0);
+
+    // Battery icon: 20×10 box + 2×4 terminal nub on the right
+    if (battery_x >= 0) {
+        int by = (HEADER_H - 10) / 2;
+        uint16_t bat_col = (battery_pct <= 20) ? COLOR_DIM : COLOR_ROW0;
+        gfx->drawRect(battery_x, by, 20, 10, bat_col);          // outer box
+        gfx->fillRect(battery_x + 20, by + 3, 2, 4, bat_col);   // + terminal nub
+        int fill_w = battery_pct * 18 / 100;
+        if (fill_w > 0)
+            gfx->fillRect(battery_x + 1, by + 1, fill_w, 8, bat_col);  // fill level
+    }
 
     if (umbrella_x >= 0)
         draw_umbrella(umbrella_x, ty, COLOR_ROW0);
@@ -328,37 +459,36 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
         int text_y = y + (row_h - row_yadv) / 2;
 
         bool disrupted = (dep.delay >= 2);
-        uint16_t color = disrupted ? COLOR_DIM : COLOR_ROW0;
 
         // Line number — right-aligned in number column
         String ln = to_latin1(dep.line);
-        draw_text(ln, num_col_end - text_w(ln, row_fsz), text_y, row_fsz, color);
+        draw_text(ln, num_col_end - text_w(ln, row_fsz), text_y, row_fsz, COLOR_ROW0);
 
         // Destination — truncated to fit, leaving room for delay badge + time
         String dest    = to_latin1(dep.destination);
         int dest_max_w = SCREEN_W - dest_start - right_margin - PAD;
-        if (disrupted) dest_max_w -= 52;
+        if (disrupted) dest_max_w -= 40;
         while (dest.length() > 1 && text_w(dest, row_fsz) > dest_max_w)
             dest = dest.substring(0, dest.length() - 1);
-        draw_text(dest, dest_start, text_y, row_fsz, color);
+        draw_text(dest, dest_start, text_y, row_fsz, COLOR_ROW0);
 
-        // Delay badge (smaller font, between dest and time)
+        // Delay badge
         if (disrupted && dep.delay > 0) {
             char badge[8];
             snprintf(badge, sizeof(badge), "+%dm", dep.delay);
             String bs = badge;
             int bx = SCREEN_W - PAD - right_margin - text_w(bs, 2) - 4;
-            draw_text(bs, bx, text_y + 4, 2, COLOR_DIM);
+            draw_text(bs, bx, text_y + 4, 2, COLOR_ROW0);
         }
 
         // Time or bus icon
         if (dep.minutes == 0) {
-            draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, color);
+            draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, COLOR_ROW0);
         } else {
             char tbuf[8];
             snprintf(tbuf, sizeof(tbuf), "%d'", dep.minutes);
             String ts = tbuf;
-            draw_text(ts, SCREEN_W - PAD - text_w(ts, row_fsz), text_y, row_fsz, color);
+            draw_text(ts, SCREEN_W - PAD - text_w(ts, row_fsz), text_y, row_fsz, COLOR_ROW0);
         }
 
         // Row separator
@@ -367,36 +497,51 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
     }
 }
 
-// ── Footer — static region (weather, UV, umbrella) ────────────────────────────
+// ── Footer — static region (weather, UV, umbrella, sun/snowflake) ────────────
 // Erases + redraws only the left portion (SCREEN_W - FOOTER_AGE_REGION_W wide).
 // Called only when weather data changes or after a full-screen clear.
 static void draw_footer_static(int fy, const char* weather_str, const char* uv_str,
-                                bool rain_today, int rain_pct, bool large_font) {
+                                bool rain_today, int rain_pct,
+                                bool snow_today, bool clear_today,
+                                bool large_font) {
     gfx->fillRect(0, fy, SCREEN_W - FOOTER_AGE_REGION_W, FOOTER_H, BLACK);
     gfx->drawFastHLine(0, fy, SCREEN_W, rgb(20, 12, 0));  // full-width separator
 
     uint8_t fsz = large_font ? 3 : 2;
     int     fh  = large_font ? 28 : 16;
     int     ty  = fy + (FOOTER_H - fh) / 2;
-    int     uby = fy + (FOOTER_H - 15) / 2;  // umbrella icon vertical center
+    int     icy = fy + (FOOTER_H - 11) / 2;  // icon vertical center (11px icons)
+    int     uby = fy + (FOOTER_H - 15) / 2;  // umbrella vertical center (15px)
     int     x   = PAD;
+
+    // Condition icon: sun (clear) or snowflake (snowy), left of temperature
+    if (clear_today && !snow_today && !rain_today) {
+        draw_sun(x, icy, COLOR_ROW0);
+        x += 13;
+    } else if (snow_today) {
+        draw_snowflake(x, icy + 1, COLOR_ROW0);  // +1 to center the 9px icon
+        x += 11;
+    }
 
     if (weather_str && strlen(weather_str) > 0) {
         String s = to_latin1(weather_str);
         draw_text(s, x, ty, fsz, COLOR_ROW0);
         x += text_w(s, fsz) + 14;
     }
+
+    // Precipitation: umbrella for rain, snowflake already shown for snow
     if (rain_today) {
         if (rain_pct > 0) {
             char pct_buf[6];
             snprintf(pct_buf, sizeof(pct_buf), "%d%%", rain_pct);
             String ps = pct_buf;
             draw_text(ps, x, ty, fsz, COLOR_ROW0);
-            x += text_w(ps, fsz) + 10;
+            x += text_w(ps, fsz) + 14;  // same gap as temperature → next item
         }
         draw_umbrella(x, uby, COLOR_ROW0);
-        x += 28;
+        x += 12 + 14;  // umbrella icon width (12px) + consistent gap
     }
+
     if (uv_str && strlen(uv_str) > 0) {
         String s = to_latin1(uv_str);
         draw_text(s, x, ty, fsz, COLOR_ROW0);
@@ -469,7 +614,9 @@ void display_draw_board(
     bool rain_today, int rain_pct,
     bool from_cache, bool wifi_ok, int age_seconds,
     time_t fetch_time, bool large_font_mode,
-    time_t countdown_target, int countdown_icon)
+    time_t countdown_target, int countdown_icon,
+    bool snow_today, bool clear_today,
+    int battery_pct)
 {
     if (!gfx) return;
     apply_night_brightness();
@@ -479,9 +626,10 @@ void display_draw_board(
     localtime_r(&now_t, &tm_now);
     int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
 
-    if (cur_minute != s_last_clock_minute) {
+    if (cur_minute != s_last_clock_minute || battery_pct != s_last_battery_pct) {
         s_last_clock_minute = cur_minute;
-        draw_header(stop_name, stop_index, stop_count, false, large_font_mode);
+        s_last_battery_pct  = battery_pct;
+        draw_header(stop_name, stop_index, stop_count, false, large_font_mode, battery_pct);
     }
 
     if (fetch_time != s_last_fetch_time) {
@@ -490,23 +638,216 @@ void display_draw_board(
     }
 
     int fy = SCREEN_H - FOOTER_H;
-    uint32_t wh = weather_hash(weather_str, uv_str, rain_today, rain_pct);
+    uint32_t wh = weather_hash(weather_str, uv_str, rain_today, rain_pct,
+                               snow_today, clear_today);
     if (wh != s_last_weather_hash || !s_footer_static_drawn) {
         s_last_weather_hash   = wh;
         s_footer_static_drawn = true;
-        draw_footer_static(fy, weather_str, uv_str, rain_today, rain_pct, large_font_mode);
+        draw_footer_static(fy, weather_str, uv_str, rain_today, rain_pct,
+                           snow_today, clear_today, large_font_mode);
     }
     draw_footer_dynamic(fy, from_cache, wifi_ok, age_seconds, large_font_mode, countdown_target, countdown_icon);
 }
 
+// ── Commute screen ────────────────────────────────────────────────────────────
+
+// full_redraw=true  → clear each row and redraw all columns (data/minute changed)
+// full_redraw=false → skip static rows except their time column; marquee rows always scroll
+static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_t, bool full_redraw) {
+    const int rows_top = HEADER_H;
+    const int rows_h   = SCREEN_H - FOOTER_H - rows_top;
+    const int row_h    = rows_h / ROW_COUNT;
+    const int mask_h   = row_h - 1;  // preserve separator pixel at row bottom
+
+    if (!data.valid || data.connection_count == 0) {
+        if (full_redraw) {
+            gfx->fillRect(0, rows_top, SCREEN_W, rows_h, BLACK);
+            String msg = (data.fetch_time > 0) ? "No connections" : "Loading...";
+            draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2,
+                      rows_top + rows_h / 2 - 8, 2, COLOR_META);
+        }
+        return;
+    }
+
+    struct RowInfo { int conn; int leg; };
+    RowInfo row_info[ROW_COUNT];
+    int n_rows = 0;
+    for (int ci = conn_idx; ci < data.connection_count && n_rows < ROW_COUNT; ci++) {
+        for (int li = 0; li < data.connections[ci].leg_count && n_rows < ROW_COUNT; li++) {
+            row_info[n_rows++] = { ci, li };
+        }
+    }
+
+    const uint8_t fsz          = 3;
+    const int     row_yadv     = 28;
+    const int     num_col_end  = PAD + 54;
+    const int     dest_start   = num_col_end + 14;
+    const int     right_margin = 64;
+    const int     dest_max_w   = SCREEN_W - dest_start - right_margin - PAD;
+    const int     time_col_x   = dest_start + dest_max_w;
+    const int     time_col_w   = SCREEN_W - time_col_x;
+
+    const uint32_t PAUSE_MS = 2000;
+    uint32_t elapsed = millis() - s_commute_scroll_ms;
+    int scroll_px = 0;
+    if (elapsed > PAUSE_MS)
+        scroll_px = (int)((elapsed - PAUSE_MS) * 10 / 1000);
+
+    for (int r = 0; r < n_rows; r++) {
+        const CommuteLeg& leg = data.connections[row_info[r].conn].legs[row_info[r].leg];
+        int y      = rows_top + r * row_h;
+        int text_y = y + (row_h - row_yadv) / 2;
+
+        int mins = (leg.dep_time > now_t) ? (int)((leg.dep_time - now_t) / 60) : 0;
+        if (mins > 99) mins = 99;
+
+        String ln  = to_latin1(leg.line);
+        String mid = to_latin1(trim_city(leg.from) + " -> " + trim_city(leg.to));
+        int mid_w  = text_w(mid, fsz);
+
+        if (mid_w <= dest_max_w) {
+            // Static row: on full_redraw clear and redraw line + destination;
+            // always refresh time column (mins can cross boundary at any second)
+            if (full_redraw) {
+                gfx->fillRect(0, y, time_col_x, mask_h, BLACK);
+                draw_text(ln,  num_col_end - text_w(ln, fsz), text_y, fsz, COLOR_ROW0);
+                draw_text(mid, dest_start,                    text_y, fsz, COLOR_ROW0);
+            }
+            gfx->fillRect(time_col_x, y, time_col_w, mask_h, BLACK);
+            if (mins == 0) {
+                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, COLOR_ROW0);
+            } else {
+                char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%d'", mins);
+                String ts = tbuf;
+                draw_text(ts, SCREEN_W - PAD - text_w(ts, fsz), text_y, fsz, COLOR_ROW0);
+            }
+        } else {
+            // Marquee row: clear only the destination column, then draw both text
+            // copies confined to [dest_start, time_col_x) via x_min/x_max clipping.
+            // This prevents any marquee pixel from ever entering the side columns,
+            // so the left column (line number) only needs clearing on full_redraw
+            // and there is no full-row black flash every second.
+            gfx->fillRect(dest_start, y, dest_max_w, mask_h, BLACK);
+
+            const int GAP_PX = 40;
+            int cycle  = mid_w + GAP_PX;
+            int offset = scroll_px % cycle;
+            int x1 = dest_start - offset;
+            int x2 = x1 + cycle;
+
+            draw_text_safe(mid, x1, text_y, fsz, COLOR_ROW0, dest_start, time_col_x);
+            draw_text_safe(mid, x2, text_y, fsz, COLOR_ROW0, dest_start, time_col_x);
+
+            if (full_redraw) {
+                gfx->fillRect(0, y, dest_start, mask_h, BLACK);
+                draw_text(ln, num_col_end - text_w(ln, fsz), text_y, fsz, COLOR_ROW0);
+            }
+
+            gfx->fillRect(time_col_x, y, time_col_w, mask_h, BLACK);
+            if (mins == 0) {
+                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, COLOR_ROW0);
+            } else {
+                char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%d'", mins);
+                String ts = tbuf;
+                draw_text(ts, SCREEN_W - PAD - text_w(ts, fsz), text_y, fsz, COLOR_ROW0);
+            }
+        }
+
+        // Separator — always redraw (trivially fast, ensures correctness after any mask)
+        if (r < n_rows - 1) {
+            bool inter_conn = (row_info[r+1].conn != row_info[r].conn);
+            gfx->drawFastHLine(0, y + row_h - 1, SCREEN_W,
+                               inter_conn ? COLOR_META : rgb(20, 12, 0));
+        }
+    }
+}
+
+void display_draw_commute(
+    const char* direction_label,
+    int page_idx, int page_count,
+    const CommuteData& data,
+    int connection_idx,
+    bool wifi_ok,
+    int battery_pct,
+    const char* weather_str, const char* uv_str,
+    bool rain_today, int rain_pct,
+    bool snow_today, bool clear_today)
+{
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now_t, &tm_now);
+    int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
+
+    bool minute_changed = (cur_minute != s_commute_last_minute);
+    bool data_changed   = (data.fetch_time != s_commute_last_fetch || connection_idx != s_commute_last_conn);
+    bool full_redraw    = minute_changed || data_changed;
+
+    // Header: redraw on minute or battery change
+    if (minute_changed || battery_pct != s_last_battery_pct) {
+        s_commute_last_minute = cur_minute;
+        s_last_battery_pct    = battery_pct;
+        draw_header(direction_label, page_idx, page_count, false, false, battery_pct);
+    }
+
+    // Reset marquee when connection or data changes
+    if (data_changed) {
+        s_commute_last_fetch = data.fetch_time;
+        s_commute_last_conn  = connection_idx;
+        s_commute_scroll_ms  = millis();
+    }
+    draw_commute_rows(data, connection_idx, now_t, full_redraw);
+
+    int fy    = SCREEN_H - FOOTER_H;
+    int age_s = (data.fetch_time > 0) ? (int)(now_t - data.fetch_time) : 0;
+
+    uint32_t wh = weather_hash(weather_str, uv_str, rain_today, rain_pct, snow_today, clear_today);
+    if (wh != s_commute_weather_hash || full_redraw) {
+        s_commute_weather_hash = wh;
+        draw_footer_static(fy, weather_str, uv_str, rain_today, rain_pct,
+                           snow_today, clear_today, false);
+    }
+    draw_footer_dynamic(fy, false, wifi_ok, age_s, false, 0, 0);
+}
+
 // ── Flight screen ─────────────────────────────────────────────────────────────
 
-// Plane icon pointing right, centered at (cx, cy), ~14×10 px
+// Small plane icon pointing right, centered at (cx, cy), ~14×10 px (header use)
 static void draw_plane_right(int cx, int cy, uint16_t col) {
     gfx->fillRect(cx - 6, cy - 1, 12, 3, col);  // fuselage
     gfx->fillRect(cx + 5, cy,      2, 1, col);  // nose tip
     gfx->fillRect(cx - 1, cy - 5,  3, 11, col); // main wing
     gfx->fillRect(cx - 6, cy - 3,  3, 7, col);  // tail body
+}
+
+// Large plane icon pointing right, centered at (cx, cy).
+// 4px fuselage so the body reads as distinct from the wings.
+// Wings root at mid-fuselage so the nose protrudes ~22px past the wing leading edge.
+static void draw_plane_large(int cx, int cy, uint16_t col) {
+    // Fuselage: 4px body + tapered nose
+    gfx->fillRect(cx - 18, cy - 2, 40, 4, col);   // main body  cx-18…cx+21
+    gfx->fillRect(cx + 22, cy - 1,  4, 2, col);   // nose taper cx+22…cx+25, 2px
+    gfx->fillRect(cx + 26, cy,      2, 1, col);   // nose tip   cx+26…cx+27, 1px
+
+    // Main wings: 5 rows × 2px, root LE=cx+4, sweeps back 2px/row each edge, tapers slightly
+    // Upper half (each row starts at cy-3 and steps up 2px):
+    gfx->fillRect(cx -  6, cy -  3, 11, 2, col);  // root  cx-6…cx+4, chord=11
+    gfx->fillRect(cx -  8, cy -  5, 10, 2, col);  //       cx-8…cx+1, chord=10
+    gfx->fillRect(cx - 10, cy -  7,  9, 2, col);  //       cx-10…cx-2, chord=9
+    gfx->fillRect(cx - 12, cy -  9,  8, 2, col);  //       cx-12…cx-5, chord=8
+    gfx->fillRect(cx - 14, cy - 11,  6, 2, col);  // tip   cx-14…cx-9, chord=6
+    // Lower half (mirror):
+    gfx->fillRect(cx -  6, cy +  1, 11, 2, col);
+    gfx->fillRect(cx -  8, cy +  3, 10, 2, col);
+    gfx->fillRect(cx - 10, cy +  5,  9, 2, col);
+    gfx->fillRect(cx - 12, cy +  7,  8, 2, col);
+    gfx->fillRect(cx - 14, cy +  9,  6, 2, col);
+
+    // Horizontal tail stabilizers — smaller, at rear, merges into fuselage edges
+    gfx->fillRect(cx - 18, cy - 5,  8, 4, col);   // upper tail  (3px above fuselage)
+    gfx->fillRect(cx - 18, cy + 1,  8, 4, col);   // lower tail  (3px below fuselage)
 }
 
 // Heading arrow: simple 6×6 compass indicator
@@ -545,85 +886,122 @@ static void draw_flight_footer(time_t now_t, const FlightInfo& fi, bool wifi_ok)
 }
 
 static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
-    const int CTY    = HEADER_H + 4;
-    const int CTH    = SCREEN_H - FOOTER_H - HEADER_H - 4;
-    const int APT_Y  = CTY + 4;
-    const int BAR_Y  = CTY + 60;
-    const int STATS_Y = CTY + 86;
-    const int TIMES_Y = CTY + 112;
+    // Layout (Y = top of character cell):
+    //   APT_Y    = 48  — ICAO codes, size=4 (28px ascent, 32px yAdv)
+    //   BAR_CY   = 61  — route line + plane, inline with mid-height of codes
+    //   TIME_Y   = 82  — dep/arr times below codes, size=2 (16px)
+    //   STATUS_Y = 106 — status label, size=2
+    //   STATS_Y  = 128 — alt/speed/heading, size=2 (airborne only)
+    const int CTY      = HEADER_H + 4;   // 40
+    const int APT_Y    = CTY + 8;        // 48
+    const int BAR_CY   = APT_Y + XLARGE_ASCENT / 2;  // 61
+    const int TIME_Y   = APT_Y + 34;    // 82 — 2px below yAdv of size=4 text
+    const int STATUS_Y = CTY + 66;      // 106
+    const int STATS_Y  = CTY + 88;      // 128
 
     if (fi.callsign.isEmpty()) {
         String msg = "No flight configured";
-        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + CTH / 2 - 8, 2, COLOR_META);
+        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + 70, 2, COLOR_META);
         return;
     }
     if (!fi.valid) {
         String msg = "Searching...";
-        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + CTH / 2 - 8, 2, COLOR_META);
+        draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, CTY + 70, 2, COLOR_META);
         return;
     }
 
-    // Determine status first — used to decide colors below
     bool no_signal = !fi.airborne && fi.dep_icao.isEmpty() && fi.arr_icao.isEmpty()
                      && fi.dep_time == 0 && fi.arr_time == 0;
     String status_str;
-    if      (fi.airborne)                                  status_str = "In flight";
-    else if (fi.arr_time > 0 && now_t > fi.arr_time)      status_str = "Landed";
-    else if (fi.dep_time > 0 && now_t < fi.dep_time)      status_str = "Pre-flight";
-    else if (!fi.on_ground && fi.dep_time > 0)             status_str = "In flight";
-    else if (no_signal)                                    status_str = "No signal";
-    else                                                   status_str = "On ground";
+    if      (fi.airborne)                              status_str = "In flight";
+    else if (fi.arr_time > 0 && now_t > fi.arr_time)  status_str = "Landed";
+    else if (fi.dep_time > 0 && now_t < fi.dep_time)  status_str = "Pre-flight";
+    else if (!fi.on_ground && fi.dep_time > 0)         status_str = "In flight";
+    else if (no_signal)                                status_str = "No signal";
+    else                                               status_str = "On ground";
 
-    // Airport codes — dim to COLOR_META when no live data, show "---" when unknown
+    // Airport codes — size=4, dim when no live data
     uint16_t apt_col = no_signal ? COLOR_META : COLOR_ROW0;
-    String dep = fi.dep_icao.length() > 0 ? fi.dep_icao : "---";
-    String arr = fi.arr_icao.length() > 0 ? fi.arr_icao : "---";
-    int16_t dep_w = text_w(dep, 3);
-    int16_t arr_w = text_w(arr, 3);
-    draw_text(dep, PAD,                        APT_Y, 3, apt_col);
-    draw_text(arr, SCREEN_W - PAD - arr_w,     APT_Y, 3, apt_col);
+    String dep_iata = fi.dep_icao.length() > 0 ? fi.dep_icao : "---";
+    String arr_iata = fi.arr_icao.length() > 0 ? fi.arr_icao : "---";
+    int16_t dep_w = text_w(dep_iata, 4);
+    int16_t arr_w = text_w(arr_iata, 4);
+    draw_text(dep_iata, PAD,                      APT_Y, 4, apt_col);
+    draw_text(arr_iata, SCREEN_W - PAD - arr_w,   APT_Y, 4, apt_col);
 
-    // Status label
-    draw_text(status_str, (SCREEN_W - text_w(status_str, 2)) / 2, APT_Y + 30, 2, COLOR_META);
+    // Departure / arrival times below airport codes
+    // Left-aligned under departure code; right-aligned under arrival code
+    char dep_tbuf[12] = "--:--";
+    char arr_tbuf[14] = "--:--";
+    if (fi.dep_time > 0) {
+        struct tm td; localtime_r(&fi.dep_time, &td);
+        snprintf(dep_tbuf, sizeof(dep_tbuf), "%02d:%02d", td.tm_hour, td.tm_min);
+    }
+    if (fi.arr_time > 0) {
+        struct tm ta; localtime_r(&fi.arr_time, &ta);
+        if (fi.dep_time > 0) {
+            struct tm td2; localtime_r(&fi.dep_time, &td2);
+            int delta_days = ta.tm_yday - td2.tm_yday;
+            if (delta_days != 0)
+                snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d+%d",
+                         ta.tm_hour, ta.tm_min, delta_days);
+            else
+                snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
+        } else {
+            snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
+        }
+    }
+    uint16_t time_col = no_signal ? COLOR_META : COLOR_ROW0;
+    String dep_ts = dep_tbuf, arr_ts = arr_tbuf;
+    draw_text(dep_ts, PAD, TIME_Y, 2, time_col);
+    draw_text(arr_ts, SCREEN_W - PAD - text_w(arr_ts, 2), TIME_Y, 2, time_col);
 
-    // When no signal: show departure date as secondary info and skip the rest
+    // Route line + plane (inline with airport codes at BAR_CY)
+    const int BAR_LX = PAD + dep_w + 12;
+    const int BAR_RX = SCREEN_W - PAD - arr_w - 12;
+    const int BAR_W  = BAR_RX - BAR_LX;
+
     if (no_signal) {
+        if (BAR_W > 20)
+            gfx->drawFastHLine(BAR_LX, BAR_CY, BAR_W, COLOR_META);
+        draw_text(status_str,
+                  (SCREEN_W - text_w(status_str, 2)) / 2, STATUS_Y, 2, COLOR_META);
         String nd = fi.dep_date.length() > 0
-                    ? "No live data \x7E " + fi.dep_date   // "~" as separator in Latin-1
+                    ? "No live data \x7E " + fi.dep_date
                     : "No live data";
-        draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, APT_Y + 50, 2, COLOR_META);
+        draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, STATUS_Y + 22, 2, COLOR_META);
         return;
     }
 
-    // Progress bar + plane marker
+    // Progress: time-based when both timestamps known; elapsed-fraction fallback
     float progress = 0.0f;
     if (fi.dep_time > 0 && fi.arr_time > 0) {
-        if (now_t <= fi.dep_time)      progress = 0.0f;
+        if      (now_t <= fi.dep_time) progress = 0.0f;
         else if (now_t >= fi.arr_time) progress = 1.0f;
         else progress = (float)(now_t - fi.dep_time) / (float)(fi.arr_time - fi.dep_time);
-    } else if (fi.dep_time > 0 && fi.arr_time == 0 && fi.airborne) {
-        long elapsed = (long)(now_t - fi.dep_time);
-        progress = elapsed / (10.0f * 3600.0f);
+    } else if (fi.dep_time > 0 && fi.airborne) {
+        progress = (float)(now_t - fi.dep_time) / (10.0f * 3600.0f);
         if (progress > 0.95f) progress = 0.95f;
     }
 
-    const int BAR_LX = PAD + dep_w + 14;
-    const int BAR_RX = SCREEN_W - PAD - arr_w - 14;
-    const int BAR_W  = BAR_RX - BAR_LX;
     if (BAR_W > 20) {
-        gfx->drawFastHLine(BAR_LX, BAR_Y + 1, BAR_W, COLOR_META);
+        gfx->drawFastHLine(BAR_LX, BAR_CY, BAR_W, COLOR_META);
         int plane_cx = BAR_LX + (int)(progress * BAR_W);
-        if (plane_cx < BAR_LX + 7) plane_cx = BAR_LX + 7;
-        if (plane_cx > BAR_RX - 7) plane_cx = BAR_RX - 7;
-        draw_plane_right(plane_cx, BAR_Y, COLOR_ROW0);
+        // Clamp: tail reaches cx-18, nose tip reaches cx+27
+        if (plane_cx < BAR_LX + 18) plane_cx = BAR_LX + 18;
+        if (plane_cx > BAR_RX - 27) plane_cx = BAR_RX - 27;
+        draw_plane_large(plane_cx, BAR_CY, COLOR_ROW0);
     }
 
-    // Stats row: altitude, speed, heading (only when airborne + data present)
+    draw_text(status_str,
+              (SCREEN_W - text_w(status_str, 2)) / 2, STATUS_Y, 2, COLOR_ROW0);
+
+    // Alt / speed / heading (airborne only)
     if (fi.airborne && fi.alt_ft > 0) {
         char alt_buf[16], spd_buf[12], hdg_buf[6];
-        snprintf(alt_buf, sizeof(alt_buf), "%dft",  (int)roundf(fi.alt_ft / 100.0f) * 100);
-        snprintf(spd_buf, sizeof(spd_buf), "%dkm/h", (int)roundf(fi.speed_kmh));
-        snprintf(hdg_buf, sizeof(hdg_buf), "%s",     heading_label(fi.heading));
+        snprintf(alt_buf, sizeof(alt_buf), "%dft",   (int)roundf(fi.alt_ft / 100.0f) * 100);
+        snprintf(spd_buf, sizeof(spd_buf), "%dkm/h",  (int)roundf(fi.speed_kmh));
+        snprintf(hdg_buf, sizeof(hdg_buf), "%s",       heading_label(fi.heading));
         String alt_s = alt_buf, spd_s = spd_buf, hdg_s = hdg_buf;
         int gap = 22;
         int total_w = text_w(alt_s, 2) + gap + text_w(spd_s, 2) + gap + text_w(hdg_s, 2);
@@ -631,39 +1009,6 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
         draw_text(alt_s, sx, STATS_Y, 2, COLOR_ROW0);  sx += text_w(alt_s, 2) + gap;
         draw_text(spd_s, sx, STATS_Y, 2, COLOR_ROW0);  sx += text_w(spd_s, 2) + gap;
         draw_text(hdg_s, sx, STATS_Y, 2, COLOR_ROW0);
-    }
-
-    // Times row: dep_time > arr_time
-    if (fi.dep_time > 0 || fi.arr_time > 0) {
-        char dep_tbuf[12] = "--:--";
-        char arr_tbuf[14] = "--:--";
-        if (fi.dep_time > 0) {
-            struct tm td; localtime_r(&fi.dep_time, &td);
-            snprintf(dep_tbuf, sizeof(dep_tbuf), "%02d:%02d", td.tm_hour, td.tm_min);
-        }
-        if (fi.arr_time > 0) {
-            struct tm ta; localtime_r(&fi.arr_time, &ta);
-            if (fi.dep_time > 0) {
-                struct tm td2; localtime_r(&fi.dep_time, &td2);
-                int delta_days = ta.tm_yday - td2.tm_yday;
-                if (delta_days != 0)
-                    snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d+%d",
-                             ta.tm_hour, ta.tm_min, delta_days);
-                else
-                    snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
-            } else {
-                snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
-            }
-        }
-        String dep_ts = dep_tbuf, arr_ts = arr_tbuf, arrow = " > ";
-        int16_t dw = text_w(dep_ts, 2), arw = text_w(arrow, 2), aw2 = text_w(arr_ts, 2);
-        int tx = (SCREEN_W - dw - arw - aw2) / 2;
-        draw_text(dep_ts, tx,       TIMES_Y, 2, COLOR_ROW0); tx += dw;
-        draw_text(arrow,  tx,       TIMES_Y, 2, COLOR_META); tx += arw;
-        draw_text(arr_ts, tx,       TIMES_Y, 2, COLOR_ROW0);
-    } else {
-        String nd = "No schedule data yet";
-        draw_text(nd, (SCREEN_W - text_w(nd, 2)) / 2, TIMES_Y, 2, COLOR_META);
     }
 }
 
@@ -734,8 +1079,8 @@ static void anim_task_fn(void*) {
         uint32_t t0 = millis();
         for (int i = 0; i < COLS && i < 64; i++) {
             heads[i]     = (int8_t)(-random(ROWS * 2));
-            col_extra[i] = (uint8_t)random(21);  // 0–20 → interval 60–80ms
-            col_next[i]  = t0 + random(80);      // stagger first fire
+            col_extra[i] = (uint8_t)random(36);  // 0–35 → interval 52–87ms (±25% of 70ms)
+            col_next[i]  = t0 + random(87);      // stagger first fire
         }
     }
 
@@ -774,9 +1119,9 @@ static void anim_task_fn(void*) {
             }
             if (++heads[c] > ROWS + 6) {
                 heads[c]     = (int8_t)(-random(ROWS / 2));
-                col_extra[c] = (uint8_t)random(21);  // re-randomize speed each cycle
+                col_extra[c] = (uint8_t)random(36);  // re-randomize speed each cycle
             }
-            col_next[c] = now + 60 + col_extra[c];
+            col_next[c] = now + 52 + col_extra[c];
         }
 
     }

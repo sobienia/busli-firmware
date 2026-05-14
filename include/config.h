@@ -31,11 +31,12 @@
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  THEME COLORS (16-bit RGB565 format)                                      ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
-// ZVV amber (#F7B500 = RGB 247,181,0) at four brightness levels
-#define COLOR_ROW0    0xF5A0   // 100% — main text
-#define COLOR_ROWS    0xC480   //  80% — boot animation trail
-#define COLOR_DIM     0x7AC0   //  50% — delays / stale indicator
-#define COLOR_META    0x49A0   //  30% — separators / inactive dots
+// Transit amber (~RGB 240,144,0 = #F09000) at four brightness levels.
+// G/R ratio ≈ 0.6 gives warm amber; the old palette (G/R ≈ 0.75) read as yellow.
+#define COLOR_ROW0    0xF480   // 100% — main text
+#define COLOR_ROWS    0xC3A0   //  80% — boot animation trail
+#define COLOR_DIM     0x7A40   //  50% — delays / stale indicator
+#define COLOR_META    0x4960   //  30% — separators / inactive dots
 #define COLOR_BLACK   0x0000
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -56,7 +57,7 @@
 
 #define FETCH_TASK_STACK      12288  // FreeRTOS task stack (bytes)
 #define FETCH_TASK_PRIORITY   1      // Low priority — runs on WiFi core 0
-#define FETCH_INTERVAL_MS     60000  // Full cycle time across all stops (ms)
+#define FETCH_INTERVAL_MS     30000  // Full cycle time across all stops (ms)
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  TOUCH                                                                    ║
@@ -65,7 +66,7 @@
 #define TOUCH_SDA_PIN        5
 #define TOUCH_SCL_PIN        6
 #define TOUCH_I2C_ADDR       0x5A  // CST226SE (Mutual) — confirmed by I2C scan
-#define TOUCH_SWIPE_PX       40     // minimum displacement to register a swipe
+#define TOUCH_SWIPE_PX       25     // minimum displacement to register a swipe (lower = more sensitive)
 #define TOUCH_LONG_PRESS_MS  2000
 #define TOUCH_DOUBLE_TAP_MS  350
 
@@ -73,7 +74,13 @@
 // ║  HARDWARE PINS                                                            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define PIN_BOOT_BUTTON   0     // BOOT button (used for switching stops)
+#define PIN_BOOT_BUTTON   0     // BOOT button: short press = next stop, long = refresh, 3s = config
+// Physical bottom-left button: short press toggles large-font mode.
+// Physical bottom-right button: short press cycles brightness 100→90→…→50→100.
+// *** GPIOs below are placeholders — check serial [GPIO] probe output while pressing each button ***
+#define PIN_BTN_ZOOM     38     // bottom-left button (GPIO not yet confirmed — check serial probe)
+#define PIN_BTN_BRIGHT   12     // bottom-right button (confirmed GPIO 12)
+#define PIN_BATTERY_ADC   4     // battery ADC: reads half the battery voltage through a 1:2 divider
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  FOOTER LAYOUT                                                            ║
@@ -104,3 +111,4 @@
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 #define PORTAL_TIMEOUT_MS  300000  // 5 minutes; 0 = no timeout
+

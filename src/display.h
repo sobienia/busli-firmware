@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <vector>
 #include "../include/flight_tracker.h"
+#include "../include/commute.h"
 
 // One transit departure (used by both display and api modules)
 struct Departure {
@@ -21,6 +22,10 @@ void display_init();
 
 // Set backlight brightness (0–100)
 void display_set_brightness(uint8_t percent);
+
+// Step through day-brightness levels: 100→90→80→70→60→50→100 (wraps).
+// Night mode is unaffected — it still overrides to NIGHT_BRIGHTNESS automatically.
+void display_step_brightness();
 
 // Show a centered message (used during boot, errors)
 void display_show_status(const char* message);
@@ -43,7 +48,10 @@ void display_draw_board(
     time_t fetch_time,
     bool large_font_mode,
     time_t countdown_target, // 0 = disabled; shows remaining time in footer when > now
-    int    countdown_icon    // 0=none 1=palm 2=calendar 3=plane
+    int    countdown_icon,   // 0=none 1=palm 2=calendar 3=plane
+    bool   snow_today,       // show snowflake icon in footer
+    bool   clear_today,      // show sun icon in footer
+    int    battery_pct       // 0–100; -1 = don't show battery icon
 );
 
 // Force a full redraw on the next display_draw_board call (call after stop changes,
@@ -54,6 +62,25 @@ void display_invalidate();
 // slot/flight_count drive the dot indicator in the header (like stop dots).
 // If fi.callsign is empty, shows a "No flight configured" placeholder.
 void display_draw_flight(int slot, int flight_count, const FlightInfo& fi, bool wifi_ok);
+
+// Draw the commute board (home or work direction).
+// direction_label: shown in header, e.g. "> Home" or "> Work"
+// connection_idx:  which connection to show at the top (swipe-down advances it)
+void display_draw_commute(
+    const char* direction_label,
+    int page_idx,
+    int page_count,
+    const CommuteData& data,
+    int connection_idx,
+    bool wifi_ok,
+    int battery_pct,
+    const char* weather_str,
+    const char* uv_str,
+    bool rain_today,
+    int  rain_pct,
+    bool snow_today,
+    bool clear_today
+);
 
 // Boot animation (Matrix-style cascading characters).
 // Start it before the blocking setup steps; update the status text as each

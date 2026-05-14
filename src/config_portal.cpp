@@ -25,6 +25,8 @@
 #define NVS_KEY_STOPS       "stops"
 #define NVS_KEY_COUNTDOWN   "countdown"
 #define NVS_KEY_FLIGHTS     "flights"
+#define NVS_KEY_OPENSKY     "opensky"
+#define NVS_KEY_COMMUTE     "commute"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -35,7 +37,7 @@ static bool       s_saved = false;
 
 // ── NVS helpers ───────────────────────────────────────────────────────────────
 
-int config_load_wifi(String ssids[], String passes[]) {
+int config_load_wifi(String ssids[], String passes[], String users[]) {
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, true);
     String json = prefs.getString(NVS_KEY_WIFI, "");
@@ -50,6 +52,7 @@ int config_load_wifi(String ssids[], String passes[]) {
         if (n >= MAX_WIFI) break;
         ssids[n]  = o["s"] | "";
         passes[n] = o["p"] | "";
+        users[n]  = o["u"] | "";
         if (ssids[n].length() > 0) n++;
     }
     return n;
@@ -105,18 +108,53 @@ int config_load_flights(FlightEntry entries[]) {
     int n = 0;
     for (JsonObject o : arr) {
         if (n >= MAX_FLIGHTS) break;
-        entries[n].callsign = o["c"] | "";
-        entries[n].dep_date = o["d"] | "";
+        entries[n].callsign     = o["c"]  | "";
+        entries[n].dep_date     = o["d"]  | "";
+        entries[n].dep_icao     = o["da"] | "";
+        entries[n].arr_icao     = o["aa"] | "";
+        entries[n].dep_time_str = o["dt"] | "";
+        entries[n].arr_time_str = o["at"] | "";
         entries[n].callsign.trim();
+        entries[n].dep_icao.toUpperCase();
+        entries[n].arr_icao.toUpperCase();
         if (entries[n].callsign.length() > 0) n++;
     }
     return n;
 }
 
-static void save_to_nvs(String ssids[], String passes[], int n_wifi,
+bool config_load_opensky(String& user, String& pass) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_OPENSKY, "");
+    prefs.end();
+    if (json.isEmpty()) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return false;
+    user = doc["u"] | "";
+    pass = doc["p"] | "";
+    return user.length() > 0;
+}
+
+bool config_load_commute(CommuteConfig& out) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_COMMUTE, "");
+    prefs.end();
+    if (json.isEmpty()) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return false;
+    out.home_station = doc["hs"] | "";
+    out.work_station = doc["ws"] | "";
+    return out.home_station.length() > 0 || out.work_station.length() > 0;
+}
+
+
+static void save_to_nvs(String ssids[], String passes[], String users[], int n_wifi,
                          StopEntry stops[], int n_stops,
                          const String& cd_label, const String& cd_target, int cd_icon,
-                         FlightEntry flights[], int n_flights) {
+                         FlightEntry flights[], int n_flights,
+                         const String& opensky_user, const String& opensky_pass,
+                         const CommuteConfig& commute) {
     // WiFi JSON
     JsonDocument wdoc;
     JsonArray warr = wdoc.to<JsonArray>();
@@ -124,6 +162,7 @@ static void save_to_nvs(String ssids[], String passes[], int n_wifi,
         JsonObject o = warr.add<JsonObject>();
         o["s"] = ssids[i];
         o["p"] = passes[i];
+        if (users[i].length() > 0) o["u"] = users[i];
     }
     String wifi_json;
     serializeJson(wdoc, wifi_json);
@@ -166,6 +205,10 @@ static void save_to_nvs(String ssids[], String passes[], int n_wifi,
             JsonObject o = flarr.add<JsonObject>();
             o["c"] = flights[i].callsign;
             o["d"] = flights[i].dep_date;
+            if (flights[i].dep_icao.length()     > 0) o["da"] = flights[i].dep_icao;
+            if (flights[i].arr_icao.length()     > 0) o["aa"] = flights[i].arr_icao;
+            if (flights[i].dep_time_str.length() > 0) o["dt"] = flights[i].dep_time_str;
+            if (flights[i].arr_time_str.length() > 0) o["at"] = flights[i].arr_time_str;
         }
         String fl_json;
         serializeJson(fldoc, fl_json);
@@ -173,9 +216,34 @@ static void save_to_nvs(String ssids[], String passes[], int n_wifi,
     } else {
         prefs.remove(NVS_KEY_FLIGHTS);
     }
+
+    if (opensky_user.length() > 0) {
+        JsonDocument oskydoc;
+        oskydoc["u"] = opensky_user;
+        oskydoc["p"] = opensky_pass;
+        String osky_json;
+        serializeJson(oskydoc, osky_json);
+        prefs.putString(NVS_KEY_OPENSKY, osky_json);
+    } else {
+        prefs.remove(NVS_KEY_OPENSKY);
+    }
+
+    // Commute JSON — inside the same open handle
+    if (commute.home_station.length() > 0 || commute.work_station.length() > 0) {
+        JsonDocument cmdoc;
+        cmdoc["hs"] = commute.home_station;
+        cmdoc["ws"] = commute.work_station;
+        String cm_json;
+        serializeJson(cmdoc, cm_json);
+        prefs.putString(NVS_KEY_COMMUTE, cm_json);
+    } else {
+        prefs.remove(NVS_KEY_COMMUTE);
+    }
+
     prefs.end();
 
-    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS\n", n_wifi, n_stops, n_flights);
+    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS\n",
+                  n_wifi, n_stops, n_flights);
 }
 
 // ── HTML builder ──────────────────────────────────────────────────────────────
@@ -193,10 +261,12 @@ static String html_encode(const String& s) {
     return out;
 }
 
-static String build_page(String ssids[], String passes[],
+static String build_page(String ssids[], String passes[], String users[],
                           StopEntry stops[], int n_stops,
                           const String& cd_label, const String& cd_target, int cd_icon,
-                          FlightEntry flights[], int n_flights) {
+                          FlightEntry flights[], int n_flights,
+                          const String& opensky_user, const String& opensky_pass,
+                          const CommuteConfig& commute) {
     String h;
     h.reserve(10000);
 
@@ -254,6 +324,9 @@ static String build_page(String ssids[], String passes[],
         h += "<label>Password</label>"
              "<input type='password' name='w" + String(i) + "p' value='"
              + html_encode(passes[i]) + "'>";
+        h += "<label>Username <span style='font-weight:normal;color:#666'>(leave blank for normal WPA2, fill in for enterprise/work networks)</span></label>"
+             "<input type='text' name='w" + String(i) + "u' value='"
+             + html_encode(users[i]) + "' autocomplete='off'>";
         h += "</div>";
     }
 
@@ -315,8 +388,12 @@ static String build_page(String ssids[], String passes[],
            "Both work. IATA is the number on your ticket.</p>");
     const char* swipe_label[] = { "swipe down", "swipe up" };
     for (int i = 0; i < MAX_FLIGHTS; i++) {
-        String cs  = (i < n_flights) ? flights[i].callsign : "";
-        String dat = (i < n_flights) ? flights[i].dep_date : "";
+        String cs   = (i < n_flights) ? flights[i].callsign     : "";
+        String dat  = (i < n_flights) ? flights[i].dep_date     : "";
+        String depa = (i < n_flights) ? flights[i].dep_icao     : "";
+        String arra = (i < n_flights) ? flights[i].arr_icao     : "";
+        String dtm  = (i < n_flights) ? flights[i].dep_time_str : "";
+        String atm  = (i < n_flights) ? flights[i].arr_time_str : "";
         h += "<div class='card'><div class='ct'>Flight ";
         h += String(i + 1);
         h += " <span style='font-weight:normal;color:#666'>(";
@@ -328,6 +405,50 @@ static String build_page(String ssids[], String passes[],
         h += "<label>Departure date</label>"
              "<input type='date' name='fl" + String(i) + "d' value='"
              + html_encode(dat) + "'>";
+        h += "<label>Departure airport <span class='hint'>IATA code from your ticket, e.g. ZRH, ADD, JFK</span></label>"
+             "<input type='text' name='fl" + String(i) + "da' maxlength='4' placeholder='ZRH' value='"
+             + html_encode(depa) + "' style='text-transform:uppercase'>";
+        h += "<label>Arrival airport <span class='hint'>IATA code from your ticket, e.g. BKK, LHR, DXB</span></label>"
+             "<input type='text' name='fl" + String(i) + "aa' maxlength='4' placeholder='BKK' value='"
+             + html_encode(arra) + "' style='text-transform:uppercase'>";
+        h += "<label>Departure time <span class='hint'>local time from ticket — enables clock display and progress bar</span></label>"
+             "<input type='time' name='fl" + String(i) + "dt' value='"
+             + html_encode(dtm) + "'>";
+        h += "<label>Arrival time <span class='hint'>local time from ticket</span></label>"
+             "<input type='time' name='fl" + String(i) + "at' value='"
+             + html_encode(atm) + "'>";
+        h += "</div>";
+    }
+    h += F("<div class='card'><div class='ct'>OpenSky Network account</div>"
+           "<p class='hint'>Required for live flight data. Without credentials, OpenSky ignores "
+           "the callsign filter and returns all aircraft worldwide (~5 MB \xe2\x80\x94 unusable). "
+           "Create a free account at <b>opensky-network.org</b> and enter your login here.</p>");
+    h += "<label>Username</label>"
+         "<input type='text' name='osky_u' autocomplete='off' value='"
+         + html_encode(opensky_user) + "'>";
+    h += "<label>Password</label>"
+         "<input type='password' name='osky_p' value='"
+         + html_encode(opensky_pass) + "'>";
+    h += F("</div>");
+
+    // ── Commute section ──────────────────────────────────────────────────────
+    h += F("<h2>Commute</h2>"
+           "<p class='hint' style='margin:-4px 0 10px'>Pick your nearest transit stop for home and work. "
+           "Two extra pages appear in the rotation: <b>&gt; Home</b> and <b>&gt; Work</b> "
+           "showing connections between them. Swipe down for later connections.</p>");
+    const char* cm_labels[] = { "Home stop", "Work stop" };
+    const String cm_stns[]  = { commute.home_station, commute.work_station };
+    const char* cm_keys[]   = { "cm_hs", "cm_ws" };
+    for (int i = 0; i < 2; i++) {
+        h += "<div class='card'><div class='ct'>";
+        h += cm_labels[i];
+        h += "</div>";
+        h += "<label>Station <span class='hint'>start typing to search&hellip;</span></label>"
+             "<div class='sta-wrap'>"
+             "<input type='text' name='" + String(cm_keys[i]) + "' value='"
+             + html_encode(cm_stns[i]) + "' oninput='st(this)' autocomplete='off'>"
+             "<div class='drop'></div>"
+             "</div>";
         h += "</div>";
     }
 
@@ -384,6 +505,7 @@ static String build_page(String ssids[], String passes[],
 
 static String s_ssids[MAX_WIFI];
 static String s_passes[MAX_WIFI];
+static String s_users[MAX_WIFI];
 static StopEntry s_stops[MAX_STOPS];
 static int s_n_stops = 0;
 static String s_cd_label;
@@ -391,25 +513,32 @@ static String s_cd_target;
 static int    s_cd_icon = 0;
 static FlightEntry s_flights[MAX_FLIGHTS];
 static int         s_n_flights = 0;
+static String      s_opensky_user;
+static String      s_opensky_pass;
+static CommuteConfig s_commute;
 
 static void handle_root() {
-    String page = build_page(s_ssids, s_passes, s_stops, s_n_stops,
+    String page = build_page(s_ssids, s_passes, s_users, s_stops, s_n_stops,
                              s_cd_label, s_cd_target, s_cd_icon,
-                             s_flights, s_n_flights);
+                             s_flights, s_n_flights,
+                             s_opensky_user, s_opensky_pass,
+                             s_commute);
     s_server.send(200, "text/html", page);
 }
 
 static void handle_save() {
     // Parse WiFi
-    String new_ssids[MAX_WIFI], new_passes[MAX_WIFI];
+    String new_ssids[MAX_WIFI], new_passes[MAX_WIFI], new_users[MAX_WIFI];
     int n_wifi = 0;
     for (int i = 0; i < MAX_WIFI; i++) {
         String ss = s_server.arg("w" + String(i) + "s");
         String pp = s_server.arg("w" + String(i) + "p");
-        ss.trim();
+        String uu = s_server.arg("w" + String(i) + "u");
+        ss.trim(); uu.trim();
         if (ss.length() > 0) {
             new_ssids[n_wifi]  = ss;
             new_passes[n_wifi] = pp;
+            new_users[n_wifi]  = uu;
             n_wifi++;
         }
     }
@@ -443,15 +572,32 @@ static void handle_save() {
     for (int i = 0; i < MAX_FLIGHTS; i++) {
         String cs  = s_server.arg("fl" + String(i) + "c"); cs.trim();
         String dat = s_server.arg("fl" + String(i) + "d"); dat.trim();
+        String depa = s_server.arg("fl" + String(i) + "da"); depa.trim(); depa.toUpperCase();
+        String arra = s_server.arg("fl" + String(i) + "aa"); arra.trim(); arra.toUpperCase();
         if (cs.length() > 0) {
-            new_flights[n_flights].callsign = cs;
-            new_flights[n_flights].dep_date = dat;
+            String dtstr = s_server.arg("fl" + String(i) + "dt"); dtstr.trim();
+            String atstr = s_server.arg("fl" + String(i) + "at"); atstr.trim();
+            new_flights[n_flights].callsign     = cs;
+            new_flights[n_flights].dep_date     = dat;
+            new_flights[n_flights].dep_icao     = depa;
+            new_flights[n_flights].arr_icao     = arra;
+            new_flights[n_flights].dep_time_str = dtstr;
+            new_flights[n_flights].arr_time_str = atstr;
             n_flights++;
         }
     }
 
-    save_to_nvs(new_ssids, new_passes, n_wifi, new_stops, n_stops,
-                cd_label, cd_target, cd_icon, new_flights, n_flights);
+    String new_opensky_user = s_server.arg("osky_u"); new_opensky_user.trim();
+    String new_opensky_pass = s_server.arg("osky_p");
+
+    // Parse commute
+    CommuteConfig new_commute;
+    new_commute.home_station = s_server.arg("cm_hs"); new_commute.home_station.trim();
+    new_commute.work_station = s_server.arg("cm_ws"); new_commute.work_station.trim();
+
+    save_to_nvs(new_ssids, new_passes, new_users, n_wifi, new_stops, n_stops,
+                cd_label, cd_target, cd_icon, new_flights, n_flights,
+                new_opensky_user, new_opensky_pass, new_commute);
 
     s_server.send(200, "text/html",
         F("<!DOCTYPE html><html><head>"
@@ -508,12 +654,15 @@ void config_portal_run(uint32_t timeoutMs) {
     display_show_status("Configure device");
 
     // Load current config to pre-populate the form
-    int n_wifi = config_load_wifi(s_ssids, s_passes);
+    int n_wifi = config_load_wifi(s_ssids, s_passes, s_users);
     // Fill empty slots so the form shows blanks
-    for (int i = n_wifi; i < MAX_WIFI; i++) { s_ssids[i] = ""; s_passes[i] = ""; }
+    for (int i = n_wifi; i < MAX_WIFI; i++) { s_ssids[i] = ""; s_passes[i] = ""; s_users[i] = ""; }
     s_n_stops  = config_load_stops(s_stops);
     config_load_countdown(s_cd_label, s_cd_target, s_cd_icon);
     s_n_flights = config_load_flights(s_flights);
+    config_load_opensky(s_opensky_user, s_opensky_pass);
+    s_commute = {};
+    config_load_commute(s_commute);
 
     // Start AP
     WiFi.disconnect(true);

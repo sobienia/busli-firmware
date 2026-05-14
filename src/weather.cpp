@@ -62,12 +62,20 @@ bool weather_fetch(WeatherData& out) {
 
     int daily_code      = doc["daily"]["weather_code"][0]                  | 0;
     out.precip_prob_pct = doc["daily"]["precipitation_probability_max"][0] | 0;
-    out.rain_today      = (daily_code >= 51) || (out.precip_prob_pct >= WEATHER_RAIN_PROB_PCT);
-    out.valid           = true;
 
-    Serial.printf("[Weather] cur=%.1f max=%.1f UV%d/%d rain=%s (code=%d prob=%d%%)\n",
+    // Classify condition — snow and rain are mutually exclusive for icon purposes
+    bool is_snow = (daily_code >= 71 && daily_code <= 77) ||
+                   (daily_code >= 85 && daily_code <= 86);
+    bool is_rain = !is_snow && (daily_code >= 51);
+    out.snow_today  = is_snow;
+    out.clear_today = (daily_code == 0 || daily_code == 1);
+    out.rain_today  = is_rain || (!is_snow && out.precip_prob_pct >= WEATHER_RAIN_PROB_PCT);
+    out.valid       = true;
+
+    Serial.printf("[Weather] cur=%.1f max=%.1f UV%d/%d rain=%s snow=%s clear=%s (code=%d prob=%d%%)\n",
         out.temp_c, out.temp_max_c, out.uv_index, out.uv_index_max,
-        out.rain_today ? "yes" : "no",
-        daily_code, out.precip_prob_pct);
+        out.rain_today ? "y" : "n", out.snow_today ? "y" : "n",
+        out.clear_today ? "y" : "n", daily_code, out.precip_prob_pct);
+
     return true;
 }
