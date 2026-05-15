@@ -203,7 +203,7 @@ static void set_initial_page() {
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 static bool try_connect(const String& ssid, const String& pass,
-                        const String& user = "", uint32_t timeout_ms = 12000) {
+                        const String& user = "", uint32_t timeout_ms = 8000) {
     if (ssid.isEmpty()) return false;
     if (user.length() > 0) {
         Serial.printf("[WiFi] Trying enterprise '%s' user='%s'...\n", ssid.c_str(), user.c_str());
@@ -271,8 +271,9 @@ static void sync_clock() {
 
 static void update_battery() {
     if (!s_pmu_ok) { g_battery_pct = -1; g_battery_charging = false; return; }
-    if (!pmu.isBatteryConnect()) { g_battery_pct = -1; g_battery_charging = false; return; }
     uint16_t mv = pmu.getBattVoltage();
+    // getBattVoltage() returns 0 when the ADC hasn't produced a reading yet
+    if (mv == 0) { g_battery_pct = -1; g_battery_charging = false; return; }
     g_battery_charging = pmu.isCharging();
     int pct = (int)((mv - 3200) * 100 / (4200 - 3200));
     if (pct < 0)   pct = 0;
@@ -559,6 +560,7 @@ void setup() {
         } else {
             s_pmu_ok = true;
             pmu.enableCharge();
+            pmu.enableMeasure();  // start continuous ADC so getBattVoltage() returns real data
             Serial.println("[PMU] SY6970 OK");
         }
     }

@@ -135,7 +135,7 @@
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.1.0"
+#define FIRMWARE_VERSION        "1.2.0"
 #define OTA_VERSION_URL         ""   // URL of version.json; leave "" to disable auto-OTA
 #define OTA_CHECK_INTERVAL_SEC  86400
 

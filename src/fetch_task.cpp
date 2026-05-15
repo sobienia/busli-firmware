@@ -78,7 +78,7 @@ static void do_fetch(int idx) {
     xSemaphoreGive(s_mutex);
 }
 
-static void do_fetch_weather() {
+static bool do_fetch_weather() {
     WeatherData wd;
     http_lock_take();
     bool ok = weather_fetch(wd);
@@ -86,6 +86,7 @@ static void do_fetch_weather() {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (ok) { s_weather = wd; s_weather_ok = true; }
     xSemaphoreGive(s_mutex);
+    return ok;
 }
 
 static void do_fetch_commute() {
@@ -125,7 +126,8 @@ static void fetch_task_loop(void* /*param*/) {
 
     time_t last_weather_fetch = time(nullptr);
     time_t last_commute_fetch = time(nullptr);
-    time_t last_ota_check     = time(nullptr);
+    // First OTA check fires at boot+3min, then every OTA_CHECK_INTERVAL_SEC after that.
+    time_t last_ota_check     = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 180;
     time_t last_ntp_sync      = time(nullptr);
 
     for (;;) {
@@ -159,8 +161,10 @@ static void fetch_task_loop(void* /*param*/) {
 
         // ── Weather ───────────────────────────────────────────────────────────
         if (now - last_weather_fetch >= WEATHER_REFRESH_SEC) {
-            do_fetch_weather();
-            last_weather_fetch = time(nullptr);
+            bool ok = do_fetch_weather();
+            // On failure retry in 60 s; on success wait the full refresh interval.
+            last_weather_fetch = ok ? time(nullptr)
+                                    : time(nullptr) - WEATHER_REFRESH_SEC + 60;
         }
 
         // ── Commute ───────────────────────────────────────────────────────────
