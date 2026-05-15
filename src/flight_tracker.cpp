@@ -12,16 +12,19 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #define MAX_FLIGHTS   2
 #define HTTP_TIMEOUT  12000   // ms per request
 
-static FlightEntry  s_entries[MAX_FLIGHTS];
-static FlightInfo   s_cache[MAX_FLIGHTS];
-static String       s_icao24[MAX_FLIGHTS];  // cached per slot; avoids re-querying
-static int          s_count = 0;
-static String       s_opensky_user;
-static String       s_opensky_pass;
+static FlightEntry          s_entries[MAX_FLIGHTS];
+static FlightInfo           s_cache[MAX_FLIGHTS];
+static String               s_icao24[MAX_FLIGHTS];
+static int                  s_count = 0;
+static String               s_opensky_user;
+static String               s_opensky_pass;
+static SemaphoreHandle_t    s_mutex = nullptr;
 
 void flight_tracker_set_opensky_auth(const String& user, const String& pass) {
     s_opensky_user = user;
@@ -464,12 +467,15 @@ static void do_refresh(int slot) {
     }
 
     fi.fetched_at = time(nullptr);
+    if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_cache[slot] = fi;
+    if (s_mutex) xSemaphoreGive(s_mutex);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void flight_tracker_init(const FlightEntry* entries, int count) {
+    s_mutex = xSemaphoreCreateMutex();
     s_count = (count < MAX_FLIGHTS) ? count : MAX_FLIGHTS;
     for (int i = 0; i < s_count; i++) {
         s_entries[i] = entries[i];
@@ -478,8 +484,7 @@ void flight_tracker_init(const FlightEntry* entries, int count) {
         s_cache[i].dep_date = entries[i].dep_date;
         s_icao24[i]  = "";
     }
-    // Initial blocking fetch so the first flight view has data
-    for (int i = 0; i < s_count; i++) do_refresh(i);
+    // No blocking HTTP fetch here — background task calls flight_tracker_refresh() on core 0
 }
 
 bool flight_tracker_refresh(int slot) {
@@ -490,7 +495,9 @@ bool flight_tracker_refresh(int slot) {
 
 void flight_tracker_get(int slot, FlightInfo& out) {
     if (slot < 0 || slot >= s_count) { out = FlightInfo{}; return; }
+    if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
     out = s_cache[slot];
+    if (s_mutex) xSemaphoreGive(s_mutex);
 }
 
 int flight_tracker_count() { return s_count; }

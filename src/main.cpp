@@ -125,10 +125,8 @@ static int      g_countdown_icon   = 0;
 
 // Flight tracking
 enum View { VIEW_BOARD, VIEW_FLIGHT0, VIEW_FLIGHT1 };
-static View     g_view            = VIEW_BOARD;
-static int      g_flight_count    = 0;
-static uint32_t g_last_flight_ms[2] = {0, 0};
-#define FLIGHT_REFRESH_MS  (5UL * 60 * 1000)
+static View g_view         = VIEW_BOARD;
+static int  g_flight_count = 0;
 
 // Commute — display-side cache; populated from background task via fetch_task_get_commute()
 static CommuteData g_commute_home  = {};
@@ -250,7 +248,7 @@ static bool connect_wifi() {
 
 static void sync_clock() {
     Serial.println("[NTP] Syncing time...");
-    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
+    configTzTime(POSIX_TZ, "pool.ntp.org", "time.nist.gov");
     uint32_t start = millis();
     time_t now = 0;
     while (millis() - start < 10000) {
@@ -451,8 +449,7 @@ static void check_touch() {
                 if (g_view == VIEW_BOARD) fetch_task_force_refresh();
                 else {
                     int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
-                    flight_tracker_refresh(slot);
-                    g_last_flight_ms[slot] = millis();
+                    flight_tracker_refresh(slot);  // user-triggered: brief core-1 block is OK
                     display_invalidate();
                 }
             } else {
@@ -531,6 +528,7 @@ void setup() {
     pinMode(PIN_BTN_BRIGHT,  INPUT_PULLUP);
     pinMode(PIN_BTN_ZOOM,    INPUT_PULLUP);
     pinMode(PIN_BTN_THEME,   INPUT_PULLUP);
+    analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);  // 0–3.1V range for 1:2 LiPo divider
 
     display_init();
     display_init_brightness();
@@ -603,9 +601,8 @@ void setup() {
             String osky_u, osky_p;
             if (config_load_opensky(osky_u, osky_p))
                 flight_tracker_set_opensky_auth(osky_u, osky_p);
-            flight_tracker_init(fl_entries, g_flight_count);
-            for (int i = 0; i < g_flight_count; i++)
-                g_last_flight_ms[i] = millis();
+            // Registers entries and schedules initial fetch on core 0 — setup() doesn't block
+            fetch_task_init_flights(fl_entries, g_flight_count);
         }
     }
 
@@ -645,20 +642,6 @@ void loop() {
             display_show_status("Update failed");
             delay(3000);
             display_invalidate();
-        }
-    }
-
-    // Flight refresh (every 5 min per slot) — still on core 1 since flight_tracker
-    // handles its own http_lock internally and is infrequent enough not to cause stutter.
-    if (g_flight_count > 0) {
-        for (int i = 0; i < g_flight_count; i++) {
-            if (now_ms - g_last_flight_ms[i] >= FLIGHT_REFRESH_MS) {
-                flight_tracker_refresh(i);
-                g_last_flight_ms[i] = millis();
-                if (g_view == VIEW_FLIGHT0 && i == 0) display_invalidate();
-                if (g_view == VIEW_FLIGHT1 && i == 1) display_invalidate();
-                break;
-            }
         }
     }
 
@@ -772,7 +755,7 @@ void loop() {
             delay(100);
             if (connect_wifi()) {
                 esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-                configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
+                configTzTime(POSIX_TZ, "pool.ntp.org", "time.nist.gov");
             }
         }
     }

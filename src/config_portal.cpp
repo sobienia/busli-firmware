@@ -18,6 +18,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <Update.h>
 
 #define PORTAL_SSID    "Busli-Config"
 #define NVS_NAMESPACE       "busli"
@@ -454,6 +455,9 @@ static String build_page(String ssids[], String passes[], String users[],
 
     h += F("<button type='submit'>&#128190;&nbsp; Save &amp; Reboot</button>"
            "</form>"
+           "<p style='text-align:center;margin-top:20px'>"
+           "<a href='/update' style='color:#555;font-size:13px'>&#9652; Upload firmware (.bin)</a>"
+           "</p>"
            "<script>"
            "var _t;"
            "function st(el){"
@@ -608,6 +612,72 @@ static void handle_save() {
     s_saved = true;
 }
 
+// ── Firmware update via browser upload ───────────────────────────────────────
+
+static void handle_update_page() {
+    s_server.send(200, "text/html",
+        F("<!DOCTYPE html><html><head>"
+          "<meta charset='UTF-8'>"
+          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+          "<title>Firmware Update</title>"
+          "<style>"
+          "*{box-sizing:border-box}"
+          "body{font:15px/1.5 sans-serif;max-width:500px;margin:0 auto;"
+               "padding:16px;background:#111;color:#f7b500}"
+          "h1{font-size:22px;margin:0 0 8px}"
+          "p{color:#999;font-size:13px}"
+          "input[type=file]{color:#ddd;margin:16px 0;display:block}"
+          "button{display:block;width:100%;padding:15px;margin-top:8px;"
+                  "background:#f7b500;color:#000;font-size:16px;font-weight:bold;"
+                  "border:none;border-radius:8px;cursor:pointer}"
+          "a{color:#555;font-size:13px}"
+          "</style></head><body>"
+          "<h1>&#9652; Firmware Update</h1>"
+          "<p>Select a <b>.bin</b> file compiled for this device and click Upload. "
+          "The device reboots automatically when the flash completes.</p>"
+          "<form method='POST' action='/update' enctype='multipart/form-data'>"
+          "<input type='file' name='firmware' accept='.bin'>"
+          "<button type='submit'>Upload &amp; Flash</button>"
+          "</form>"
+          "<p style='margin-top:20px'><a href='/'>&#8592; Back to settings</a></p>"
+          "</body></html>"));
+}
+
+static void handle_update_upload() {
+    HTTPUpload& up = s_server.upload();
+    if (up.status == UPLOAD_FILE_START) {
+        Serial.printf("[OTA] Upload start: %s\n", up.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+            Serial.println("[OTA] Update.begin failed");
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(up.buf, up.currentSize) != up.currentSize)
+            Serial.println("[OTA] Write error");
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (Update.end(true))
+            Serial.printf("[OTA] Flash complete: %u bytes\n", up.totalSize);
+        else
+            Serial.println("[OTA] Update.end failed");
+    }
+}
+
+static void handle_update_finish() {
+    bool ok = !Update.hasError();
+    s_server.send(200, "text/html", ok
+        ? F("<!DOCTYPE html><html><head>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<style>body{font:16px sans-serif;background:#111;color:#f7b500;"
+            "text-align:center;padding:40px}</style></head><body>"
+            "<h2>&#10003; Update complete</h2><p>Rebooting&hellip;</p></body></html>")
+        : F("<!DOCTYPE html><html><head>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<style>body{font:16px sans-serif;background:#111;color:#e03030;"
+            "text-align:center;padding:40px}</style></head><body>"
+            "<h2>&#10007; Update failed</h2>"
+            "<p><a href='/update' style='color:#f7b500'>Try again</a></p>"
+            "</body></html>"));
+    if (ok) { delay(500); ESP.restart(); }
+}
+
 static void handle_not_found() {
     // Captive-portal redirect — iOS/Android auto-detect and open the browser
     s_server.sendHeader("Location", "http://192.168.4.1/", true);
@@ -681,6 +751,8 @@ void config_portal_run(uint32_t timeoutMs) {
     s_server.on("/",         HTTP_GET,  handle_root);
     s_server.on("/save",     HTTP_POST, handle_save);
     s_server.on("/stations", HTTP_GET,  handle_stations);
+    s_server.on("/update",   HTTP_GET,  handle_update_page);
+    s_server.on("/update",   HTTP_POST, handle_update_finish, handle_update_upload);
     s_server.onNotFound(handle_not_found);
     s_server.begin();
 

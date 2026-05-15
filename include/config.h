@@ -13,8 +13,9 @@
 // If it has "V1.1" → set to 11. Otherwise → leave at 10.
 #define BOARD_VERSION 11
 
-// How often to refresh transit data (in seconds)
-#define REFRESH_INTERVAL_SEC 30
+// Transit refresh intervals
+#define ACTIVE_REFRESH_SEC    30   // currently-displayed stop
+#define INACTIVE_REFRESH_SEC  90   // background stops (3× less frequent)
 
 // Display brightness (0–100, percent)
 #define DAY_BRIGHTNESS    80
@@ -27,6 +28,7 @@
 // Timezone — Switzerland CET (DST handled automatically in code)
 #define TIMEZONE_OFFSET_SEC  3600
 #define DST_OFFSET_SEC       3600
+#define POSIX_TZ  "CET-1CEST,M3.5.0,M10.5.0/3"
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  THEME COLORS (16-bit RGB565 format)                                      ║
@@ -57,7 +59,9 @@
 
 #define FETCH_TASK_STACK      16384  // FreeRTOS task stack (bytes)
 #define FETCH_TASK_PRIORITY   1      // Low priority — runs on WiFi core 0
-#define FETCH_INTERVAL_MS     30000  // Full cycle time across all stops (ms)
+#define FETCH_LOOP_MS         5000   // How often the background task checks for due work
+#define FLIGHT_REFRESH_SEC    300    // Flight data refresh interval (5 min)
+#define NTP_RESYNC_SEC        86400  // Re-sync NTP once per day
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  TOUCH                                                                    ║

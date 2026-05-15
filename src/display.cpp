@@ -401,13 +401,10 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     }
     String clock_str = clock_buf;
 
-    // Build right cluster right-to-left: clock | battery | umbrella | dots
+    // Right cluster (right-to-left): clock | umbrella | dots
     int16_t clock_w = text_w(clock_str, fsz);
     int rx = SCREEN_W - PAD - clock_w;
     int clock_x = rx;
-
-    int battery_x = -1;
-    if (battery_pct >= 0) { rx -= 6; rx -= 22; battery_x = rx; }   // 22px icon + 6px gap
 
     int umbrella_x = -1;
     if (rain_active) { rx -= 16; umbrella_x = rx; }
@@ -415,9 +412,14 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     int dots_w = stop_count * 12;
     int dots_x = (dots_w > 0) ? (rx -= 8, rx -= dots_w, rx) : rx;
 
+    // Left cluster: battery (22px + 6px gap) then stop label
+    // Battery icon: 20px box + 2px terminal nub = 22px total
+    int label_x = PAD;
+    if (battery_pct >= 0) label_x = PAD + 22 + 6;
+
     // Stop label — truncate if too wide
     String label = to_latin1(stop_name);
-    int label_max = dots_x - PAD - 8;
+    int label_max = dots_x - label_x - 8;
     if (text_w(label, fsz) > label_max) {
         int comma = label.indexOf(", ");
         if (comma >= 0) label = label.substring(comma + 2);
@@ -425,19 +427,19 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
             label = label.substring(0, label.length() - 1);
     }
 
-    draw_text(label, PAD, ty, fsz, c_row0);
-    draw_text(clock_str, clock_x, ty, fsz, c_row0);
-
-    // Battery icon: 20×10 box + 2×4 terminal nub on the right
-    if (battery_x >= 0) {
+    // Battery icon at top-left (before stop label)
+    if (battery_pct >= 0) {
         int by = (HEADER_H - 10) / 2;
         uint16_t bat_col = (battery_pct <= 20) ? c_dim : c_row0;
-        gfx->drawRect(battery_x, by, 20, 10, bat_col);          // outer box
-        gfx->fillRect(battery_x + 20, by + 3, 2, 4, bat_col);   // + terminal nub
+        gfx->drawRect(PAD, by, 20, 10, bat_col);        // outer box
+        gfx->fillRect(PAD + 20, by + 3, 2, 4, bat_col); // + terminal nub
         int fill_w = battery_pct * 18 / 100;
         if (fill_w > 0)
-            gfx->fillRect(battery_x + 1, by + 1, fill_w, 8, bat_col);  // fill level
+            gfx->fillRect(PAD + 1, by + 1, fill_w, 8, bat_col);
     }
+
+    draw_text(label, label_x, ty, fsz, c_row0);
+    draw_text(clock_str, clock_x, ty, fsz, c_row0);
 
     if (umbrella_x >= 0)
         draw_umbrella(umbrella_x, ty, c_row0);

@@ -17,6 +17,7 @@
 #include "../include/config.h"
 #include "../include/http_lock.h"
 #include "../include/ota.h"
+#include "../include/flight_tracker.h"
 #include "api.h"
 #include "weather.h"
 #include "commute.h"
@@ -26,11 +27,18 @@
 
 static SemaphoreHandle_t s_mutex;
 static StopCache         s_cache[8];
-static const StopConfig* s_stops      = nullptr;
-static int               s_num_stops  = 0;
+static const StopConfig* s_stops          = nullptr;
+static int               s_num_stops      = 0;
 static volatile int      s_active_stop    = 0;
 static volatile bool     s_force_refresh  = false;
 static volatile bool     s_force_commute  = false;
+
+// Per-stop last-fetch timestamps for adaptive scheduling
+static time_t s_stop_last_attempt[8] = {};
+
+// Flight state (registered via fetch_task_init_flights, managed on core 0)
+static int    s_flight_count = 0;
+static time_t s_flight_last_fetch[2] = {0, 0};
 
 // Weather cache
 static WeatherData s_weather   = {};
@@ -109,42 +117,70 @@ static void fetch_task_loop(void* /*param*/) {
     do_fetch_weather();
     do_fetch_commute();
 
+    // Initial flight fetches (may block up to ~24s per slot — intentionally on core 0).
+    for (int i = 0; i < s_flight_count; i++) {
+        flight_tracker_refresh(i);
+        s_flight_last_fetch[i] = time(nullptr);
+    }
+
     time_t last_weather_fetch = time(nullptr);
     time_t last_commute_fetch = time(nullptr);
     time_t last_ota_check     = time(nullptr);
-
-    int round_robin_idx = (s_num_stops > 1) ? 1 : 0; // stop 0 already fetched synchronously
+    time_t last_ntp_sync      = time(nullptr);
 
     for (;;) {
-        // Transit stop fetch (force-refresh or round-robin)
-        int fetch_idx;
+        time_t now = time(nullptr);
+
+        // ── Transit: adaptive scheduling ──────────────────────────────────────
+        // Active stop: ACTIVE_REFRESH_SEC. Inactive stops: INACTIVE_REFRESH_SEC.
+        // Pick the most overdue stop on each iteration.
+        int  fetch_idx   = -1;
+        long best_overdue = -1;
+
         if (s_force_refresh) {
             fetch_idx       = s_active_stop;
             s_force_refresh = false;
         } else {
-            fetch_idx       = round_robin_idx;
-            round_robin_idx = (round_robin_idx + 1) % s_num_stops;
+            for (int i = 0; i < s_num_stops; i++) {
+                int  threshold = (i == s_active_stop) ? ACTIVE_REFRESH_SEC
+                                                      : INACTIVE_REFRESH_SEC;
+                long overdue   = (long)(now - s_stop_last_attempt[i]) - threshold;
+                if (overdue > best_overdue) {
+                    best_overdue = overdue;
+                    fetch_idx    = i;
+                }
+            }
         }
-        do_fetch(fetch_idx);
 
-        time_t now = time(nullptr);
+        if (fetch_idx >= 0) {
+            do_fetch(fetch_idx);
+            s_stop_last_attempt[fetch_idx] = time(nullptr);
+        }
 
-        // Weather: refresh every WEATHER_REFRESH_SEC
+        // ── Weather ───────────────────────────────────────────────────────────
         if (now - last_weather_fetch >= WEATHER_REFRESH_SEC) {
             do_fetch_weather();
             last_weather_fetch = time(nullptr);
         }
 
-        // Commute: refresh every COMMUTE_REFRESH_SEC, or on demand
-        bool commute_due = s_force_commute ||
-                           (now - last_commute_fetch >= COMMUTE_REFRESH_SEC);
-        if (commute_due) {
+        // ── Commute ───────────────────────────────────────────────────────────
+        if (s_force_commute || (now - last_commute_fetch >= COMMUTE_REFRESH_SEC)) {
             s_force_commute = false;
             do_fetch_commute();
             last_commute_fetch = time(nullptr);
         }
 
-        // OTA: check for firmware updates once per OTA_CHECK_INTERVAL_SEC
+        // ── Flights ───────────────────────────────────────────────────────────
+        // Refresh one slot per loop iteration to avoid back-to-back blocking calls.
+        for (int i = 0; i < s_flight_count; i++) {
+            if (now - s_flight_last_fetch[i] >= FLIGHT_REFRESH_SEC) {
+                flight_tracker_refresh(i);
+                s_flight_last_fetch[i] = time(nullptr);
+                break;
+            }
+        }
+
+        // ── OTA ───────────────────────────────────────────────────────────────
         if (now - last_ota_check >= OTA_CHECK_INTERVAL_SEC && !g_ota_pending) {
             String url;
             if (ota_check(url)) {
@@ -154,10 +190,14 @@ static void fetch_task_loop(void* /*param*/) {
             last_ota_check = time(nullptr);
         }
 
-        uint32_t delay_ms = (s_num_stops > 0)
-                            ? (FETCH_INTERVAL_MS / s_num_stops)
-                            : FETCH_INTERVAL_MS;
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        // ── NTP daily resync ──────────────────────────────────────────────────
+        if (now - last_ntp_sync >= NTP_RESYNC_SEC) {
+            configTzTime(POSIX_TZ, "pool.ntp.org", "time.nist.gov");
+            last_ntp_sync = time(nullptr);
+            Serial.println("[NTP] Daily resync triggered");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(FETCH_LOOP_MS));
     }
 }
 
@@ -165,10 +205,8 @@ void fetch_task_start(const StopConfig* stops, int num_stops) {
     s_stops     = stops;
     s_num_stops = num_stops;
     s_mutex     = xSemaphoreCreateMutex();
-
-    // Fetch stop 0 synchronously so there is data to display immediately
-    do_fetch(0);
-
+    // Background task fetches stop 0 first on its initial iteration (adaptive scheduler
+    // treats all stops as overdue at t=0 and picks active stop first due to lower threshold).
     xTaskCreatePinnedToCore(
         fetch_task_loop, "fetch",
         FETCH_TASK_STACK, nullptr, FETCH_TASK_PRIORITY,
@@ -223,4 +261,11 @@ bool fetch_task_get_commute(CommuteData& out_home, CommuteData& out_work) {
 
 void fetch_task_force_commute_refresh() {
     s_force_commute = true;
+}
+
+void fetch_task_init_flights(const FlightEntry* entries, int count) {
+    // Initialise data structures (no HTTP) so the display shows callsign names immediately.
+    flight_tracker_init(entries, count);
+    s_flight_count = count;
+    for (int i = 0; i < count; i++) s_flight_last_fetch[i] = 0; // trigger immediate fetch
 }

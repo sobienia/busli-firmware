@@ -1,10 +1,11 @@
 #pragma once
 #include <Arduino.h>
 #include <vector>
-#include "display.h"   // Departure struct
-#include "api.h"       // StopConfig struct
-#include "weather.h"   // WeatherData
-#include "commute.h"   // CommuteData
+#include "display.h"          // Departure struct
+#include "api.h"              // StopConfig struct
+#include "weather.h"          // WeatherData
+#include "commute.h"          // CommuteData
+#include "flight_tracker.h"   // FlightEntry
 
 struct StopCache {
     std::vector<Departure> departures;
@@ -42,3 +43,7 @@ bool fetch_task_get_commute(CommuteData& out_home, CommuteData& out_work);
 
 // Ask the background task to re-fetch commute data on its next iteration.
 void fetch_task_force_commute_refresh();
+
+// Register flights with the background task. Call from setup() after fetch_task_start().
+// The background task performs all fetches on core 0 — setup() never blocks on HTTP.
+void fetch_task_init_flights(const FlightEntry* entries, int count);
