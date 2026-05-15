@@ -675,15 +675,22 @@ void loop() {
     if (g_ota_pending) {
         g_ota_pending = false;
         display_show_status("Firmware update found\nInstalling...");
-        if (ota_apply(g_ota_url)) {
-            display_show_status("Update complete!\nRestarting...");
-            delay(2000);
-            ESP.restart();
-        } else {
-            display_show_status("Update failed");
-            delay(3000);
-            display_invalidate();
-        }
+        // HTTPS download needs ~20 KB of stack — more than loopTask's default 8 KB.
+        // Spawn a dedicated task so we control the stack size explicitly.
+        xTaskCreate([](void*) {
+            if (ota_apply(g_ota_url)) {
+                display_show_status("Update complete!\nRestarting...");
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                ESP.restart();
+            } else {
+                display_show_status("Update failed");
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                display_invalidate();
+            }
+            vTaskDelete(nullptr);
+        }, "ota_apply", 32768, nullptr, 5, nullptr);
+        // Suspend loop() while the OTA task runs so they don't race on display/HTTP
+        vTaskSuspend(nullptr);
     }
 
     // Pull latest weather + commute from background cache once per second
