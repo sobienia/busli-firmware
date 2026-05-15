@@ -29,6 +29,7 @@
 #define NVS_KEY_FLIGHTS     "flights"
 #define NVS_KEY_OPENSKY     "opensky"
 #define NVS_KEY_COMMUTE     "commute"
+#define NVS_KEY_OTA         "ota_en"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -137,6 +138,14 @@ bool config_load_opensky(String& user, String& pass) {
     return user.length() > 0;
 }
 
+bool config_load_ota_enabled() {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    bool val = prefs.getBool(NVS_KEY_OTA, true);
+    prefs.end();
+    return val;
+}
+
 bool config_load_commute(CommuteConfig& out) {
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, true);
@@ -156,7 +165,8 @@ static void save_to_nvs(String ssids[], String passes[], String users[], int n_w
                          const String& cd_label, const String& cd_target, int cd_icon,
                          FlightEntry flights[], int n_flights,
                          const String& opensky_user, const String& opensky_pass,
-                         const CommuteConfig& commute) {
+                         const CommuteConfig& commute,
+                         bool ota_enabled) {
     // WiFi JSON
     JsonDocument wdoc;
     JsonArray warr = wdoc.to<JsonArray>();
@@ -242,10 +252,11 @@ static void save_to_nvs(String ssids[], String passes[], String users[], int n_w
         prefs.remove(NVS_KEY_COMMUTE);
     }
 
+    prefs.putBool(NVS_KEY_OTA, ota_enabled);
     prefs.end();
 
-    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS\n",
-                  n_wifi, n_stops, n_flights);
+    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS, OTA=%s\n",
+                  n_wifi, n_stops, n_flights, ota_enabled ? "on" : "off");
 }
 
 // ── HTML builder ──────────────────────────────────────────────────────────────
@@ -268,7 +279,8 @@ static String build_page(String ssids[], String passes[], String users[],
                           const String& cd_label, const String& cd_target, int cd_icon,
                           FlightEntry flights[], int n_flights,
                           const String& opensky_user, const String& opensky_pass,
-                          const CommuteConfig& commute) {
+                          const CommuteConfig& commute,
+                          bool ota_enabled) {
     String h;
     h.reserve(10000);
 
@@ -454,6 +466,16 @@ static String build_page(String ssids[], String passes[], String users[],
         h += "</div>";
     }
 
+    // ── Updates section ──────────────────────────────────────────────────────
+    h += F("<h2>Updates</h2><div class='card'>");
+    h += "<label style='display:flex;align-items:center;gap:10px;cursor:pointer'>"
+         "<input type='checkbox' name='ota_en' value='1'";
+    if (ota_enabled) h += " checked";
+    h += F("><span>Automatic firmware updates</span></label>"
+           "<p class='hint' style='margin-top:6px'>When enabled, the device checks for new firmware "
+           "once a day and installs it automatically. Disable to update manually via the "
+           "Firmware update page.</p></div>");
+
     h += F("<button type='submit'>&#128190;&nbsp; Save &amp; Reboot</button>"
            "</form>"
            "<p style='text-align:center;margin-top:20px'>"
@@ -521,13 +543,14 @@ static int         s_n_flights = 0;
 static String      s_opensky_user;
 static String      s_opensky_pass;
 static CommuteConfig s_commute;
+static bool          s_ota_enabled = true;
 
 static void handle_root() {
     String page = build_page(s_ssids, s_passes, s_users, s_stops, s_n_stops,
                              s_cd_label, s_cd_target, s_cd_icon,
                              s_flights, s_n_flights,
                              s_opensky_user, s_opensky_pass,
-                             s_commute);
+                             s_commute, s_ota_enabled);
     s_server.send(200, "text/html", page);
 }
 
@@ -600,9 +623,11 @@ static void handle_save() {
     new_commute.home_station = s_server.arg("cm_hs"); new_commute.home_station.trim();
     new_commute.work_station = s_server.arg("cm_ws"); new_commute.work_station.trim();
 
+    bool new_ota_enabled = s_server.arg("ota_en") == "1";
+
     save_to_nvs(new_ssids, new_passes, new_users, n_wifi, new_stops, n_stops,
                 cd_label, cd_target, cd_icon, new_flights, n_flights,
-                new_opensky_user, new_opensky_pass, new_commute);
+                new_opensky_user, new_opensky_pass, new_commute, new_ota_enabled);
 
     s_server.send(200, "text/html",
         F("<!DOCTYPE html><html><head>"
@@ -743,6 +768,7 @@ void config_portal_run(uint32_t timeoutMs) {
     config_load_opensky(s_opensky_user, s_opensky_pass);
     s_commute = {};
     config_load_commute(s_commute);
+    s_ota_enabled = config_load_ota_enabled();
 
     // Start AP
     WiFi.disconnect(true);

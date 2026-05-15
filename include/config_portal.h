@@ -50,6 +50,9 @@ struct CommuteConfig {
 // Load commute config from NVS. Returns true if at least one station is configured.
 bool config_load_commute(CommuteConfig& out);
 
+// Load OTA-enabled flag from NVS. Returns true (default) if the user has not disabled it.
+bool config_load_ota_enabled();
+
 // Run the AP config portal. Blocks until the user saves (then reboots)
 // or until timeoutMs elapses (then returns so normal boot can continue).
 // Pass timeoutMs=0 for no timeout.

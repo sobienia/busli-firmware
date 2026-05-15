@@ -32,6 +32,7 @@ static int               s_num_stops      = 0;
 static volatile int      s_active_stop    = 0;
 static volatile bool     s_force_refresh  = false;
 static volatile bool     s_force_commute  = false;
+static volatile bool     s_ota_enabled    = true;
 
 // Per-stop last-fetch timestamps for adaptive scheduling
 static time_t s_stop_last_attempt[8] = {};
@@ -185,7 +186,7 @@ static void fetch_task_loop(void* /*param*/) {
         }
 
         // ── OTA ───────────────────────────────────────────────────────────────
-        if (now - last_ota_check >= OTA_CHECK_INTERVAL_SEC && !g_ota_pending) {
+        if (s_ota_enabled && now - last_ota_check >= OTA_CHECK_INTERVAL_SEC && !g_ota_pending) {
             String url;
             if (ota_check(url)) {
                 g_ota_url     = url;
@@ -265,6 +266,10 @@ bool fetch_task_get_commute(CommuteData& out_home, CommuteData& out_work) {
 
 void fetch_task_force_commute_refresh() {
     s_force_commute = true;
+}
+
+void fetch_task_set_ota_enabled(bool enabled) {
+    s_ota_enabled = enabled;
 }
 
 void fetch_task_init_flights(const FlightEntry* entries, int count) {

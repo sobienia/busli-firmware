@@ -47,3 +47,7 @@ void fetch_task_force_commute_refresh();
 // Register flights with the background task. Call from setup() after fetch_task_start().
 // The background task performs all fetches on core 0 — setup() never blocks on HTTP.
 void fetch_task_init_flights(const FlightEntry* entries, int count);
+
+// Enable or disable automatic OTA checks. Call from setup() after loading config.
+// Default is true; set to false if the user has opted out in the portal.
+void fetch_task_set_ota_enabled(bool enabled);

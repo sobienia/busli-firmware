@@ -618,6 +618,7 @@ void setup() {
 
     http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);
+    fetch_task_set_ota_enabled(config_load_ota_enabled());
 
     // Restore last-viewed page from NVS (overrides time-based initial page)
     {
