@@ -15,21 +15,39 @@
 
 #include "../include/fetch_task.h"
 #include "../include/config.h"
+#include "../include/http_lock.h"
+#include "../include/ota.h"
 #include "api.h"
+#include "weather.h"
+#include "commute.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
 static SemaphoreHandle_t s_mutex;
-static StopCache         s_cache[8];        // max 8 stops; indexed by stop idx
+static StopCache         s_cache[8];
 static const StopConfig* s_stops      = nullptr;
 static int               s_num_stops  = 0;
 static volatile int      s_active_stop    = 0;
 static volatile bool     s_force_refresh  = false;
+static volatile bool     s_force_commute  = false;
+
+// Weather cache
+static WeatherData s_weather   = {};
+static bool        s_weather_ok = false;
+
+// Commute cache
+static String      s_home_station;
+static String      s_work_station;
+static CommuteData s_commute_home = {};
+static CommuteData s_commute_work = {};
+static bool        s_commute_ok   = false;
 
 static void do_fetch(int idx) {
     std::vector<Departure> fresh;
+    http_lock_take();
     bool ok = api_fetch_departures(s_stops[idx], fresh, 6);
+    http_lock_give();
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (ok) {
@@ -52,20 +70,89 @@ static void do_fetch(int idx) {
     xSemaphoreGive(s_mutex);
 }
 
+static void do_fetch_weather() {
+    WeatherData wd;
+    http_lock_take();
+    bool ok = weather_fetch(wd);
+    http_lock_give();
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (ok) { s_weather = wd; s_weather_ok = true; }
+    xSemaphoreGive(s_mutex);
+}
+
+static void do_fetch_commute() {
+    if (s_home_station.isEmpty() || s_work_station.isEmpty()) return;
+    CommuteData home = {}, work = {};
+    // home commute = work→home; work commute = home→work
+    http_lock_take(); commute_fetch(s_work_station, s_home_station, home); http_lock_give();
+    http_lock_take(); commute_fetch(s_home_station, s_work_station, work); http_lock_give();
+    time_t now = time(nullptr);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (home.valid) {
+        s_commute_home = home;
+    } else {
+        // Keep existing valid data; only update fetch_time so the display moves
+        // past "Loading..." to "No connections" and doesn't appear frozen.
+        s_commute_home.fetch_time = now;
+    }
+    if (work.valid) {
+        s_commute_work = work;
+    } else {
+        s_commute_work.fetch_time = now;
+    }
+    s_commute_ok = true;
+    xSemaphoreGive(s_mutex);
+}
+
 static void fetch_task_loop(void* /*param*/) {
-    int round_robin_idx = (s_num_stops > 1) ? 1 : 0; // stop 0 already fetched at start
+    // Fetch weather and commute immediately so data is available within seconds of boot.
+    do_fetch_weather();
+    do_fetch_commute();
+
+    time_t last_weather_fetch = time(nullptr);
+    time_t last_commute_fetch = time(nullptr);
+    time_t last_ota_check     = time(nullptr);
+
+    int round_robin_idx = (s_num_stops > 1) ? 1 : 0; // stop 0 already fetched synchronously
 
     for (;;) {
+        // Transit stop fetch (force-refresh or round-robin)
         int fetch_idx;
         if (s_force_refresh) {
-            fetch_idx      = s_active_stop;
+            fetch_idx       = s_active_stop;
             s_force_refresh = false;
         } else {
             fetch_idx       = round_robin_idx;
             round_robin_idx = (round_robin_idx + 1) % s_num_stops;
         }
-
         do_fetch(fetch_idx);
+
+        time_t now = time(nullptr);
+
+        // Weather: refresh every WEATHER_REFRESH_SEC
+        if (now - last_weather_fetch >= WEATHER_REFRESH_SEC) {
+            do_fetch_weather();
+            last_weather_fetch = time(nullptr);
+        }
+
+        // Commute: refresh every COMMUTE_REFRESH_SEC, or on demand
+        bool commute_due = s_force_commute ||
+                           (now - last_commute_fetch >= COMMUTE_REFRESH_SEC);
+        if (commute_due) {
+            s_force_commute = false;
+            do_fetch_commute();
+            last_commute_fetch = time(nullptr);
+        }
+
+        // OTA: check for firmware updates once per OTA_CHECK_INTERVAL_SEC
+        if (now - last_ota_check >= OTA_CHECK_INTERVAL_SEC && !g_ota_pending) {
+            String url;
+            if (ota_check(url)) {
+                g_ota_url     = url;
+                g_ota_pending = true;
+            }
+            last_ota_check = time(nullptr);
+        }
 
         uint32_t delay_ms = (s_num_stops > 0)
                             ? (FETCH_INTERVAL_MS / s_num_stops)
@@ -111,4 +198,29 @@ void fetch_task_set_active_stop(int new_idx) {
 
 void fetch_task_force_refresh() {
     s_force_refresh = true;
+}
+
+void fetch_task_set_commute(const String& home, const String& work) {
+    s_home_station = home;
+    s_work_station = work;
+}
+
+bool fetch_task_get_weather(WeatherData& out) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = s_weather_ok;
+    if (ok) out = s_weather;
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+bool fetch_task_get_commute(CommuteData& out_home, CommuteData& out_work) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = s_commute_ok;
+    if (ok) { out_home = s_commute_home; out_work = s_commute_work; }
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+void fetch_task_force_commute_refresh() {
+    s_force_commute = true;
 }

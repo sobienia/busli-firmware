@@ -684,7 +684,11 @@ void config_portal_run(uint32_t timeoutMs) {
     s_server.onNotFound(handle_not_found);
     s_server.begin();
 
-    display_show_status("Join: Busli-Config");
+    // Show connection instructions on screen
+    char portal_msg[80];
+    snprintf(portal_msg, sizeof(portal_msg),
+             "WiFi: %s\nOpen: %s", PORTAL_SSID, ip.toString().c_str());
+    display_show_status(portal_msg);
 
     uint32_t start = millis();
     while (!s_saved) {

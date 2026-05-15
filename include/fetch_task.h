@@ -3,6 +3,8 @@
 #include <vector>
 #include "display.h"   // Departure struct
 #include "api.h"       // StopConfig struct
+#include "weather.h"   // WeatherData
+#include "commute.h"   // CommuteData
 
 struct StopCache {
     std::vector<Departure> departures;
@@ -28,3 +30,15 @@ void fetch_task_set_active_stop(int new_idx);
 
 // Request an immediate re-fetch of the active stop (long-press action).
 void fetch_task_force_refresh();
+
+// Configure commute stations for background fetching.
+// Call before fetch_task_start(). Empty strings disable commute fetching.
+void fetch_task_set_commute(const String& home, const String& work);
+
+// Read the latest weather / commute data from the background cache.
+// Never blocks; returns false if no data has been fetched yet.
+bool fetch_task_get_weather(WeatherData& out);
+bool fetch_task_get_commute(CommuteData& out_home, CommuteData& out_work);
+
+// Ask the background task to re-fetch commute data on its next iteration.
+void fetch_task_force_commute_refresh();

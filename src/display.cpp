@@ -10,6 +10,7 @@
 #include "../include/tramli_fonts.h"
 #include "../include/matrix_font.h"
 #include <Arduino_GFX_Library.h>
+#include <Preferences.h>
 
 static const int SMALL_ASCENT  = 15;   // TramliSmall  16px
 static const int LARGE_ASCENT  = 22;   // TramliLarge  24px
@@ -360,10 +361,24 @@ static void apply_night_brightness() {
     display_set_brightness(is_night_hours() ? NIGHT_BRIGHTNESS : s_day_brightness);
 }
 
+void display_init_brightness() {
+    Preferences prefs;
+    prefs.begin("tramli", true);
+    int b = prefs.getInt("bright_day", DAY_BRIGHTNESS);
+    prefs.end();
+    if (b >= 20 && b <= 100) s_day_brightness = (uint8_t)b;
+    apply_night_brightness();
+    Serial.printf("[Display] Brightness loaded: %d%%\n", s_day_brightness);
+}
+
 void display_step_brightness() {
     // Cycle: 100→80→60→40→20→100
     s_day_brightness = (s_day_brightness > 20) ? s_day_brightness - 20 : 100;
     if (!is_night_hours()) display_set_brightness(s_day_brightness);
+    Preferences prefs;
+    prefs.begin("tramli", false);
+    prefs.putInt("bright_day", s_day_brightness);
+    prefs.end();
     Serial.printf("[Display] Day brightness → %d%%\n", s_day_brightness);
 }
 
@@ -672,7 +687,7 @@ static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_
     if (!data.valid || data.connection_count == 0) {
         if (full_redraw) {
             gfx->fillRect(0, rows_top, SCREEN_W, rows_h, BLACK);
-            String msg = (data.fetch_time > 0) ? "No connections" : "Loading...";
+            String msg = (data.fetch_time > 0) ? "Commute unavailable" : "Loading...";
             draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2,
                       rows_top + rows_h / 2 - 8, 2, c_meta);
         }

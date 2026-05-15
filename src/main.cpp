@@ -10,7 +10,9 @@
 
 #include "../include/config.h"
 #include "../include/secrets.h"
+#include "../include/http_lock.h"
 #include "../include/fetch_task.h"
+#include "../include/ota.h"
 #include "../include/touch_handler.h"
 #include "../include/config_portal.h"
 #include "../include/commute.h"
@@ -19,6 +21,7 @@
 #include "api.h"
 #include "weather.h"
 #include "../include/flight_tracker.h"
+#include <esp_wifi.h>
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  HARDCODED STOP DEFAULTS — used when NVS has no saved stops               ║
@@ -127,17 +130,16 @@ static int      g_flight_count    = 0;
 static uint32_t g_last_flight_ms[2] = {0, 0};
 #define FLIGHT_REFRESH_MS  (5UL * 60 * 1000)
 
-// Commute
+// Commute — display-side cache; populated from background task via fetch_task_get_commute()
 static CommuteData g_commute_home  = {};
 static CommuteData g_commute_work  = {};
 static String      g_home_station;
 static String      g_work_station;
-static int         g_commute_conn_idx = 0;  // which connection to show at top
-static uint32_t    g_last_commute_ms  = 0;
-#define COMMUTE_REFRESH_MS  (60UL * 1000)
+static int         g_commute_conn_idx = 0;
 
+// Weather — display-side cache; populated from background task via fetch_task_get_weather()
 static WeatherData weather_data    = {};
-static uint32_t    last_weather_ms = 0;
+static uint32_t    g_setup_done_ms = 0;  // set at end of setup(); used to detect "still loading"
 
 // Battery
 static int      g_battery_pct    = -1;   // -1 until first read
@@ -454,8 +456,8 @@ static void check_touch() {
                     display_invalidate();
                 }
             } else {
-                // Commute: force immediate refresh of both directions
-                g_last_commute_ms = 0;
+                // Commute: ask background task to re-fetch on its next iteration
+                fetch_task_force_commute_refresh();
             }
             break;
         case TOUCH_DOUBLE_TAP:
@@ -517,6 +519,7 @@ static void check_touch() {
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 void setup() {
+    setCpuFrequencyMhz(80);   // 80 MHz is the minimum with WiFi; saves ~100 mA vs 240 MHz
     Serial.begin(115200);
     delay(500);
     Serial.println();
@@ -530,6 +533,7 @@ void setup() {
     pinMode(PIN_BTN_THEME,   INPUT_PULLUP);
 
     display_init();
+    display_init_brightness();
     load_theme();
     {
         Preferences prefs;
@@ -549,6 +553,10 @@ void setup() {
             connect_wifi();
         }
     }
+    // Enable modem sleep: WiFi radio powers down between beacon intervals.
+    // Cuts idle WiFi draw ~30-40%. Note: may occasionally increase latency on
+    // the first HTTP request after a long idle; disable if connection drops occur.
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
     sync_clock();
 
@@ -569,7 +577,7 @@ void setup() {
         }
     }
 
-    // Load commute station names from NVS
+    // Load commute station names from NVS and hand them to the background task
     {
         CommuteConfig cc;
         if (config_load_commute(cc)) {
@@ -578,11 +586,13 @@ void setup() {
             Serial.printf("[Commute] Home: '%s'  Work: '%s'\n",
                           g_home_station.c_str(), g_work_station.c_str());
         }
+        fetch_task_set_commute(g_home_station, g_work_station);
     }
 
     setup_pages();
     set_initial_page();
 
+    http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);
 
     {
@@ -599,17 +609,9 @@ void setup() {
         }
     }
 
-    weather_fetch(weather_data);
-    last_weather_ms = millis();
-
-    // Initial commute fetch (blocking — gives data before first redraw)
-    // home commute = work→home; work commute = home→work
-    if (commute_configured()) {
-        commute_fetch(g_work_station, g_home_station, g_commute_home);
-        commute_fetch(g_home_station, g_work_station, g_commute_work);
-        g_last_commute_ms = millis();
-    }
-
+    // Weather and commute are now fetched by the background task immediately after
+    // it starts, so setup() can complete without blocking on those HTTP calls.
+    g_setup_done_ms = millis();
     display_boot_animation_stop();
 }
 
@@ -631,13 +633,23 @@ void loop() {
                       PIN_BATTERY_ADC, adc_mv, adc_mv * 2, g_battery_pct);
     }
 
-    // Refresh weather every WEATHER_REFRESH_SEC
-    if (now_ms - last_weather_ms >= WEATHER_REFRESH_SEC * 1000UL) {
-        weather_fetch(weather_data);
-        last_weather_ms = now_ms;
+    // Apply pending OTA update (flag set by background task when a newer version is found)
+    if (g_ota_pending) {
+        g_ota_pending = false;
+        display_show_status("Firmware update found\nInstalling...");
+        if (ota_apply(g_ota_url)) {
+            display_show_status("Update complete!\nRestarting...");
+            delay(2000);
+            ESP.restart();
+        } else {
+            display_show_status("Update failed");
+            delay(3000);
+            display_invalidate();
+        }
     }
 
-    // Background flight data refresh (every 5 min per slot, non-blocking check)
+    // Flight refresh (every 5 min per slot) — still on core 1 since flight_tracker
+    // handles its own http_lock internally and is infrequent enough not to cause stutter.
     if (g_flight_count > 0) {
         for (int i = 0; i < g_flight_count; i++) {
             if (now_ms - g_last_flight_ms[i] >= FLIGHT_REFRESH_MS) {
@@ -645,21 +657,25 @@ void loop() {
                 g_last_flight_ms[i] = millis();
                 if (g_view == VIEW_FLIGHT0 && i == 0) display_invalidate();
                 if (g_view == VIEW_FLIGHT1 && i == 1) display_invalidate();
-                break;  // refresh one slot per loop to avoid long blocking back-to-back
+                break;
             }
         }
     }
 
-    // Commute refresh every 5 minutes
-    if (commute_configured() &&
-        (g_last_commute_ms == 0 || now_ms - g_last_commute_ms >= COMMUTE_REFRESH_MS)) {
-        g_last_commute_ms = now_ms;
-        commute_fetch(g_work_station, g_home_station, g_commute_home);
-        commute_fetch(g_home_station, g_work_station, g_commute_work);
-        // Clamp connection index if data shrank
-        if (g_commute_conn_idx >= g_commute_home.connection_count) g_commute_conn_idx = 0;
-        if (g_commute_conn_idx >= g_commute_work.connection_count) g_commute_conn_idx = 0;
-        display_invalidate();
+    // Pull latest weather + commute from background cache once per second
+    fetch_task_get_weather(weather_data);
+    if (commute_configured()) {
+        CommuteData new_home, new_work;
+        if (fetch_task_get_commute(new_home, new_work)) {
+            // Clamp connection index if the number of connections shrank
+            if (new_home.connection_count != g_commute_home.connection_count ||
+                new_work.connection_count  != g_commute_work.connection_count) {
+                if (g_commute_conn_idx >= new_home.connection_count) g_commute_conn_idx = 0;
+                if (g_commute_conn_idx >= new_work.connection_count)  g_commute_conn_idx = 0;
+            }
+            g_commute_home = new_home;
+            g_commute_work = new_work;
+        }
     }
 
     // Redraw every second (clock + age counter; commute marquee advances from millis())
@@ -688,6 +704,8 @@ void loop() {
                              (int)roundf(weather_data.temp_max_c));
                     snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
                              weather_data.uv_index, weather_data.uv_index_max);
+                } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
+                    strncpy(weather_str, "No weather", sizeof(weather_str) - 1);
                 }
 
                 display_draw_board(
@@ -730,6 +748,8 @@ void loop() {
                          (int)roundf(weather_data.temp_max_c));
                 snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
                          weather_data.uv_index, weather_data.uv_index_max);
+            } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
+                strncpy(weather_str, "No weather", sizeof(weather_str) - 1);
             }
             display_draw_commute(label, g_current_page, g_num_pages,
                                  cd, g_commute_conn_idx,
@@ -751,7 +771,7 @@ void loop() {
             WiFi.disconnect();
             delay(100);
             if (connect_wifi()) {
-                // Re-arm SNTP after reconnect so clock drift is corrected
+                esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
                 configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
             }
         }

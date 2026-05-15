@@ -20,6 +20,10 @@ struct Departure {
 // Initialize the display hardware (call once in setup())
 void display_init();
 
+// Load the previously saved day-brightness level from NVS and apply it.
+// Call once in setup() after display_init().
+void display_init_brightness();
+
 // Set backlight brightness (0–100)
 void display_set_brightness(uint8_t percent);
 

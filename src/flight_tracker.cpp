@@ -8,6 +8,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/flight_tracker.h"
+#include "../include/http_lock.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -233,18 +234,20 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
     WiFiClientSecure wc; wc.setInsecure();
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT * (have_icao ? 1 : 3));  // extra time for large scan
-    if (!http.begin(wc, url)) { Serial.println("[Flight] http.begin failed"); return false; }
+    http_lock_take();
+    if (!http.begin(wc, url)) { Serial.println("[Flight] http.begin failed"); http_lock_give(); return false; }
     if (s_opensky_user.length() > 0)
         http.setAuthorization(s_opensky_user.c_str(), s_opensky_pass.c_str());
 
     int code = http.GET();
     Serial.printf("[Flight] HTTP %d\n", code);
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) { http.end(); http_lock_give(); return false; }
 
     // ── Path A: icao24-filtered — small response, parse normally ─────────────
     if (have_icao) {
         String body = http.getString();
         http.end();
+        http_lock_give();
         Serial.printf("[Flight] icao24 body %u bytes: %s\n",
                       (unsigned)body.length(), body.c_str());
 
@@ -268,6 +271,7 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
     char* buf = nullptr;
     size_t total = http_read_psram(http, &buf, 3UL * 1024 * 1024);  // 3 MB cap
     http.end();
+    http_lock_give();
     if (!buf) return false;
 
     Serial.printf("[Flight] global body %u bytes\n", (unsigned)total);
@@ -356,13 +360,15 @@ static bool fetch_route(const String& icao24, const String& dep_date, FlightInfo
     wc.setInsecure();
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT);
-    if (!http.begin(wc, url)) return false;
+    http_lock_take();
+    if (!http.begin(wc, url)) { http_lock_give(); return false; }
     if (s_opensky_user.length() > 0)
         http.setAuthorization(s_opensky_user.c_str(), s_opensky_pass.c_str());
 
     int code = http.GET();
     String body = http.getString();
     http.end();
+    http_lock_give();
 
     Serial.printf("[Flight] route HTTP %d  body: %s\n", code, body.c_str());
 

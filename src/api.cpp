@@ -304,25 +304,37 @@ bool api_fetch_departures(
         return ok;
     }
 
-    // Content-Length path — bulk read through _rxBuffer (works for smaller responses).
-    String body;
-    body.reserve(content_len + 1);
+    // Content-Length path — use PSRAM buffer to match the chunked path and avoid
+    // the DRAM→PSRAM realloc corruption that String::concat can trigger on large bodies.
+    const int MAX_BODY_CL = 300000;
+    int alloc_len = (content_len > 0 && content_len <= MAX_BODY_CL) ? content_len : MAX_BODY_CL;
+    char* buf = (char*)heap_caps_malloc(alloc_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        http.end();
+        Serial.println("[API] PSRAM alloc failed (content-length path)");
+        return false;
+    }
+    int buf_len = 0;
     {
         WiFiClient& stream = http.getStream();
         uint32_t deadline  = millis() + API_TIMEOUT_MS;
-        uint8_t  buf[512];
+        uint8_t  rbuf[512];
         for (int rem = content_len; rem > 0 && millis() < deadline; ) {
-            int got = stream.read(buf, min(rem, (int)sizeof(buf)));
-            if (got > 0) { body.concat((const char*)buf, got); rem -= got; }
-            else          { delay(1); }
+            int got = stream.read(rbuf, min(rem, (int)sizeof(rbuf)));
+            if (got > 0) {
+                if (buf_len + got <= alloc_len) { memcpy(buf + buf_len, rbuf, got); buf_len += got; }
+                rem -= got;
+            } else {
+                delay(1);
+            }
         }
     }
-
+    buf[buf_len] = '\0';
     http.end();
+    Serial.printf("[API] content-length: %d bytes\n", buf_len);
 
-    if (body.isEmpty()) {
-        Serial.println("[API] Empty response body");
-        return false;
-    }
-    return process_json_body(body.c_str(), body.length(), stop, out_departures, max_results);
+    bool ok = (buf_len > 0) &&
+              process_json_body((const char*)buf, buf_len, stop, out_departures, max_results);
+    heap_caps_free(buf);
+    return ok;
 }

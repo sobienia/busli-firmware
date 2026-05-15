@@ -55,7 +55,7 @@
 // ║  BACKGROUND FETCH TASK                                                    ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define FETCH_TASK_STACK      12288  // FreeRTOS task stack (bytes)
+#define FETCH_TASK_STACK      16384  // FreeRTOS task stack (bytes)
 #define FETCH_TASK_PRIORITY   1      // Low priority — runs on WiFi core 0
 #define FETCH_INTERVAL_MS     30000  // Full cycle time across all stops (ms)
 
@@ -109,4 +109,29 @@
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 #define PORTAL_TIMEOUT_MS  300000  // 5 minutes; 0 = no timeout
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  COMMUTE REFRESH                                                          ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define COMMUTE_REFRESH_SEC  60    // how often the background task re-fetches commute data
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  FIRMWARE / OTA                                                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+// Bump FIRMWARE_VERSION before each release. The device checks OTA_VERSION_URL
+// hourly and self-flashes if the remote version is newer.
+//
+// Hosting on GitHub:
+//  1. Commit a file (e.g. ota/version.json) with content:
+//       {"version":"X.Y.Z","url":"https://github.com/<user>/<repo>/releases/download/vX.Y.Z/firmware.bin"}
+//  2. Set OTA_VERSION_URL to the raw URL of that file.
+//  3. On each release: bump FIRMWARE_VERSION here, build, upload firmware.bin
+//     to GitHub Releases, update version.json to point to the new binary.
+//     Every device — including a friend's — picks it up on the next hourly check.
+//
+// Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
+#define FIRMWARE_VERSION        "1.0.0"
+#define OTA_VERSION_URL         ""
+#define OTA_CHECK_INTERVAL_SEC  86400
 
