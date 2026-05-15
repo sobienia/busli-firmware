@@ -136,10 +136,10 @@
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
 #define FIRMWARE_VERSION        "1.2.0"
-#define OTA_VERSION_URL         ""   // URL of version.json; leave "" to disable auto-OTA
+#define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 
 // Public URL of the GitHub Releases page where users can download firmware.bin manually.
 // Shown as a link in the config portal /update page. Leave "" to hide.
-#define FIRMWARE_RELEASE_URL    ""
+#define FIRMWARE_RELEASE_URL    "https://github.com/sobienia/busli-firmware/releases"
 
