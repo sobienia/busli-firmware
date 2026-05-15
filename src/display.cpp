@@ -43,11 +43,12 @@ static uint16_t TRAIL[4] = { 0xF480, 0xC3A0, 0x7A40, 0x4960 };
 // Header redraws on minute change, rows on new fetch data, footer is split:
 //   static region (weather/UV) redraws on weather change (~15 min)
 //   dynamic region (age + dot) redraws every second
-static time_t    s_last_fetch_time    = -1;
-static int       s_last_clock_minute  = -1;
-static int       s_last_battery_pct   = -2;   // -2 = never drawn; triggers first paint
-static uint32_t  s_last_weather_hash  = 0xFFFFFFFF;
-static bool      s_footer_static_drawn = false;
+static time_t    s_last_fetch_time      = -1;
+static int       s_last_clock_minute    = -1;
+static int       s_last_battery_pct     = -2;   // -2 = never drawn; triggers first paint
+static bool      s_last_battery_charging = false;
+static uint32_t  s_last_weather_hash    = 0xFFFFFFFF;
+static bool      s_footer_static_drawn  = false;
 // Flight screen partial-redraw state
 static int    s_flight_last_slot   = -1;
 static int    s_flight_last_minute = -1;
@@ -243,34 +244,49 @@ void display_set_brightness(uint8_t percent) {
 
 void display_show_status(const char* message) {
     if (!gfx) return;
-    s_last_fetch_time     = -1;
-    s_last_clock_minute   = -1;
-    s_last_battery_pct    = -2;
-    s_footer_static_drawn = false;
-    s_commute_last_fetch   = -1;
-    s_commute_last_minute  = -1;
-    s_commute_last_conn    = -2;
-    s_commute_scroll_ms    = 0;
-    s_commute_weather_hash = 0xFFFFFFFF;
+    s_last_fetch_time       = -1;
+    s_last_clock_minute     = -1;
+    s_last_battery_pct      = -2;
+    s_last_battery_charging = false;
+    s_footer_static_drawn   = false;
+    s_commute_last_fetch    = -1;
+    s_commute_last_minute   = -1;
+    s_commute_last_conn     = -2;
+    s_commute_scroll_ms     = 0;
+    s_commute_weather_hash  = 0xFFFFFFFF;
     gfx->fillScreen(BLACK);
-    String s = to_latin1(message);
-    int16_t w = text_w(s, 3);
-    draw_text(s, (SCREEN_W - w) / 2, SCREEN_H / 2 - 14, 3, c_row0);
+
+    // Split on '\n' and center each line independently.
+    String full = to_latin1(message);
+    const int LINE_H = 30;  // TramliLarge yAdvance (28) + 2px spacing
+    int n_lines = 1;
+    for (int i = 0; i < (int)full.length(); i++) if (full[i] == '\n') n_lines++;
+    int y = (SCREEN_H - n_lines * LINE_H) / 2;
+    int start = 0;
+    for (int i = 0; i <= (int)full.length(); i++) {
+        if (i == (int)full.length() || full[i] == '\n') {
+            String line = full.substring(start, i);
+            draw_text(line, (SCREEN_W - text_w(line, 3)) / 2, y, 3, c_row0);
+            y += LINE_H;
+            start = i + 1;
+        }
+    }
 }
 
 void display_invalidate() {
-    s_last_fetch_time     = -1;
-    s_last_clock_minute   = -1;
-    s_last_battery_pct    = -2;
-    s_footer_static_drawn = false;
-    s_flight_last_slot    = -1;
-    s_flight_last_minute  = -1;
-    s_flight_last_fetch   = -1;
-    s_commute_last_fetch   = -1;
-    s_commute_last_minute  = -1;
-    s_commute_last_conn    = -2;
-    s_commute_scroll_ms    = 0;
-    s_commute_weather_hash = 0xFFFFFFFF;
+    s_last_fetch_time       = -1;
+    s_last_clock_minute     = -1;
+    s_last_battery_pct      = -2;
+    s_last_battery_charging = false;
+    s_footer_static_drawn   = false;
+    s_flight_last_slot      = -1;
+    s_flight_last_minute    = -1;
+    s_flight_last_fetch     = -1;
+    s_commute_last_fetch    = -1;
+    s_commute_last_minute   = -1;
+    s_commute_last_conn     = -2;
+    s_commute_scroll_ms     = 0;
+    s_commute_weather_hash  = 0xFFFFFFFF;
 }
 
 // ── Umbrella icon (12×15) ────────────────────────────────────────────────────
@@ -384,7 +400,7 @@ void display_step_brightness() {
 
 // ── Header ────────────────────────────────────────────────────────────────────
 static void draw_header(const char* stop_name, int stop_index, int stop_count,
-                        bool rain_active, bool large_font, int battery_pct) {
+                        bool rain_active, bool large_font, int battery_pct, bool battery_charging) {
     gfx->fillRect(0, 0, SCREEN_W, HEADER_H, BLACK);
 
     uint8_t fsz = large_font ? 3 : 2;
@@ -412,10 +428,15 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     int dots_w = stop_count * 12;
     int dots_x = (dots_w > 0) ? (rx -= 8, rx -= dots_w, rx) : rx;
 
-    // Left cluster: battery (22px + 6px gap) then stop label
-    // Battery icon: 20px box + 2px terminal nub = 22px total
+    // Left cluster: battery icon (22px) + % label + 6px gap + stop name
+    char pct_buf[8] = "";
+    String pct_str;
     int label_x = PAD;
-    if (battery_pct >= 0) label_x = PAD + 22 + 6;
+    if (battery_pct >= 0) {
+        snprintf(pct_buf, sizeof(pct_buf), battery_charging ? "%d%%+" : "%d%%", battery_pct);
+        pct_str  = pct_buf;
+        label_x  = PAD + 22 + 2 + text_w(pct_str, 2) + 6;
+    }
 
     // Stop label — truncate if too wide
     String label = to_latin1(stop_name);
@@ -431,11 +452,12 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     if (battery_pct >= 0) {
         int by = (HEADER_H - 10) / 2;
         uint16_t bat_col = (battery_pct <= 20) ? c_dim : c_row0;
-        gfx->drawRect(PAD, by, 20, 10, bat_col);        // outer box
-        gfx->fillRect(PAD + 20, by + 3, 2, 4, bat_col); // + terminal nub
+        gfx->drawRect(PAD, by, 20, 10, bat_col);
+        gfx->fillRect(PAD + 20, by + 3, 2, 4, bat_col);
         int fill_w = battery_pct * 18 / 100;
         if (fill_w > 0)
             gfx->fillRect(PAD + 1, by + 1, fill_w, 8, bat_col);
+        draw_text(pct_str, PAD + 22 + 2, (HEADER_H - 16) / 2, 2, bat_col);
     }
 
     draw_text(label, label_x, ty, fsz, c_row0);
@@ -643,7 +665,7 @@ void display_draw_board(
     time_t fetch_time, bool large_font_mode,
     time_t countdown_target, int countdown_icon,
     bool snow_today, bool clear_today,
-    int battery_pct)
+    int battery_pct, bool battery_charging)
 {
     if (!gfx) return;
     apply_night_brightness();
@@ -653,10 +675,11 @@ void display_draw_board(
     localtime_r(&now_t, &tm_now);
     int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
 
-    if (cur_minute != s_last_clock_minute || battery_pct != s_last_battery_pct) {
-        s_last_clock_minute = cur_minute;
-        s_last_battery_pct  = battery_pct;
-        draw_header(stop_name, stop_index, stop_count, false, large_font_mode, battery_pct);
+    if (cur_minute != s_last_clock_minute || battery_pct != s_last_battery_pct || battery_charging != s_last_battery_charging) {
+        s_last_clock_minute     = cur_minute;
+        s_last_battery_pct      = battery_pct;
+        s_last_battery_charging = battery_charging;
+        draw_header(stop_name, stop_index, stop_count, false, large_font_mode, battery_pct, battery_charging);
     }
 
     if (fetch_time != s_last_fetch_time) {
@@ -796,6 +819,7 @@ void display_draw_commute(
     int connection_idx,
     bool wifi_ok,
     int battery_pct,
+    bool battery_charging,
     const char* weather_str, const char* uv_str,
     bool rain_today, int rain_pct,
     bool snow_today, bool clear_today)
@@ -813,10 +837,11 @@ void display_draw_commute(
     bool full_redraw    = minute_changed || data_changed;
 
     // Header: redraw on minute or battery change
-    if (minute_changed || battery_pct != s_last_battery_pct) {
-        s_commute_last_minute = cur_minute;
-        s_last_battery_pct    = battery_pct;
-        draw_header(direction_label, page_idx, page_count, false, false, battery_pct);
+    if (minute_changed || battery_pct != s_last_battery_pct || battery_charging != s_last_battery_charging) {
+        s_commute_last_minute   = cur_minute;
+        s_last_battery_pct      = battery_pct;
+        s_last_battery_charging = battery_charging;
+        draw_header(direction_label, page_idx, page_count, false, false, battery_pct, battery_charging);
     }
 
     // Reset marquee when connection or data changes

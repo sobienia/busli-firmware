@@ -63,7 +63,8 @@ void display_draw_board(
     int    countdown_icon,   // 0=none 1=palm 2=calendar 3=plane
     bool   snow_today,       // show snowflake icon in footer
     bool   clear_today,      // show sun icon in footer
-    int    battery_pct       // 0–100; -1 = don't show battery icon
+    int    battery_pct,      // 0–100; -1 = don't show battery icon
+    bool   battery_charging  // true = show "+" after percentage
 );
 
 // Force a full redraw on the next display_draw_board call (call after stop changes,
@@ -86,6 +87,7 @@ void display_draw_commute(
     int connection_idx,
     bool wifi_ok,
     int battery_pct,
+    bool battery_charging,
     const char* weather_str,
     const char* uv_str,
     bool rain_today,

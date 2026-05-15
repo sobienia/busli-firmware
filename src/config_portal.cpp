@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/config_portal.h"
+#include "../include/config.h"
 #include "../include/swiss_stops.h"
 #include "display.h"
 #include <Arduino.h>
@@ -456,7 +457,7 @@ static String build_page(String ssids[], String passes[], String users[],
     h += F("<button type='submit'>&#128190;&nbsp; Save &amp; Reboot</button>"
            "</form>"
            "<p style='text-align:center;margin-top:20px'>"
-           "<a href='/update' style='color:#555;font-size:13px'>&#9652; Upload firmware (.bin)</a>"
+           "<a href='/update' style='color:#999;font-size:13px'>&#9652; Firmware update</a>"
            "</p>"
            "<script>"
            "var _t;"
@@ -765,10 +766,10 @@ void config_portal_run(uint32_t timeoutMs) {
     s_server.onNotFound(handle_not_found);
     s_server.begin();
 
-    // Show connection instructions on screen
+    // Show connection instructions on screen — two centered lines
     char portal_msg[80];
     snprintf(portal_msg, sizeof(portal_msg),
-             "WiFi: %s\nOpen: %s", PORTAL_SSID, ip.toString().c_str());
+             "Connect to: %s\nThen open: %s", PORTAL_SSID, ip.toString().c_str());
     display_show_status(portal_msg);
 
     uint32_t start = millis();

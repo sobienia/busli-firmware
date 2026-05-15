@@ -7,6 +7,9 @@
 #include <esp_wpa2.h>
 #include <Preferences.h>
 #include <time.h>
+#include <Wire.h>
+#define XPOWERS_CHIP_SY6970
+#include <XPowersLib.h>
 
 #include "../include/config.h"
 #include "../include/secrets.h"
@@ -139,9 +142,12 @@ static int         g_commute_conn_idx = 0;
 static WeatherData weather_data    = {};
 static uint32_t    g_setup_done_ms = 0;  // set at end of setup(); used to detect "still loading"
 
-// Battery
-static int      g_battery_pct    = -1;   // -1 until first read
-static uint32_t last_battery_ms  = 0;
+// Battery — read via SY6970 PMU on the I2C bus shared with touch (SDA=5 SCL=6)
+static XPowersPPM pmu;
+static bool       s_pmu_ok          = false;
+static int        g_battery_pct     = -1;
+static bool       g_battery_charging = false;
+static uint32_t   last_battery_ms   = 0;
 
 // Button debounce state — BOOT button
 static bool     button_was_pressed    = false;
@@ -263,42 +269,16 @@ static void sync_clock() {
                   t.tm_hour, t.tm_min, t.tm_sec);
 }
 
-// Read battery percentage from the ADC voltage divider (GPIO PIN_BATTERY_ADC, 1:2 divider).
-// Returns:
-//   0–100  normal LiPo reading
-//   -1     no valid reading (pin not connected, or USB-VBUS detected on this pin)
-//
-// DIAGNOSTIC NOTE: if the icon shows when USB is plugged in but disappears on battery,
-// GPIO PIN_BATTERY_ADC is almost certainly wired to the USB VBUS rail (5V when USB is
-// connected, 0V when on battery). The actual LiPo sense pin may be different on your
-// board — check the T-Display S3 Pro schematic and update PIN_BATTERY_ADC in config.h.
-// The [Batt] serial log shows the exact ADC millivolts to help identify the right pin.
-static int read_battery_pct() {
-    uint32_t adc_mv  = analogReadMilliVolts(PIN_BATTERY_ADC);
-    uint32_t batt_mv = adc_mv * 2;  // 1:2 divider: actual = adc × 2
-
-    // > 4400 mV: above LiPo max (4200 mV) — we are almost certainly reading USB VBUS
-    // (5 V → ~2500 mV ADC → batt_mv ~5000 mV). Return -1 so no icon is shown; a
-    // full battery icon at 100% when on USB would be misleading.
-    if (batt_mv > 4400) {
-        Serial.printf("[Batt] GPIO%d: adc=%umV → batt_mv=%umV  *** LIKELY USB VBUS, NOT BATTERY ***\n"
-                      "[Batt]   Fix: find the correct LiPo-sense GPIO in the board schematic\n"
-                      "[Batt]   and update PIN_BATTERY_ADC in include/config.h\n",
-                      PIN_BATTERY_ADC, adc_mv, batt_mv);
-        return -1;
-    }
-
-    // < 1500 mV: below reasonable LiPo minimum — pin is floating, 0V, or not connected.
-    if (batt_mv < 1500) {
-        Serial.printf("[Batt] GPIO%d: adc=%umV → batt_mv=%umV  (below threshold — no reading)\n",
-                      PIN_BATTERY_ADC, adc_mv, batt_mv);
-        return -1;
-    }
-
-    int pct = (int)((batt_mv - 3000) * 100 / (4200 - 3000));
-    Serial.printf("[Batt] GPIO%d: adc=%umV → batt_mv=%umV → %d%%\n",
-                  PIN_BATTERY_ADC, adc_mv, batt_mv, pct);
-    return (pct < 0) ? 0 : (pct > 100) ? 100 : pct;
+static void update_battery() {
+    if (!s_pmu_ok) { g_battery_pct = -1; g_battery_charging = false; return; }
+    if (!pmu.isBatteryConnect()) { g_battery_pct = -1; g_battery_charging = false; return; }
+    uint16_t mv = pmu.getBattVoltage();
+    g_battery_charging = pmu.isCharging();
+    int pct = (int)((mv - 3200) * 100 / (4200 - 3200));
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    g_battery_pct = pct;
+    Serial.printf("[Batt] %umV → %d%%%s\n", mv, pct, g_battery_charging ? " (charging)" : "");
 }
 
 static void switch_page(int new_page) {
@@ -310,6 +290,12 @@ static void switch_page(int new_page) {
     if (p.type == PageInfo::TRANSIT) {
         current_stop_idx = p.transit_idx;
         fetch_task_set_active_stop(current_stop_idx);
+    }
+    {
+        Preferences prefs;
+        prefs.begin("tramli", false);
+        prefs.putInt("page", new_page);
+        prefs.end();
     }
     display_invalidate();
 }
@@ -554,7 +540,6 @@ void setup() {
     pinMode(PIN_BTN_BRIGHT,  INPUT_PULLUP);
     pinMode(PIN_BTN_ZOOM,    INPUT_PULLUP);
     pinMode(PIN_BTN_THEME,   INPUT_PULLUP);
-    analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);  // 0–3.1V range for 1:2 LiPo divider
 
     display_init();
     display_init_brightness();
@@ -566,16 +551,29 @@ void setup() {
         prefs.end();
         if (g_display_flipped) display_set_flipped(true);
     }
+    Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
     touch_init();
+    {
+        if (!pmu.begin(Wire, SY6970_SLAVE_ADDRESS, TOUCH_SDA_PIN, TOUCH_SCL_PIN)) {
+            Serial.println("[PMU] SY6970 not found — no battery indicator");
+        } else {
+            s_pmu_ok = true;
+            pmu.enableCharge();
+            Serial.println("[PMU] SY6970 OK");
+        }
+    }
     display_boot_animation_start();
 
     setup_stops();
 
     if (!connect_wifi()) {
-        while (WiFi.status() != WL_CONNECTED) {
-            delay(30000);
-            connect_wifi();
-        }
+        // All credentials failed — stop the animation and show a message.
+        // The reconnect loop in loop() will keep retrying every 30 s.
+        // The user can hold the boot button at any time to enter config portal.
+        display_boot_animation_stop();
+        display_show_status("No WiFi\nHold boot button to configure");
+        delay(4000);
+        display_invalidate();
     }
     // Enable modem sleep: WiFi radio powers down between beacon intervals.
     // Cuts idle WiFi draw ~30-40%. Note: may occasionally increase latency on
@@ -619,6 +617,23 @@ void setup() {
     http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);
 
+    // Restore last-viewed page from NVS (overrides time-based initial page)
+    {
+        Preferences prefs;
+        prefs.begin("tramli", true);
+        int saved = prefs.getInt("page", -1);
+        prefs.end();
+        if (saved >= 0 && saved < g_num_pages) {
+            g_current_page = saved;
+            PageInfo& p = g_pages[saved];
+            if (p.type == PageInfo::TRANSIT) {
+                current_stop_idx = p.transit_idx;
+                fetch_task_set_active_stop(current_stop_idx);
+            }
+            Serial.printf("[Page] Restored page %d from NVS\n", saved);
+        }
+    }
+
     {
         FlightEntry fl_entries[2];
         g_flight_count = config_load_flights(fl_entries);
@@ -647,10 +662,10 @@ void loop() {
 
     uint32_t now_ms = millis();
 
-    // Read battery voltage once per minute (ADC reads are slow; no need for higher rate)
+    // Poll PMU once per minute (I2C read; no need for higher rate)
     if (last_battery_ms == 0 || now_ms - last_battery_ms >= 60000) {
         last_battery_ms = now_ms;
-        g_battery_pct   = read_battery_pct();  // logs internally
+        update_battery();
     }
 
     // Apply pending OTA update (flag set by background task when a newer version is found)
@@ -732,7 +747,8 @@ void loop() {
                     g_countdown_icon,
                     weather_data.valid && weather_data.snow_today,
                     weather_data.valid && weather_data.clear_today,
-                    g_battery_pct
+                    g_battery_pct,
+                    g_battery_charging
                 );
             } else {
                 int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
@@ -759,7 +775,7 @@ void loop() {
             }
             display_draw_commute(label, g_current_page, g_num_pages,
                                  cd, g_commute_conn_idx,
-                                 WiFi.status() == WL_CONNECTED, g_battery_pct,
+                                 WiFi.status() == WL_CONNECTED, g_battery_pct, g_battery_charging,
                                  weather_str, uv_str,
                                  weather_data.valid && weather_data.rain_today,
                                  weather_data.valid ? weather_data.precip_prob_pct : 0,
