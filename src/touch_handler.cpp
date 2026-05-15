@@ -31,6 +31,13 @@ static bool     s_long_press_fired = false;
 static uint32_t s_last_tap_ms        = 0;
 static bool     s_waiting_double_tap = false;
 
+bool touch_is_pressed()    { return s_touching; }
+int  touch_last_screen_x() {
+    // rotation=3: rightward swipe = raw_y decreasing, so screen_x = SCREEN_W - raw_y*(SCREEN_W/480)
+    // raw_y range 0..480 maps to screen_x SCREEN_W..0 (inverted)
+    return SCREEN_W - (int)s_last_raw_y * SCREEN_W / 480;
+}
+
 void touch_init() {
     Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
     bool ok = s_touch.init();

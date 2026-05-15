@@ -671,26 +671,49 @@ void loop() {
         update_battery();
     }
 
-    // Apply pending OTA update (flag set by background task when a newer version is found)
+    // OTA update prompt — shown when background task finds a newer firmware version.
     if (g_ota_pending) {
         g_ota_pending = false;
-        display_show_status("Firmware update found\nInstalling...");
-        // HTTPS download needs ~20 KB of stack — more than loopTask's default 8 KB.
-        // Spawn a dedicated task so we control the stack size explicitly.
-        xTaskCreate([](void*) {
-            if (ota_apply(g_ota_url)) {
-                display_show_status("Update complete!\nRestarting...");
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                ESP.restart();
-            } else {
-                display_show_status("Update failed");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                display_invalidate();
+        display_show_ota_prompt(FIRMWARE_VERSION, g_ota_remote_version.c_str());
+
+        // Wait up to 60 s for the user to tap Yes (right) or No (left).
+        // Physical buttons: right (PIN_BTN_BRIGHT) = Yes, left (PIN_BTN_ZOOM) = No.
+        bool install = false;
+        bool decided = false;
+        bool was_pressed = false;
+        uint32_t deadline = millis() + 60000;
+        while (!decided && millis() < deadline) {
+            if (digitalRead(PIN_BTN_BRIGHT) == LOW) { install = true;  decided = true; }
+            if (digitalRead(PIN_BTN_ZOOM)   == LOW) { install = false; decided = true; }
+            touch_poll();
+            bool pressed = touch_is_pressed();
+            if (was_pressed && !pressed) {
+                install = (touch_last_screen_x() > SCREEN_W / 2);
+                decided = true;
             }
-            vTaskDelete(nullptr);
-        }, "ota_apply", 32768, nullptr, 5, nullptr);
-        // Suspend loop() while the OTA task runs so they don't race on display/HTTP
-        vTaskSuspend(nullptr);
+            was_pressed = pressed;
+            delay(20);
+        }
+
+        if (install) {
+            display_show_status("Installing firmware...");
+            // HTTPS download needs more stack than loopTask's 8 KB — use a dedicated task.
+            xTaskCreate([](void*) {
+                if (ota_apply(g_ota_url)) {
+                    display_show_status("Update complete!\nRestarting...");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    ESP.restart();
+                } else {
+                    display_show_status("Update failed");
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    display_invalidate();
+                }
+                vTaskDelete(nullptr);
+            }, "ota_apply", 32768, nullptr, 5, nullptr);
+            vTaskSuspend(nullptr); // pause loop() while OTA task runs
+        } else {
+            display_invalidate(); // user declined — resume normal display
+        }
     }
 
     // Pull latest weather + commute from background cache once per second

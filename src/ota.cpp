@@ -17,6 +17,7 @@
 
 volatile bool g_ota_pending = false;
 String        g_ota_url;
+String        g_ota_remote_version;
 
 // Compare "major.minor.patch" — returns true if a is strictly newer than b.
 static bool is_newer(const char* a, const char* b) {
@@ -62,7 +63,8 @@ bool ota_check(String& out_url) {
 
     if (strlen(url) == 0 || !is_newer(remote_ver, FIRMWARE_VERSION)) return false;
 
-    out_url = url;
+    out_url              = url;
+    g_ota_remote_version = remote_ver;
     Serial.printf("[OTA] Update available: %s -> %s\n", FIRMWARE_VERSION, remote_ver);
     return true;
 }

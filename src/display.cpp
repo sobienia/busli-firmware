@@ -273,6 +273,38 @@ void display_show_status(const char* message) {
     }
 }
 
+void display_show_ota_prompt(const char* cur_ver, const char* new_ver) {
+    if (!gfx) return;
+    gfx->fillScreen(BLACK);
+
+    // Title
+    String title = "New firmware available!";
+    draw_text(title, (SCREEN_W - text_w(title, 3)) / 2, 22, 3, c_row0);
+
+    // Version line  e.g. "v1.2.0 → v1.3.1"
+    String ver_line = String("v") + cur_ver + " \xc2\xbb v" + new_ver;
+    draw_text(ver_line, (SCREEN_W - text_w(ver_line, 2)) / 2, 70, 2, c_dim);
+
+    // Separator
+    gfx->drawFastHLine(PAD, 120, SCREEN_W - PAD * 2, c_meta);
+
+    // No button — left half
+    const int BTN_Y = 135, BTN_H = 52;
+    const int BTN_MARGIN = 16;
+    int btn_w = SCREEN_W / 2 - BTN_MARGIN * 2;
+    gfx->drawRect(BTN_MARGIN, BTN_Y, btn_w, BTN_H, c_meta);
+    String lbl_no = "No";
+    draw_text(lbl_no, BTN_MARGIN + (btn_w - text_w(lbl_no, 3)) / 2,
+              BTN_Y + (BTN_H - 28) / 2, 3, c_dim);
+
+    // Yes button — right half
+    int btn_x2 = SCREEN_W / 2 + BTN_MARGIN;
+    gfx->drawRect(btn_x2, BTN_Y, btn_w, BTN_H, c_row0);
+    String lbl_yes = "Yes";
+    draw_text(lbl_yes, btn_x2 + (btn_w - text_w(lbl_yes, 3)) / 2,
+              BTN_Y + (BTN_H - 28) / 2, 3, c_row0);
+}
+
 void display_invalidate() {
     s_last_fetch_time       = -1;
     s_last_clock_minute     = -1;

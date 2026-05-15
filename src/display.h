@@ -42,6 +42,9 @@ void display_step_brightness();
 // Show a centered message (used during boot, errors)
 void display_show_status(const char* message);
 
+// Show an OTA update prompt with No (left) and Yes (right) tap zones.
+void display_show_ota_prompt(const char* cur_ver, const char* new_ver);
+
 // Draw the main departure board.
 // fetch_time: timestamp of the last successful fetch (used to skip row redraws
 //             when departure data hasn't changed since the last screen update).

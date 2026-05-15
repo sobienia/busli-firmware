@@ -5,6 +5,7 @@
 // Cleared by main loop after applying (or failing) the update.
 extern volatile bool g_ota_pending;
 extern String        g_ota_url;
+extern String        g_ota_remote_version;
 
 // Check version.json at OTA_VERSION_URL. Returns true + download URL if a
 // newer firmware is available. No-op and returns false when URL is empty.

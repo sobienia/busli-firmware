@@ -17,3 +17,8 @@ void touch_init();
 // Call every loop iteration. Returns the detected gesture (or TOUCH_NONE).
 // Each gesture is returned exactly once per event.
 TouchGesture touch_poll();
+
+// Raw state — call touch_poll() first to update.
+// Use these inside blocking prompt loops to detect finger-up and tap position.
+bool touch_is_pressed();       // true while screen is being touched
+int  touch_last_screen_x();    // screen X of last touch (0=left .. SCREEN_W-1=right)

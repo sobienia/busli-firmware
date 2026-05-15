@@ -793,9 +793,10 @@ void config_portal_run(uint32_t timeoutMs) {
     s_server.begin();
 
     // Show connection instructions on screen — two centered lines
-    char portal_msg[80];
+    char portal_msg[120];
     snprintf(portal_msg, sizeof(portal_msg),
-             "Connect to: %s\nThen open: %s", PORTAL_SSID, ip.toString().c_str());
+             "Connect to: %s\nThen open: %s\nFirmware %s",
+             PORTAL_SSID, ip.toString().c_str(), FIRMWARE_VERSION);
     display_show_status(portal_msg);
 
     uint32_t start = millis();
