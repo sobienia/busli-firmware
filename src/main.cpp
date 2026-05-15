@@ -263,15 +263,41 @@ static void sync_clock() {
                   t.tm_hour, t.tm_min, t.tm_sec);
 }
 
-// Read battery percentage from the ADC voltage divider (GPIO 4, 1:2 divider).
-// Uses analogReadMilliVolts() for built-in ADC calibration — no manual attenuation setup needed.
-// Returns -1 when no battery is detected (battery_mv < 1000 mV = clearly unpowered).
+// Read battery percentage from the ADC voltage divider (GPIO PIN_BATTERY_ADC, 1:2 divider).
+// Returns:
+//   0–100  normal LiPo reading
+//   -1     no valid reading (pin not connected, or USB-VBUS detected on this pin)
+//
+// DIAGNOSTIC NOTE: if the icon shows when USB is plugged in but disappears on battery,
+// GPIO PIN_BATTERY_ADC is almost certainly wired to the USB VBUS rail (5V when USB is
+// connected, 0V when on battery). The actual LiPo sense pin may be different on your
+// board — check the T-Display S3 Pro schematic and update PIN_BATTERY_ADC in config.h.
+// The [Batt] serial log shows the exact ADC millivolts to help identify the right pin.
 static int read_battery_pct() {
-    uint32_t adc_mv   = analogReadMilliVolts(PIN_BATTERY_ADC);
-    uint32_t batt_mv  = adc_mv * 2;          // 1:2 divider: actual = adc × 2
-    if (batt_mv < 1000) return -1;            // no battery or wrong GPIO
-    // LiPo range: 3000 mV (empty) → 4200 mV (full)
+    uint32_t adc_mv  = analogReadMilliVolts(PIN_BATTERY_ADC);
+    uint32_t batt_mv = adc_mv * 2;  // 1:2 divider: actual = adc × 2
+
+    // > 4400 mV: above LiPo max (4200 mV) — we are almost certainly reading USB VBUS
+    // (5 V → ~2500 mV ADC → batt_mv ~5000 mV). Return -1 so no icon is shown; a
+    // full battery icon at 100% when on USB would be misleading.
+    if (batt_mv > 4400) {
+        Serial.printf("[Batt] GPIO%d: adc=%umV → batt_mv=%umV  *** LIKELY USB VBUS, NOT BATTERY ***\n"
+                      "[Batt]   Fix: find the correct LiPo-sense GPIO in the board schematic\n"
+                      "[Batt]   and update PIN_BATTERY_ADC in include/config.h\n",
+                      PIN_BATTERY_ADC, adc_mv, batt_mv);
+        return -1;
+    }
+
+    // < 1500 mV: below reasonable LiPo minimum — pin is floating, 0V, or not connected.
+    if (batt_mv < 1500) {
+        Serial.printf("[Batt] GPIO%d: adc=%umV → batt_mv=%umV  (below threshold — no reading)\n",
+                      PIN_BATTERY_ADC, adc_mv, batt_mv);
+        return -1;
+    }
+
     int pct = (int)((batt_mv - 3000) * 100 / (4200 - 3000));
+    Serial.printf("[Batt] GPIO%d: adc=%umV → batt_mv=%umV → %d%%\n",
+                  PIN_BATTERY_ADC, adc_mv, batt_mv, pct);
     return (pct < 0) ? 0 : (pct > 100) ? 100 : pct;
 }
 
@@ -624,10 +650,7 @@ void loop() {
     // Read battery voltage once per minute (ADC reads are slow; no need for higher rate)
     if (last_battery_ms == 0 || now_ms - last_battery_ms >= 60000) {
         last_battery_ms = now_ms;
-        g_battery_pct   = read_battery_pct();
-        uint32_t adc_mv = analogReadMilliVolts(PIN_BATTERY_ADC);
-        Serial.printf("[Batt] GPIO%d adc=%umV batt=%umV pct=%d\n",
-                      PIN_BATTERY_ADC, adc_mv, adc_mv * 2, g_battery_pct);
+        g_battery_pct   = read_battery_pct();  // logs internally
     }
 
     // Apply pending OTA update (flag set by background task when a newer version is found)

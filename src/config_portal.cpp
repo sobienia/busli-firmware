@@ -615,32 +615,41 @@ static void handle_save() {
 // ── Firmware update via browser upload ───────────────────────────────────────
 
 static void handle_update_page() {
-    s_server.send(200, "text/html",
-        F("<!DOCTYPE html><html><head>"
-          "<meta charset='UTF-8'>"
-          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-          "<title>Firmware Update</title>"
-          "<style>"
-          "*{box-sizing:border-box}"
-          "body{font:15px/1.5 sans-serif;max-width:500px;margin:0 auto;"
-               "padding:16px;background:#111;color:#f7b500}"
-          "h1{font-size:22px;margin:0 0 8px}"
-          "p{color:#999;font-size:13px}"
-          "input[type=file]{color:#ddd;margin:16px 0;display:block}"
-          "button{display:block;width:100%;padding:15px;margin-top:8px;"
-                  "background:#f7b500;color:#000;font-size:16px;font-weight:bold;"
-                  "border:none;border-radius:8px;cursor:pointer}"
-          "a{color:#555;font-size:13px}"
-          "</style></head><body>"
-          "<h1>&#9652; Firmware Update</h1>"
-          "<p>Select a <b>.bin</b> file compiled for this device and click Upload. "
-          "The device reboots automatically when the flash completes.</p>"
-          "<form method='POST' action='/update' enctype='multipart/form-data'>"
-          "<input type='file' name='firmware' accept='.bin'>"
-          "<button type='submit'>Upload &amp; Flash</button>"
-          "</form>"
-          "<p style='margin-top:20px'><a href='/'>&#8592; Back to settings</a></p>"
-          "</body></html>"));
+    String page;
+    page.reserve(1200);
+    page += F("<!DOCTYPE html><html><head>"
+              "<meta charset='UTF-8'>"
+              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+              "<title>Firmware Update</title>"
+              "<style>"
+              "*{box-sizing:border-box}"
+              "body{font:15px/1.5 sans-serif;max-width:500px;margin:0 auto;"
+                   "padding:16px;background:#111;color:#f7b500}"
+              "h1{font-size:22px;margin:0 0 8px}"
+              "p,small{color:#999;font-size:13px}"
+              "input[type=file]{color:#ddd;margin:16px 0;display:block}"
+              "button{display:block;width:100%;padding:15px;margin-top:8px;"
+                      "background:#f7b500;color:#000;font-size:16px;font-weight:bold;"
+                      "border:none;border-radius:8px;cursor:pointer}"
+              "a{color:#555;font-size:13px}"
+              ".ver{color:#666;font-size:12px;margin-bottom:16px}"
+              "</style></head><body>"
+              "<h1>&#9652; Firmware Update</h1>");
+    page += "<p class='ver'>Current firmware: <b>v" FIRMWARE_VERSION "</b></p>";
+    page += F("<p>Select a <b>.bin</b> file compiled for this device and click Upload. "
+              "The device reboots automatically when the flash completes.</p>");
+    if (strlen(FIRMWARE_RELEASE_URL) > 0) {
+        page += "<p>&#11015; Download the latest firmware: "
+                "<a href='" FIRMWARE_RELEASE_URL "' style='color:#f7b500'>"
+                FIRMWARE_RELEASE_URL "</a></p>";
+    }
+    page += F("<form method='POST' action='/update' enctype='multipart/form-data'>"
+              "<input type='file' name='firmware' accept='.bin'>"
+              "<button type='submit'>Upload &amp; Flash</button>"
+              "</form>"
+              "<p style='margin-top:20px'><a href='/'>&#8592; Back to settings</a></p>"
+              "</body></html>");
+    s_server.send(200, "text/html", page);
 }
 
 static void handle_update_upload() {
