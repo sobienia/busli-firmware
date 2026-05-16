@@ -2,13 +2,10 @@
 // parcel_tracker.cpp — Swiss Post delivery status (undocumented ekp-web API)
 // ─────────────────────────────────────────────────────────────────────────────
 // 4-step flow:
-//   1. GET  /api/user                         → userId + session cookie
+//   1. GET  /api/user                         → userIdentifier + session cookie + CSRF token
 //   2. POST /api/history?userId=…             → hash
 //   3. GET  /api/history/not-included/{hash}  → identity
 //   4. GET  /api/shipment/id/{identity}/events/ → events → status
-//
-// Best-effort: if the API layout changes or a step fails, returns false.
-// The caller (fetch_task.cpp) holds the http_lock for the full call.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/parcel_tracker.h"
@@ -16,16 +13,18 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-static const char* BASE_URL  = "https://service.post.ch/ekp-web/api";
+static const char* BASE_URL   = "https://service.post.ch/ekp-web/api";
+static const char* ORIGIN     = "https://service.post.ch";
+static const char* REFERER    = "https://service.post.ch/ekp-web/ui/";
+static const char* USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 static const int   TIMEOUT_MS = 12000;
 
-// Strip cookie attributes (everything from the first ';' onward).
 static String strip_cookie_attrs(const String& set_cookie) {
     int semi = set_cookie.indexOf(';');
     return (semi >= 0) ? set_cookie.substring(0, semi) : set_cookie;
 }
 
-// Percent-encode characters that are illegal in a URL query-parameter value.
 static String url_encode(const String& s) {
     String out;
     out.reserve(s.length() + 16);
@@ -43,46 +42,74 @@ static String url_encode(const String& s) {
     return out;
 }
 
-// Map the latest event's description text to a short display status.
-static String classify_status(const String& desc) {
-    String d = desc;
-    d.toLowerCase();
-    if (d.indexOf("deliver") >= 0 || d.indexOf("zugestellt") >= 0 ||
-        d.indexOf("delivered")  >= 0)
+// Map a Swiss Post eventCode (PARCEL.*.X.NNNN) to a short status string.
+// Falls back to keyword matching on the city name for customs detection.
+static String classify_event_code(const String& code, const String& city) {
+    // Extract the trailing numeric segment
+    int last_dot = code.lastIndexOf('.');
+    int n = (last_dot >= 0) ? code.substring(last_dot + 1).toInt() : 0;
+
+    // Known event code ranges (from Swiss Post public API docs + community research):
+    if (n >= 6500 && n < 7000) return "Delivered";   // 6500-6699 = delivered
+    if (n >= 5600 && n < 5700) return "In delivery";  // 5600-5699 = out for delivery
+    if (n >= 5500 && n < 5600) return "In delivery";  // 5500-5599 = delivery attempt
+
+    // Sorting center
+    String ci = city; ci.toLowerCase();
+    if (ci.indexOf("paketzentrum") >= 0) return "Sorted";
+
+    // Customs: detect via code keyword or city name
+    String c = code; c.toLowerCase();
+    if (c.indexOf("custom") >= 0 || c.indexOf("zoll") >= 0 ||
+        ci.indexOf("zoll") >= 0  || ci.indexOf("customs") >= 0)
+        return "Customs";
+
+    return "Shipped";
+}
+
+// Fallback: keyword matching on human-readable description text.
+static String classify_desc(const String& desc) {
+    String d = desc; d.toLowerCase();
+    if (d.indexOf("zugestellt") >= 0 || d.indexOf("delivered") >= 0)
         return "Delivered";
-    if (d.indexOf("out for delivery") >= 0 || d.indexOf("zustellung") >= 0 ||
-        d.indexOf("courier") >= 0 || d.indexOf("zustell") >= 0)
+    if (d.indexOf("out for delivery") >= 0 || d.indexOf("zustell") >= 0)
         return "In delivery";
-    if (d.indexOf("custom") >= 0 || d.indexOf("zoll") >= 0 ||
-        d.indexOf("clearance") >= 0)
+    if (d.indexOf("custom") >= 0 || d.indexOf("zoll") >= 0)
         return "Customs";
     return "Shipped";
 }
 
-// Build an HTTPClient pointing at url, with shared headers.
+// Configure an HTTPClient for the Swiss Post API.
+// Always looks like a browser request (User-Agent, Origin, Referer).
 static bool begin_https(HTTPClient& http, WiFiClientSecure& wc,
-                        const String& url, const String& cookie) {
+                        const String& url, const String& cookie,
+                        const String& csrf = "") {
     wc.setInsecure();
     http.setTimeout(TIMEOUT_MS);
     http.setReuse(false);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     if (!http.begin(wc, url)) return false;
-    http.addHeader("Accept", "application/json");
-    http.addHeader("X-Requested-With", "XMLHttpRequest");
+    http.addHeader("User-Agent",       USER_AGENT);
+    http.addHeader("Accept",           "application/json, text/plain, */*");
+    http.addHeader("Accept-Language",  "en-US,en;q=0.9");
+    http.addHeader("Origin",           ORIGIN);
+    http.addHeader("Referer",          REFERER);
     if (cookie.length() > 0) http.addHeader("Cookie", cookie);
+    if (csrf.length()   > 0) http.addHeader("X-CSRF-TOKEN", csrf);
     return true;
 }
 
 bool parcel_fetch(const char* tracking_number, String& out_status) {
     String base = BASE_URL;
-    String cookie;
+    String cookie, csrf, user_id;
 
-    // ── Step 1: GET /user → userId + session cookie ────────────────────────
+    // ── Step 1: GET /user → userIdentifier + session cookie + CSRF token ──
     {
         WiFiClientSecure wc;
         HTTPClient http;
-        const char* collect[] = {"Set-Cookie", "x-csrf-token"};
-        http.collectHeaders(collect, 2);
+        const char* collect[] = {"Set-Cookie", "X-CSRF-TOKEN", "x-csrf-token",
+                                 "XSRF-TOKEN",  "x-xsrf-token"};
+        http.collectHeaders(collect, 5);
 
         if (!begin_https(http, wc, base + "/user", "")) {
             Serial.println("[Parcel] Step1 begin failed");
@@ -96,169 +123,164 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         }
 
         cookie = strip_cookie_attrs(http.header("Set-Cookie"));
+        // Try every CSRF header name variant
+        for (const char* h : {"X-CSRF-TOKEN", "x-csrf-token", "XSRF-TOKEN", "x-xsrf-token"}) {
+            csrf = http.header(h);
+            if (csrf.length() > 0) break;
+        }
+
         String body = http.getString();
         http.end();
 
-        Serial.printf("[Parcel] Step1 OK cookie='%s'\n", cookie.c_str());
-        Serial.printf("[Parcel] Step1 body: %.250s\n", body.c_str());
+        Serial.printf("[Parcel] Step1 cookie='%s' csrf='%s'\n",
+                      cookie.c_str(), csrf.c_str());
+        Serial.printf("[Parcel] Step1 body: %.280s\n", body.c_str());
 
-        // userId may live under several field names; proceed with empty string
-        // (cookie-only auth) if not found — some API versions omit it.
-        String user_id;
         if (!body.isEmpty()) {
             JsonDocument doc;
             if (!deserializeJson(doc, body)) {
-                // Try the known field name variants
                 for (const char* key : {"userIdentifier", "userId", "id", "customerId"}) {
                     const char* v = doc[key] | (const char*)nullptr;
                     if (v && *v) { user_id = v; break; }
                 }
-                // Nested: {"user": {"id": "..."}}
-                if (user_id.isEmpty()) {
-                    const char* v = doc["user"]["id"] | (const char*)nullptr;
-                    if (v && *v) user_id = v;
-                }
             }
         }
         if (user_id.isEmpty())
-            Serial.println("[Parcel] Step1 userId not found — continuing with cookie only");
+            Serial.println("[Parcel] Step1 no userId — cookie-only");
         else
             Serial.printf("[Parcel] Step1 userId='%s'\n", user_id.c_str());
+    }
 
-        // ── Step 2: POST /history → hash ───────────────────────────────────
-        {
-            WiFiClientSecure wc2;
-            HTTPClient http2;
-            const char* collect2[] = {"Set-Cookie"};
-            http2.collectHeaders(collect2, 1);
+    // ── Step 2: POST /history?userId=… → hash ─────────────────────────────
+    String hash;
+    {
+        WiFiClientSecure wc;
+        HTTPClient http;
+        const char* collect[] = {"Set-Cookie"};
+        http.collectHeaders(collect, 1);
 
-            // Append ?userId= only when we actually have one (value needs URL-encoding)
-            String url2 = base + "/history";
-            if (!user_id.isEmpty()) url2 += "?userId=" + url_encode(user_id);
-            if (!begin_https(http2, wc2, url2, cookie)) {
-                Serial.println("[Parcel] Step2 begin failed"); return false;
-            }
-            http2.addHeader("Content-Type", "application/json");
+        String url = base + "/history";
+        if (!user_id.isEmpty()) url += "?userId=" + url_encode(user_id);
+        if (!begin_https(http, wc, url, cookie, csrf)) {
+            Serial.println("[Parcel] Step2 begin failed"); return false;
+        }
+        http.addHeader("Content-Type", "application/json;charset=UTF-8");
 
-            String req_body = "{\"searchQuery\":\"";
-            req_body += tracking_number;
-            req_body += "\"}";
+        String req = "{\"searchQuery\":\"";
+        req += tracking_number;
+        req += "\"}";
 
-            int code2 = http2.POST(req_body);
-            if (code2 != 200 && code2 != 201) {
-                Serial.printf("[Parcel] Step2 HTTP %d\n", code2);
-                http2.end(); return false;
-            }
+        int code = http.POST(req);
+        String body = http.getString();
+        http.end();
 
-            String new_ck = strip_cookie_attrs(http2.header("Set-Cookie"));
-            if (new_ck.length() > 0) cookie = new_ck;
+        Serial.printf("[Parcel] Step2 HTTP %d body: %.200s\n", code, body.c_str());
+        if (code != 200 && code != 201) return false;
 
-            String body2 = http2.getString();
-            http2.end();
-            Serial.printf("[Parcel] Step2 body: %.120s\n", body2.c_str());
+        JsonDocument doc;
+        if (deserializeJson(doc, body)) { Serial.println("[Parcel] Step2 JSON error"); return false; }
+        const char* h = doc["hash"] | (const char*)nullptr;
+        if (!h && doc.is<JsonArray>() && doc.size() > 0)
+            h = doc[0]["hash"] | (const char*)nullptr;
+        if (!h || !*h) { Serial.println("[Parcel] Step2 no hash"); return false; }
+        hash = h;
+    }
 
-            JsonDocument doc2;
-            if (deserializeJson(doc2, body2)) {
-                Serial.println("[Parcel] Step2 JSON error"); return false;
-            }
+    // ── Step 3: GET /history/not-included/{hash} → identity ───────────────
+    String identity;
+    {
+        WiFiClientSecure wc;
+        HTTPClient http;
 
-            // hash may live at root or inside the first array element
-            String hash = doc2["hash"] | "";
-            if (hash.isEmpty() && doc2.is<JsonArray>() && doc2.size() > 0)
-                hash = doc2[0]["hash"] | "";
-            if (hash.isEmpty()) {
-                Serial.println("[Parcel] Step2 no hash"); return false;
-            }
+        String url = base + "/history/not-included/" + hash;
+        if (!user_id.isEmpty()) url += "?userId=" + url_encode(user_id);
+        if (!begin_https(http, wc, url, cookie, csrf)) {
+            Serial.println("[Parcel] Step3 begin failed"); return false;
+        }
 
-            // ── Step 3: GET /history/not-included/{hash} → identity ────────
-            {
-                WiFiClientSecure wc3;
-                HTTPClient http3;
+        int code = http.GET();
+        String body = http.getString();
+        http.end();
 
-                String url3 = base + "/history/not-included/" + hash;
-                if (!user_id.isEmpty()) url3 += "?userId=" + url_encode(user_id);
-                if (!begin_https(http3, wc3, url3, cookie)) {
-                    Serial.println("[Parcel] Step3 begin failed"); return false;
+        Serial.printf("[Parcel] Step3 HTTP %d body: %.200s\n", code, body.c_str());
+        if (code != 200) return false;
+
+        JsonDocument doc;
+        if (deserializeJson(doc, body)) { Serial.println("[Parcel] Step3 JSON error"); return false; }
+        const char* id = doc["identity"] | (const char*)nullptr;
+        if (!id && doc.is<JsonArray>() && doc.size() > 0)
+            id = doc[0]["identity"] | (const char*)nullptr;
+        if (!id || !*id) { Serial.println("[Parcel] Step3 no identity"); return false; }
+        identity = id;
+    }
+
+    // ── Step 4: GET events for this shipment ──────────────────────────────
+    // Try URL patterns in order — the correct one varies across API versions.
+    {
+        // Candidates to try in sequence; %s = identity (already ASCII-safe)
+        static const char* PATTERNS[] = {
+            "/shipment/id/%s/events/",
+            "/shipment/id/%s/events",
+            "/shipment/%s/events/",
+            "/shipment/%s/events",
+        };
+
+        int code = 0;
+        String body;
+        for (const char* pat : PATTERNS) {
+            char path[160];
+            snprintf(path, sizeof(path), pat, identity.c_str());
+            String url = base + path;
+            if (!user_id.isEmpty()) { url += "?userId="; url += url_encode(user_id); }
+
+            WiFiClientSecure wc;
+            HTTPClient http;
+            if (!begin_https(http, wc, url, cookie, csrf)) continue;
+            code = http.GET();
+            body = http.getString();
+            http.end();
+            Serial.printf("[Parcel] Step4 %s → HTTP %d\n", path, code);
+            if (code == 200) break;
+        }
+        Serial.printf("[Parcel] Step4 body: %.280s\n", body.c_str());
+        if (code != 200) return false;
+
+        JsonDocument doc;
+        if (deserializeJson(doc, body)) { Serial.println("[Parcel] Step4 JSON error"); return false; }
+
+        // Events are newest-first — take the first one that parses successfully.
+        String latest_status;
+        auto walk_events = [&](JsonArray arr) {
+            for (JsonObject ev : arr) {
+                const char* code_str = ev["eventCode"] | (const char*)nullptr;
+                const char* city_str = ev["city"]      | (const char*)nullptr;
+                if (code_str && *code_str) {
+                    latest_status = classify_event_code(String(code_str),
+                                                        city_str ? String(city_str) : String());
+                    Serial.printf("[Parcel] event code=%s city=%s → %s\n",
+                                  code_str, city_str ? city_str : "", latest_status.c_str());
+                    return;  // newest event wins; stop here
                 }
-
-                int code3 = http3.GET();
-                if (code3 != 200) {
-                    Serial.printf("[Parcel] Step3 HTTP %d\n", code3);
-                    http3.end(); return false;
-                }
-
-                String body3 = http3.getString();
-                http3.end();
-                Serial.printf("[Parcel] Step3 body: %.120s\n", body3.c_str());
-
-                JsonDocument doc3;
-                if (deserializeJson(doc3, body3)) {
-                    Serial.println("[Parcel] Step3 JSON error"); return false;
-                }
-
-                String identity = doc3["identity"] | "";
-                if (identity.isEmpty() && doc3.is<JsonArray>() && doc3.size() > 0)
-                    identity = doc3[0]["identity"] | "";
-                if (identity.isEmpty()) {
-                    Serial.println("[Parcel] Step3 no identity"); return false;
-                }
-
-                // ── Step 4: GET /shipment/id/{identity}/events/ ────────────
-                {
-                    WiFiClientSecure wc4;
-                    HTTPClient http4;
-
-                    String url4 = base + "/shipment/id/" + identity + "/events/";
-                    if (!begin_https(http4, wc4, url4, cookie)) {
-                        Serial.println("[Parcel] Step4 begin failed"); return false;
-                    }
-
-                    int code4 = http4.GET();
-                    if (code4 != 200) {
-                        Serial.printf("[Parcel] Step4 HTTP %d\n", code4);
-                        http4.end(); return false;
-                    }
-
-                    String body4 = http4.getString();
-                    http4.end();
-                    Serial.printf("[Parcel] Step4 body: %.200s\n", body4.c_str());
-
-                    JsonDocument doc4;
-                    if (deserializeJson(doc4, body4)) {
-                        Serial.println("[Parcel] Step4 JSON error"); return false;
-                    }
-
-                    // Walk the events array (may be at root or under "events" key)
-                    String latest_desc;
-                    auto walk_events = [&](JsonArray arr) {
-                        for (JsonObject ev : arr) {
-                            // Try common field name variants
-                            const char* d =
-                                ev["description"]      | ev["eventDescription"] |
+                // Fallback: description fields (older API variants)
+                const char* d = ev["description"]      | ev["eventDescription"] |
                                 ev["text"]             | ev["status"]           |
                                 ev["descriptionLocal"] | (const char*)nullptr;
-                            if (d && *d) latest_desc = d;
-                        }
-                    };
-
-                    if (doc4.is<JsonArray>())
-                        walk_events(doc4.as<JsonArray>());
-                    else if (doc4["events"].is<JsonArray>())
-                        walk_events(doc4["events"].as<JsonArray>());
-
-                    if (latest_desc.isEmpty()) {
-                        // Got events but couldn't read description — assume in transit
-                        Serial.println("[Parcel] No event description, defaulting Shipped");
-                        out_status = "Shipped";
-                        return true;
-                    }
-
-                    out_status = classify_status(latest_desc);
-                    Serial.printf("[Parcel] Status='%s' (desc='%s')\n",
-                                  out_status.c_str(), latest_desc.c_str());
-                    return true;
+                if (d && *d) {
+                    latest_status = classify_desc(String(d));
+                    return;
                 }
             }
+        };
+        if (doc.is<JsonArray>())                walk_events(doc.as<JsonArray>());
+        else if (doc["events"].is<JsonArray>()) walk_events(doc["events"].as<JsonArray>());
+
+        if (latest_status.isEmpty()) {
+            Serial.println("[Parcel] No events parsed — defaulting Shipped");
+            out_status = "Shipped";
+            return true;
         }
+        out_status = latest_status;
+        Serial.printf("[Parcel] Final status='%s'\n", out_status.c_str());
+        return true;
     }
 }

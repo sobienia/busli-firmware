@@ -822,13 +822,15 @@ void loop() {
                 int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
 
                 char weather_str[20] = "";
-                char uv_str[16]      = "";
+                char uv_str[32]      = "";
                 if (weather_data.valid) {
                     snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
                              (int)roundf(weather_data.temp_c),
                              (int)roundf(weather_data.temp_max_c));
                     if (g_parcel_status.length() > 0)
-                        strncpy(uv_str, g_parcel_status.c_str(), sizeof(uv_str) - 1);
+                        snprintf(uv_str, sizeof(uv_str), "UV%d/%d | Package: %s",
+                                 weather_data.uv_index, weather_data.uv_index_max,
+                                 g_parcel_status.c_str());
                     else
                         snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
                                  weather_data.uv_index, weather_data.uv_index_max);
@@ -870,13 +872,15 @@ void loop() {
             CommuteData& cd = is_home ? g_commute_home : g_commute_work;
             const char* label = is_home ? "Work -> Home" : "Home -> Work";
             char weather_str[20] = "";
-            char uv_str[16]      = "";
+            char uv_str[32]      = "";
             if (weather_data.valid) {
                 snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
                          (int)roundf(weather_data.temp_c),
                          (int)roundf(weather_data.temp_max_c));
                 if (g_parcel_status.length() > 0)
-                    strncpy(uv_str, g_parcel_status.c_str(), sizeof(uv_str) - 1);
+                    snprintf(uv_str, sizeof(uv_str), "UV%d/%d | %s",
+                             weather_data.uv_index, weather_data.uv_index_max,
+                             g_parcel_status.c_str());
                 else
                     snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
                              weather_data.uv_index, weather_data.uv_index_max);
