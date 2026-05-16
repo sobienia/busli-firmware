@@ -695,6 +695,13 @@ void loop() {
             delay(20);
         }
 
+        if (install && g_battery_pct >= 0 && g_battery_pct < 25 && !g_battery_charging) {
+            display_show_status("Battery too low\nCharge to 25% first");
+            delay(4000);
+            display_invalidate();
+            install = false;
+        }
+
         if (install) {
             display_show_status("Installing firmware...");
             // HTTPS download needs more stack than loopTask's 8 KB — use a dedicated task.
