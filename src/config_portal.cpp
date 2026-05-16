@@ -11,6 +11,7 @@
 
 #include "../include/config_portal.h"
 #include "../include/config.h"
+#include "../include/pager.h"
 #include "../include/swiss_stops.h"
 #include "display.h"
 #include <Arduino.h>
@@ -31,6 +32,7 @@
 #define NVS_KEY_COMMUTE     "commute"
 #define NVS_KEY_OTA         "ota_en"
 #define NVS_KEY_PARCEL      "parcel"
+#define NVS_KEY_PAGER       "pager"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -158,6 +160,56 @@ bool config_load_parcel(String& out_tracking, int& out_pulses) {
     out_tracking = doc["n"] | "";
     out_pulses   = doc["p"] | 3;
     return out_tracking.length() > 0;
+}
+
+bool config_load_pager(PagerConfig& out) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_PAGER, "");
+    prefs.end();
+
+    bool needs_save = false;
+    if (!json.isEmpty()) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, json)) {
+            out.name  = doc["n"] | "";
+            out.topic = doc["t"] | "";
+            out.n_friends = 0;
+            JsonArray fa = doc["f"].as<JsonArray>();
+            for (JsonObject fo : fa) {
+                if (out.n_friends >= PAGER_MAX_FRIENDS) break;
+                out.friends[out.n_friends].name  = fo["n"] | "";
+                out.friends[out.n_friends].topic = fo["t"] | "";
+                if (out.friends[out.n_friends].name.length() > 0 &&
+                    out.friends[out.n_friends].topic.length() > 0)
+                    out.n_friends++;
+            }
+        }
+    }
+    if (out.topic.isEmpty()) {
+        out.topic  = pager_generate_topic();
+        needs_save = true;
+    }
+    if (needs_save) config_save_pager(out);
+    return out.topic.length() > 0;
+}
+
+void config_save_pager(const PagerConfig& cfg) {
+    JsonDocument doc;
+    doc["n"] = cfg.name;
+    doc["t"] = cfg.topic;
+    JsonArray fa = doc["f"].to<JsonArray>();
+    for (int i = 0; i < cfg.n_friends; i++) {
+        JsonObject fo = fa.add<JsonObject>();
+        fo["n"] = cfg.friends[i].name;
+        fo["t"] = cfg.friends[i].topic;
+    }
+    String json;
+    serializeJson(doc, json);
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putString(NVS_KEY_PAGER, json);
+    prefs.end();
 }
 
 bool config_load_commute(CommuteConfig& out) {
@@ -310,7 +362,8 @@ static String build_page(String ssids[], String passes[], String users[],
                           const String& opensky_user, const String& opensky_pass,
                           const CommuteConfig& commute,
                           bool ota_enabled,
-                          const String& parcel_tracking, int parcel_pulses) {
+                          const String& parcel_tracking, int parcel_pulses,
+                          const PagerConfig& pager) {
     String h;
     h.reserve(10000);
 
@@ -335,6 +388,10 @@ static String build_page(String ssids[], String passes[], String users[],
            "button{display:block;width:100%;padding:15px;margin-top:28px;"
                    "background:#f7b500;color:#000;font-size:16px;font-weight:bold;"
                    "border:none;border-radius:8px;cursor:pointer}"
+           ".tbtn{display:inline-block;width:auto;padding:6px 12px;margin-top:0;"
+                  "background:#1a1a1a;color:#f7b500;font-size:12px;font-weight:bold;"
+                  "border:1px solid #383838;border-radius:5px;cursor:pointer;white-space:nowrap}"
+           ".tbtn:disabled{opacity:.5;cursor:default}"
            ".sta-wrap{position:relative}"
            ".drop{position:absolute;left:0;right:0;top:100%;background:#1a1a1a;"
                   "border:1px solid #444;border-radius:0 0 6px 6px;z-index:9;"
@@ -510,6 +567,39 @@ static String build_page(String ssids[], String passes[], String users[],
          + String(parcel_pulses) + "' style='width:80px'>";
     h += F("</div>");
 
+    // ── Pager section ────────────────────────────────────────────────────────
+    h += F("<h2>Pager</h2>"
+           "<p class='hint' style='margin:-4px 0 10px'>Send activity invites to friends. "
+           "Long-press the brightness button to open the send screen. "
+           "Share your Topic ID with friends so they can message you.</p>");
+    h += "<div class='card'><div class='ct'>This device</div>";
+    h += "<label>Your name <span class='hint'>shown to friends when you send a message</span></label>"
+         "<input type='text' name='pg_n' placeholder='e.g. AJ' maxlength='20' value='"
+         + html_encode(pager.name) + "'>";
+    h += "<label>Your topic ID <span class='hint'>share this with friends so they can add you</span></label>"
+         "<input type='text' name='pg_t' value='"
+         + html_encode(pager.topic) + "' autocomplete='off' spellcheck='false' style='font-size:12px'>";
+    h += F("</div>");
+    h += F("<div class='card'><div class='ct'>Friends</div>"
+           "<p class='hint' style='margin:4px 0 10px'>Add up to 5 friends. "
+           "Enter their name and the topic ID they shared with you.</p>");
+    for (int i = 0; i < PAGER_MAX_FRIENDS; i++) {
+        String fn = (i < pager.n_friends) ? pager.friends[i].name  : "";
+        String ft = (i < pager.n_friends) ? pager.friends[i].topic : "";
+        h += "<div style='margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #252525'>";
+        h += "<label style='color:#777'>Friend " + String(i + 1) + "</label>";
+        h += "<div style='display:flex;gap:8px;margin-top:4px;align-items:center'>"
+             "<input type='text' name='pf" + String(i) + "n' id='pfn" + String(i) + "' placeholder='Name' "
+             "value='" + html_encode(fn) + "' style='width:35%'>"
+             "<input type='text' name='pf" + String(i) + "t' id='pft" + String(i) + "' placeholder='Topic ID' "
+             "value='" + html_encode(ft) + "' style='font-size:12px;flex:1' "
+             "autocomplete='off' spellcheck='false'>"
+             "<button type='button' class='tbtn' onclick='testPager(this," + String(i) + ")'>Test</button>"
+             "</div>";
+        h += "</div>";
+    }
+    h += F("</div>");
+
     // ── Updates section ──────────────────────────────────────────────────────
     h += F("<h2>Updates</h2><div class='card'>");
     h += "<label style='display:flex;align-items:center;gap:10px;cursor:pointer'>"
@@ -567,6 +657,21 @@ static String build_page(String ssids[], String passes[], String users[],
                "if(e.getAttribute('data-v')===v)e.classList.add('sel');"
              "});"
            "})();"
+           "function testPager(btn,i){"
+             "var t=document.getElementById('pft'+i).value.trim();"
+             "if(!t){btn.textContent='no topic';return;}"
+             "var n=document.getElementById('pfn'+i).value.trim();"
+             "btn.textContent='...';btn.disabled=true;"
+             "fetch('/pager_test?topic='+encodeURIComponent(t)+'&name='+encodeURIComponent(n))"
+               ".then(function(r){return r.json();})"
+               ".then(function(d){"
+                 "btn.textContent=d.ok?'✓ sent':'✗ fail';"
+                 "btn.disabled=false;"
+                 "setTimeout(function(){btn.textContent='Test';},3000);"
+               "})"
+               ".catch(function(){btn.textContent='✗ err';btn.disabled=false;"
+                 "setTimeout(function(){btn.textContent='Test';},3000);});"
+           "}"
            "</script>"
            "</body></html>");
     return h;
@@ -590,6 +695,7 @@ static CommuteConfig s_commute;
 static bool          s_ota_enabled = true;
 static String        s_parcel_tracking;
 static int           s_parcel_pulses = 3;
+static PagerConfig   s_pager;
 
 static void handle_root() {
     String page = build_page(s_ssids, s_passes, s_users, s_stops, s_n_stops,
@@ -597,7 +703,8 @@ static void handle_root() {
                              s_flights, s_n_flights,
                              s_opensky_user, s_opensky_pass,
                              s_commute, s_ota_enabled,
-                             s_parcel_tracking, s_parcel_pulses);
+                             s_parcel_tracking, s_parcel_pulses,
+                             s_pager);
     s_server.send(200, "text/html", page);
 }
 
@@ -676,6 +783,23 @@ static void handle_save() {
     int    new_parcel_pulses   = s_server.arg("pt_pulses").toInt();
     if (new_parcel_pulses < 0)  new_parcel_pulses = 0;
     if (new_parcel_pulses > 10) new_parcel_pulses = 10;
+
+    // Parse pager config
+    PagerConfig new_pager;
+    new_pager.name  = s_server.arg("pg_n"); new_pager.name.trim();
+    new_pager.topic = s_server.arg("pg_t"); new_pager.topic.trim();
+    if (new_pager.topic.isEmpty()) new_pager.topic = s_pager.topic;  // keep existing
+    new_pager.n_friends = 0;
+    for (int i = 0; i < PAGER_MAX_FRIENDS; i++) {
+        String fn = s_server.arg("pf" + String(i) + "n"); fn.trim();
+        String ft = s_server.arg("pf" + String(i) + "t"); ft.trim();
+        if (fn.length() > 0 && ft.length() > 0) {
+            new_pager.friends[new_pager.n_friends].name  = fn;
+            new_pager.friends[new_pager.n_friends].topic = ft;
+            new_pager.n_friends++;
+        }
+    }
+    config_save_pager(new_pager);
 
     save_to_nvs(new_ssids, new_passes, new_users, n_wifi, new_stops, n_stops,
                 cd_label, cd_target, cd_icon, new_flights, n_flights,
@@ -766,6 +890,19 @@ static void handle_update_finish() {
     if (ok) { delay(500); ESP.restart(); }
 }
 
+static void handle_pager_test() {
+    String topic = s_server.arg("topic"); topic.trim();
+    String name  = s_server.arg("name");  name.trim();
+    if (topic.isEmpty()) {
+        s_server.send(400, "application/json", F("{\"ok\":false,\"msg\":\"no topic\"}"));
+        return;
+    }
+    String from = name.isEmpty() ? "Busli" : name;
+    bool ok = pager_publish(topic, from, s_pager.topic, "Test from Busli config portal");
+    s_server.send(200, "application/json",
+                  ok ? F("{\"ok\":true}") : F("{\"ok\":false,\"msg\":\"send failed\"}"));
+}
+
 static void handle_not_found() {
     // Captive-portal redirect — iOS/Android auto-detect and open the browser
     s_server.sendHeader("Location", "http://192.168.4.1/", true);
@@ -825,6 +962,8 @@ void config_portal_run(uint32_t timeoutMs) {
     s_parcel_tracking = "";
     s_parcel_pulses   = 3;
     config_load_parcel(s_parcel_tracking, s_parcel_pulses);
+    s_pager = {};
+    config_load_pager(s_pager);
 
     // Start AP
     WiFi.disconnect(true);
@@ -840,11 +979,12 @@ void config_portal_run(uint32_t timeoutMs) {
     s_dns.start(53, "*", ip);
 
     // Web server routes
-    s_server.on("/",         HTTP_GET,  handle_root);
-    s_server.on("/save",     HTTP_POST, handle_save);
-    s_server.on("/stations", HTTP_GET,  handle_stations);
-    s_server.on("/update",   HTTP_GET,  handle_update_page);
-    s_server.on("/update",   HTTP_POST, handle_update_finish, handle_update_upload);
+    s_server.on("/",           HTTP_GET,  handle_root);
+    s_server.on("/save",       HTTP_POST, handle_save);
+    s_server.on("/stations",   HTTP_GET,  handle_stations);
+    s_server.on("/pager_test", HTTP_GET,  handle_pager_test);
+    s_server.on("/update",     HTTP_GET,  handle_update_page);
+    s_server.on("/update",     HTTP_POST, handle_update_finish, handle_update_upload);
     s_server.onNotFound(handle_not_found);
     s_server.begin();
 

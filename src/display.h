@@ -104,3 +104,40 @@ void display_draw_commute(
 // phase begins; stop it when the board is ready to appear.
 void display_boot_animation_start();
 void display_boot_animation_stop();
+
+// ── Pager UI screens ──────────────────────────────────────────────────────────
+// All pager screens fill the full 480×222 display (no external footer/header).
+// highlighted: index of the currently selected item, or -1 for none.
+
+// Activity selection: 2 rows × 5 columns of labeled tiles.
+// acts[10] — activity labels (up to 8 chars each).
+void display_draw_pager_activities(const char* const acts[], int highlighted);
+
+// Time selection: 2 rows × 3 columns.
+// activity_label: shown in header for context (e.g. "Beer").
+// times[6] — time labels.
+void display_draw_pager_times(const char* activity_label,
+                               const char* const times[], int highlighted);
+
+// Friend selection: vertical list, tap to send.
+// header: shows the composed message (e.g. "Beer in 30 min?").
+// names[n] — friend display names; n — count.
+void display_draw_pager_friends(const char* header,
+                                 const char* const names[], int n, int highlighted);
+
+// Incoming message overlay: header + icon + text + timestamp + reply/close buttons.
+// header:       shown top-left of the header bar (e.g. "From: AJ").
+// icon_idx:     activity index 0–9; -1 = no icon (used for invite messages).
+// sent_at:      epoch of original send (right-aligned in header); 0 = hidden.
+// show_replies: true → [Yes][No][Later][Close]; false → single full-width [Close].
+// highlighted:  0–3 for 4-btn mode; 0 for single-btn mode; -1 = none.
+// re_text:      original question text to show as a quote block (nullptr = none).
+// re_icon_idx:  activity index for the quoted question's icon; -1 = no icon.
+void display_draw_pager_incoming(const char* header,
+                                  const char* text,
+                                  int icon_idx,
+                                  time_t sent_at,
+                                  bool show_replies,
+                                  int highlighted,
+                                  const char* re_text   = nullptr,
+                                  int         re_icon_idx = -1);

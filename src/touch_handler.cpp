@@ -33,9 +33,13 @@ static bool     s_waiting_double_tap = false;
 
 bool touch_is_pressed()    { return s_touching; }
 int  touch_last_screen_x() {
-    // rotation=3: rightward swipe = raw_y decreasing, so screen_x = SCREEN_W - raw_y*(SCREEN_W/480)
-    // raw_y range 0..480 maps to screen_x SCREEN_W..0 (inverted)
+    // rotation=3: raw_y maps to the horizontal screen axis (inverted)
     return SCREEN_W - (int)s_last_raw_y * SCREEN_W / 480;
+}
+
+int  touch_last_screen_y() {
+    // rotation=3: raw_x maps to the vertical screen axis (0=top, SCREEN_H-1=bottom)
+    return (int)s_last_raw_x * SCREEN_H / 222;
 }
 
 void touch_init() {

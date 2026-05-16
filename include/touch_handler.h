@@ -22,3 +22,4 @@ TouchGesture touch_poll();
 // Use these inside blocking prompt loops to detect finger-up and tap position.
 bool touch_is_pressed();       // true while screen is being touched
 int  touch_last_screen_x();    // screen X of last touch (0=left .. SCREEN_W-1=right)
+int  touch_last_screen_y();    // screen Y of last touch (0=top  .. SCREEN_H-1=bottom)

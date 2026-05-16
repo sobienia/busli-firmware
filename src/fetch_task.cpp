@@ -19,6 +19,7 @@
 #include "../include/ota.h"
 #include "../include/flight_tracker.h"
 #include "../include/parcel_tracker.h"
+#include "../include/pager.h"
 #include "api.h"
 #include "weather.h"
 #include "commute.h"
@@ -56,6 +57,15 @@ static bool        s_commute_ok   = false;
 // Parcel tracking
 static String s_parcel_tracking;
 static int    s_parcel_pulses      = 3;
+
+// Pager (ntfy.sh)
+static PagerConfig         s_pager_cfg;
+static bool                s_pager_ready        = false;
+static time_t              s_pager_last_poll    = 0;
+static PagerIncoming       s_pager_queue[4];
+static int                 s_pager_queue_head   = 0;
+static int                 s_pager_queue_tail   = 0;
+static volatile time_t     s_pager_last_activity = 0;  // set by main loop on send/receive/open
 static String s_parcel_status;
 static bool   s_parcel_changed     = false;
 static bool   s_parcel_ok          = false;  // at least one fetch succeeded
@@ -123,6 +133,25 @@ static void do_fetch_commute() {
     xSemaphoreGive(s_mutex);
 }
 
+static void do_poll_pager() {
+    if (!s_pager_ready || s_pager_cfg.topic.isEmpty()) return;
+    std::vector<PagerIncoming> msgs;
+    http_lock_take();
+    bool ok = pager_poll(s_pager_cfg.topic, s_pager_last_poll, msgs);
+    http_lock_give();
+    if (!ok || msgs.empty()) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (auto& m : msgs) {
+        // Circular buffer — drop oldest if full
+        int next = (s_pager_queue_tail + 1) % 4;
+        if (next == s_pager_queue_head) s_pager_queue_head = (s_pager_queue_head + 1) % 4;
+        s_pager_queue[s_pager_queue_tail] = m;
+        s_pager_queue_tail = next;
+    }
+    xSemaphoreGive(s_mutex);
+    Serial.printf("[Pager] %d new message(s)\n", (int)msgs.size());
+}
+
 static void do_fetch_parcel() {
     if (s_parcel_tracking.isEmpty()) return;
     String new_status;
@@ -165,6 +194,8 @@ static void fetch_task_loop(void* /*param*/) {
     time_t last_ntp_sync      = time(nullptr);
     // First parcel check fires at boot+30s to avoid crowding the initial fetches.
     time_t last_parcel_fetch  = time(nullptr) - PARCEL_REFRESH_SEC + 30;
+    // First pager poll fires at boot+15s.
+    time_t last_pager_poll    = time(nullptr) - PAGER_POLL_SEC + 15;
 
     for (;;) {
         time_t now = time(nullptr);
@@ -234,6 +265,16 @@ static void fetch_task_loop(void* /*param*/) {
         if (!s_parcel_tracking.isEmpty() && now - last_parcel_fetch >= PARCEL_REFRESH_SEC) {
             do_fetch_parcel();
             last_parcel_fetch = time(nullptr);
+        }
+
+        // ── Pager polling ─────────────────────────────────────────────────────
+        // 15 s when pager was used in the last 5 minutes; 60 s when idle.
+        if (s_pager_ready) {
+            int poll_sec = (now - s_pager_last_activity < 300) ? 15 : 60;
+            if (now - last_pager_poll >= poll_sec) {
+                do_poll_pager();
+                last_pager_poll = time(nullptr);
+            }
         }
 
         // ── NTP daily resync ──────────────────────────────────────────────────
@@ -337,9 +378,31 @@ bool fetch_task_get_parcel(String& out_status, bool& out_changed) {
     return ok;
 }
 
+void fetch_task_set_pager(const PagerConfig& cfg) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_pager_cfg   = cfg;
+    s_pager_ready = cfg.topic.length() > 0;
+    xSemaphoreGive(s_mutex);
+}
+
+bool fetch_task_get_pager_incoming(PagerIncoming& out) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool has = (s_pager_queue_head != s_pager_queue_tail);
+    if (has) {
+        out = s_pager_queue[s_pager_queue_head];
+        s_pager_queue_head = (s_pager_queue_head + 1) % 4;
+    }
+    xSemaphoreGive(s_mutex);
+    return has;
+}
+
 void fetch_task_init_flights(const FlightEntry* entries, int count) {
     // Initialise data structures (no HTTP) so the display shows callsign names immediately.
     flight_tracker_init(entries, count);
     s_flight_count = count;
     for (int i = 0; i < count; i++) s_flight_last_fetch[i] = 0; // trigger immediate fetch
+}
+
+void fetch_task_notify_pager_activity() {
+    s_pager_last_activity = time(nullptr);
 }

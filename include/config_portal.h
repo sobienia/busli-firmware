@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "pager.h"
 
 // One stop's editable fields — strings only, no raw pointer arrays.
 // Call config_build_stop_configs() after loading to produce StopConfig[].
@@ -56,6 +57,14 @@ bool config_load_ota_enabled();
 // Load parcel tracking config. Returns true if a tracking number is set.
 // out_pulses: how many times to pulse brightness on status change (default 3).
 bool config_load_parcel(String& out_tracking, int& out_pulses);
+
+// Load pager config (device name, own topic, friends list).
+// Auto-generates and persists a topic on first call if none exists.
+// Returns true if at least a topic is present.
+bool config_load_pager(PagerConfig& out);
+
+// Persist pager config to NVS.
+void config_save_pager(const PagerConfig& cfg);
 
 // Run the AP config portal. Blocks until the user saves (then reboots)
 // or until timeoutMs elapses (then returns so normal boot can continue).

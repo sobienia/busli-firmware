@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <vector>
 #include "display.h"          // Departure struct
+#include "pager.h"            // PagerConfig, PagerIncoming
 #include "api.h"              // StopConfig struct
 #include "weather.h"          // WeatherData
 #include "commute.h"          // CommuteData
@@ -60,3 +61,14 @@ void fetch_task_set_parcel(const String& tracking, int pulses);
 // out_changed is set true (once) when the status has changed since last read.
 // Returns false if no tracking number is configured or no fetch has completed yet.
 bool fetch_task_get_parcel(String& out_status, bool& out_changed);
+
+// Configure pager (ntfy.sh polling). Call from setup() after loading config.
+// Polling starts immediately; pass an empty topic to disable.
+void fetch_task_set_pager(const PagerConfig& cfg);
+
+// Pop the oldest unread incoming pager message. Returns false if queue is empty.
+bool fetch_task_get_pager_incoming(PagerIncoming& out);
+
+// Signal that the pager was just used (send/receive/open). Switches poll interval
+// to 15 s for the next 5 minutes, then falls back to 60 s when idle.
+void fetch_task_notify_pager_activity();

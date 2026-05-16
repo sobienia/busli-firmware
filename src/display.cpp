@@ -1265,3 +1265,277 @@ void display_boot_animation_stop() {
     s_anim_running = false;
     while (s_anim_task_handle != nullptr) vTaskDelay(pdMS_TO_TICKS(10));
 }
+
+// ── Pager UI ──────────────────────────────────────────────────────────────────
+
+static void pager_draw_header(const char* title) {
+    gfx->fillScreen(BLACK);
+    String t = to_latin1(title);
+    int tw = text_w(t, 2);
+    draw_text(t, (SCREEN_W - tw) / 2, (HEADER_H - 16) / 2, 2, c_row0);
+    gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, c_meta);
+}
+
+// Pixel-art icons for the 10 activity slots.
+// cx/cy = center of the icon drawing area.
+static void pager_icon(int idx, int cx, int cy, uint16_t col) {
+    switch (idx) {
+    case 0: // Beer mug
+        gfx->fillRect(cx - 8, cy - 9, 16, 20, col);          // mug body
+        gfx->drawRect(cx + 8, cy - 3, 7, 10, col);            // handle
+        gfx->fillRect(cx - 9, cy - 13, 18, 5, col);           // foam
+        break;
+    case 1: // Coffee cup + saucer + steam
+        gfx->fillRect(cx - 8, cy - 5, 16, 15, col);           // cup
+        gfx->fillRect(cx - 11, cy + 10, 22, 3, col);          // saucer
+        gfx->drawFastVLine(cx - 4, cy - 10, 5, col);          // steam left
+        gfx->drawFastVLine(cx,     cy - 12, 5, col);           // steam mid
+        gfx->drawFastVLine(cx + 4, cy - 10, 5, col);          // steam right
+        break;
+    case 2: // Movie clapperboard
+        gfx->fillRect(cx - 12, cy - 2, 24, 15, col);          // board body
+        gfx->fillRect(cx - 12, cy - 9, 24, 8, col);           // top strip
+        for (int i = 0; i < 4; i++)
+            gfx->fillRect(cx - 11 + i * 6, cy - 9, 3, 8, BLACK); // stripe gaps
+        break;
+    case 3: // Gym barbell
+        gfx->fillRect(cx - 14, cy - 2, 28, 4, col);           // bar
+        gfx->fillRect(cx - 19, cy - 8, 6, 16, col);           // left plate
+        gfx->fillRect(cx + 13, cy - 8, 6, 16, col);           // right plate
+        break;
+    case 4: // Running stick figure
+        gfx->fillCircle(cx + 4, cy - 11, 4, col);             // head
+        gfx->drawLine(cx + 2, cy - 7, cx, cy + 2, col);       // torso
+        gfx->drawLine(cx + 1, cy - 4, cx - 7, cy,     col);   // arm back
+        gfx->drawLine(cx + 1, cy - 4, cx + 8, cy - 8, col);   // arm fwd
+        gfx->drawLine(cx,     cy + 2, cx - 7, cy + 10, col);  // leg back
+        gfx->drawLine(cx,     cy + 2, cx + 7, cy + 8,  col);  // leg fwd
+        break;
+    case 5: // Bicycle
+        gfx->drawCircle(cx - 11, cy + 4, 9, col);             // rear wheel
+        gfx->drawCircle(cx + 11, cy + 4, 9, col);             // front wheel
+        gfx->drawLine(cx - 11, cy + 4, cx,      cy - 5, col); // rear frame
+        gfx->drawLine(cx,      cy - 5, cx + 11, cy + 4, col); // front fork
+        gfx->drawLine(cx - 11, cy + 4, cx,      cy + 4, col); // chain stay
+        gfx->drawLine(cx,      cy + 4, cx,      cy - 5, col); // seat tube
+        gfx->drawFastHLine(cx + 9, cy - 3, 6, col);           // handlebar
+        break;
+    case 6: { // Classic digital phone (Nokia-style: body + antenna + screen + keypad)
+        // Antenna (top-right, slightly angled)
+        gfx->drawLine(cx + 5, cy - 20, cx + 7, cy - 12, col);
+        gfx->drawLine(cx + 6, cy - 20, cx + 8, cy - 12, col);
+        // Phone body
+        gfx->fillRect(cx - 8, cy - 12, 16, 26, col);
+        // Screen (dark inset, top portion)
+        gfx->fillRect(cx - 5, cy - 10, 10, 7, BLACK);
+        // Earpiece slit on screen
+        gfx->fillRect(cx - 2, cy - 9, 5, 1, col);
+        // Keypad: 3×4 grid of dark button squares
+        for (int r = 0; r < 4; r++) {
+            for (int c2 = 0; c2 < 3; c2++) {
+                gfx->fillRect(cx - 5 + c2 * 4, cy - 1 + r * 4, 2, 2, BLACK);
+            }
+        }
+        break;
+    }
+    case 7: // Dinner fork + knife
+        gfx->fillRect(cx - 8, cy - 13, 3, 26, col);           // fork handle
+        gfx->fillRect(cx - 10, cy - 13, 2, 9, col);           // left prong
+        gfx->fillRect(cx - 6,  cy - 13, 2, 9, col);           // right prong
+        gfx->fillRect(cx + 5, cy - 13, 3, 26, col);           // knife blade+handle
+        gfx->fillTriangle(cx + 4, cy - 13, cx + 8, cy - 13, cx + 8, cy + 2, col); // taper
+        break;
+    case 8: // Lunch bowl
+        gfx->fillCircle(cx, cy + 4, 12, col);                 // full circle
+        gfx->fillRect(cx - 13, cy - 8, 26, 12, BLACK);        // erase top → bowl shape
+        gfx->fillRect(cx - 13, cy + 15, 26, 3, col);          // base line
+        break;
+    case 9: // Heart (Love)
+        gfx->fillCircle(cx - 5, cy - 5, 7, col);
+        gfx->fillCircle(cx + 5, cy - 5, 7, col);
+        gfx->fillTriangle(cx - 11, cy, cx + 11, cy, cx, cy + 11, col);
+        break;
+    default:
+        break;
+    }
+}
+
+// icon_idx >= 0: draw pixel-art icon + small label; -1: text-only tile (time selector)
+static void pager_draw_tile(int x, int y, int w, int h,
+                             const char* label, int icon_idx, bool selected) {
+    uint16_t border = selected ? c_row0 : c_meta;
+    uint16_t text_c = selected ? c_row0 : c_dim;
+    gfx->drawRect(x + 2, y + 2, w - 4, h - 4, border);
+    if (selected) gfx->drawRect(x + 3, y + 3, w - 6, h - 6, border);
+    if (icon_idx >= 0) {
+        uint16_t icon_c = selected ? c_row0 : c_rows;
+        bool has_label = (label && label[0] != '\0');
+        int icon_cy = has_label ? (y + h / 2 - 8) : (y + h / 2);
+        pager_icon(icon_idx, x + w / 2, icon_cy, icon_c);
+        if (has_label) {
+            String s = to_latin1(label);
+            int tw = text_w(s, 2);
+            draw_text(s, x + (w - tw) / 2, y + h - 22, 2, text_c);
+        }
+    } else {
+        String s = to_latin1(label);
+        int tw = text_w(s, 2);
+        draw_text(s, x + (w - tw) / 2, y + (h - 16) / 2, 2, text_c);
+    }
+}
+
+void display_draw_pager_activities(const char* const acts[], int highlighted) {
+    pager_draw_header("Send a message");
+    int content_h = SCREEN_H - HEADER_H;
+    int tile_w = SCREEN_W / 5;
+    int tile_h = content_h / 2;
+    for (int i = 0; i < 10; i++) {
+        int col = i % 5;
+        int row = i / 5;
+        pager_draw_tile(col * tile_w, HEADER_H + row * tile_h,
+                        tile_w, tile_h, acts[i], i, i == highlighted);
+    }
+}
+
+void display_draw_pager_times(const char* activity_label,
+                               const char* const times[], int highlighted) {
+    char hdr[32];
+    snprintf(hdr, sizeof(hdr), "%s — when?", activity_label);
+    pager_draw_header(hdr);
+    int content_h = SCREEN_H - HEADER_H;
+    int tile_w = SCREEN_W / 3;
+    int tile_h = content_h / 2;
+    for (int i = 0; i < 6; i++) {
+        int col = i % 3;
+        int row = i / 3;
+        pager_draw_tile(col * tile_w, HEADER_H + row * tile_h,
+                        tile_w, tile_h, times[i], -1, i == highlighted);
+    }
+}
+
+void display_draw_pager_friends(const char* header,
+                                 const char* const names[], int n, int highlighted) {
+    pager_draw_header(header);
+    if (n == 0) {
+        String msg = "No friends configured";
+        int tw = text_w(msg, 2);
+        draw_text(msg, (SCREEN_W - tw) / 2, HEADER_H + 70, 2, c_dim);
+        return;
+    }
+    int content_h = SCREEN_H - HEADER_H;
+    int rows  = (n <= 3) ? 1 : 2;
+    int tile_w = SCREEN_W / 3;
+    int tile_h = content_h / rows;
+    for (int i = 0; i < n; i++) {
+        int col = i % 3;
+        int row = i / 3;
+        pager_draw_tile(col * tile_w, HEADER_H + row * tile_h,
+                        tile_w, tile_h, names[i], -1, i == highlighted);
+    }
+}
+
+void display_draw_pager_incoming(const char* header,
+                                  const char* text,
+                                  int icon_idx,
+                                  time_t sent_at,
+                                  bool show_replies,
+                                  int highlighted,
+                                  const char* re_text,
+                                  int re_icon_idx) {
+    // ── Header bar ─────────────────────────────────────────────────────────────
+    gfx->fillScreen(BLACK);
+    String hdr = to_latin1(header);
+    draw_text(hdr, PAD, (HEADER_H - 16) / 2, 2, c_row0);
+
+    if (sent_at > 0) {
+        int elapsed = (int)((time(nullptr) - sent_at) / 60);
+        char buf[16];
+        // Avoid 'j' — "just now" inflates text_w in TramliSmall due to bounding-box quirk
+        if (elapsed < 1)       snprintf(buf, sizeof(buf), "now");
+        else if (elapsed == 1) snprintf(buf, sizeof(buf), "1 min ago");
+        else                   snprintf(buf, sizeof(buf), "%d min ago", elapsed);
+        String sb = buf;
+        int stw = text_w(sb, 2);
+        draw_text(sb, SCREEN_W - stw - PAD, (HEADER_H - 16) / 2, 2, c_dim);
+    }
+    gfx->drawFastHLine(0, HEADER_H - 1, SCREEN_W, c_meta);
+
+    int btn_y    = SCREEN_H - 70;
+    int content_top = HEADER_H;
+
+    // ── Quote block — original question shown above a reply ───────────────────
+    bool has_quote = (re_text && re_text[0]);
+    if (has_quote) {
+        int qy = HEADER_H + 7;
+        gfx->fillRect(PAD, HEADER_H + 4, 3, 22, c_meta);  // left amber bar
+        String qs = to_latin1(re_text);
+        int max_qw = SCREEN_W - PAD - 14 - PAD;
+        if (text_w(qs, 2) > max_qw) {
+            int ddw = text_w("..", 2);
+            while (qs.length() > 1 && text_w(qs, 2) > max_qw - ddw)
+                qs = qs.substring(0, qs.length() - 1);
+            qs += "..";
+        }
+        draw_text(qs, PAD + 14, qy, 2, c_dim);
+        gfx->drawFastHLine(0, HEADER_H + 32, SCREEN_W, c_meta);
+        content_top = HEADER_H + 34;
+    }
+
+    // ── Icon + message text ─────────────────────────────────────────────────────
+    // For reply messages (has_quote): show the original question's icon as context.
+    // For invite messages: show the activity icon as before.
+    int display_icon = has_quote ? re_icon_idx : icon_idx;
+
+    String s = to_latin1(text);
+    int max_w = SCREEN_W - 2 * PAD;
+    int text_y;
+    if (display_icon >= 0) {
+        pager_icon(display_icon, SCREEN_W / 2, content_top + 26, c_rows);
+        text_y = content_top + 58;
+    } else {
+        int msg_h = btn_y - content_top;
+        int tw = text_w(s, 2);
+        text_y = content_top + (msg_h - (tw > max_w ? 32 : 16)) / 2;
+    }
+    int tw = text_w(s, 2);
+    if (tw <= max_w) {
+        draw_text(s, (SCREEN_W - tw) / 2, text_y, 2, c_row0);
+    } else {
+        int mid = s.length() / 2;
+        int sp  = s.lastIndexOf(' ', mid);
+        if (sp < 0) sp = s.indexOf(' ', mid);
+        if (sp > 0) {
+            String l1 = s.substring(0, sp), l2 = s.substring(sp + 1);
+            int tw1 = text_w(l1, 2), tw2 = text_w(l2, 2);
+            draw_text(l1, (SCREEN_W - tw1) / 2, text_y,      2, c_row0);
+            draw_text(l2, (SCREEN_W - tw2) / 2, text_y + 20, 2, c_row0);
+        } else {
+            draw_text(s, PAD, text_y, 2, c_row0);
+        }
+    }
+
+    // ── Button row ─────────────────────────────────────────────────────────────
+    gfx->drawFastHLine(0, btn_y, SCREEN_W, c_meta);
+    if (show_replies) {
+        // 4 buttons: Yes / No / Later / Close
+        static const char* BTNS[] = { "Yes", "No", "Later", "Close" };
+        int btn_w = SCREEN_W / 4;
+        for (int i = 0; i < 4; i++) {
+            bool sel = (i == highlighted);
+            int bx = i * btn_w;
+            if (sel) gfx->fillRect(bx, btn_y, btn_w, 70, c_meta >> 1);
+            if (i > 0) gfx->drawFastVLine(bx, btn_y, 70, c_meta);
+            String bs = to_latin1(BTNS[i]);
+            int btw = text_w(bs, 2);
+            draw_text(bs, bx + (btn_w - btw) / 2, btn_y + (70 - 16) / 2, 2,
+                      sel ? c_row0 : c_rows);
+        }
+    } else {
+        // Single full-width Close (reply already sent or not applicable)
+        if (highlighted == 0) gfx->fillRect(0, btn_y, SCREEN_W, 70, c_meta >> 1);
+        String cl = "Close";
+        int ctw = text_w(cl, 2);
+        draw_text(cl, (SCREEN_W - ctw) / 2, btn_y + (70 - 16) / 2, 2,
+                  (highlighted == 0) ? c_row0 : c_rows);
+    }
+}
