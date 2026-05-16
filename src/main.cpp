@@ -698,7 +698,10 @@ void loop() {
         if (install) {
             display_show_status("Installing firmware...");
             // HTTPS download needs more stack than loopTask's 8 KB — use a dedicated task.
-            xTaskCreate([](void*) {
+            // Pass our own handle so the task can resume loop() if the download fails.
+            TaskHandle_t loop_task = xTaskGetCurrentTaskHandle();
+            xTaskCreate([](void* arg) {
+                TaskHandle_t caller = static_cast<TaskHandle_t>(arg);
                 if (ota_apply(g_ota_url)) {
                     display_show_status("Update complete!\nRestarting...");
                     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -707,9 +710,10 @@ void loop() {
                     display_show_status("Update failed");
                     vTaskDelay(pdMS_TO_TICKS(3000));
                     display_invalidate();
+                    vTaskResume(caller); // unblock loop() so buttons work again
                 }
                 vTaskDelete(nullptr);
-            }, "ota_apply", 32768, nullptr, 5, nullptr);
+            }, "ota_apply", 32768, (void*)loop_task, 5, nullptr);
             vTaskSuspend(nullptr); // pause loop() while OTA task runs
         } else {
             display_invalidate(); // user declined — resume normal display
