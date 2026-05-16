@@ -142,6 +142,14 @@ static int         g_commute_conn_idx = 0;
 static WeatherData weather_data    = {};
 static uint32_t    g_setup_done_ms = 0;  // set at end of setup(); used to detect "still loading"
 
+// Parcel tracking — display-side state
+static String   g_parcel_status;         // "" = not configured or not yet fetched
+static int      g_parcel_pulses    = 3;  // brightness flashes on status change
+static bool     g_parcel_pulsing   = false;
+static int      g_parcel_pulse_rem = 0;  // remaining flash cycles
+static uint32_t g_parcel_pulse_ms  = 0;  // millis() when current half-cycle started
+static bool     g_parcel_pulse_hi  = false; // true = currently at 100% brightness
+
 // Battery — read via SY6970 PMU on the I2C bus shared with touch (SDA=5 SCL=6)
 static XPowersPPM pmu;
 static bool       s_pmu_ok          = false;
@@ -524,6 +532,26 @@ static void check_touch() {
     }
 }
 
+// ── Parcel brightness pulse ───────────────────────────────────────────────────
+// Called every loop() tick when g_parcel_pulsing is true.
+// Each "pulse" = 250 ms at 100%, then 250 ms at dimmed level.
+// After g_parcel_pulse_rem cycles, restores brightness via display_invalidate().
+static void parcel_pulse_tick() {
+    if (!g_parcel_pulsing) return;
+    uint32_t now_ms = millis();
+    if (now_ms - g_parcel_pulse_ms < 250) return;   // wait out the current half-cycle
+    g_parcel_pulse_ms = now_ms;
+    g_parcel_pulse_hi = !g_parcel_pulse_hi;
+    display_set_brightness(g_parcel_pulse_hi ? 100 : 15);
+    if (!g_parcel_pulse_hi) {
+        // finished one full pulse (hi→lo)
+        if (--g_parcel_pulse_rem <= 0) {
+            g_parcel_pulsing = false;
+            display_invalidate();  // triggers apply_night_brightness() on next draw
+        }
+    }
+}
+
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  ARDUINO ENTRY POINTS                                                     ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -619,6 +647,14 @@ void setup() {
     http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);
     fetch_task_set_ota_enabled(config_load_ota_enabled());
+    {
+        String pt_tracking;
+        if (config_load_parcel(pt_tracking, g_parcel_pulses)) {
+            fetch_task_set_parcel(pt_tracking, g_parcel_pulses);
+            Serial.printf("[Parcel] Tracking: %s (%d pulses)\n",
+                          pt_tracking.c_str(), g_parcel_pulses);
+        }
+    }
 
     // Restore last-viewed page from NVS (overrides time-based initial page)
     {
@@ -727,6 +763,25 @@ void loop() {
         }
     }
 
+    // Parcel pulse animation tick
+    parcel_pulse_tick();
+
+    // Pull latest parcel status — start pulse animation on status change
+    {
+        String new_parcel;
+        bool   parcel_changed = false;
+        if (fetch_task_get_parcel(new_parcel, parcel_changed)) {
+            g_parcel_status = new_parcel;
+            if (parcel_changed && g_parcel_pulses > 0 && !g_parcel_pulsing) {
+                g_parcel_pulsing   = true;
+                g_parcel_pulse_rem = g_parcel_pulses;
+                g_parcel_pulse_hi  = true;
+                g_parcel_pulse_ms  = millis();
+                display_set_brightness(100);
+            }
+        }
+    }
+
     // Pull latest weather + commute from background cache once per second
     fetch_task_get_weather(weather_data);
     if (commute_configured()) {
@@ -762,13 +817,16 @@ void loop() {
                 int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
 
                 char weather_str[20] = "";
-                char uv_str[10]      = "";
+                char uv_str[16]      = "";
                 if (weather_data.valid) {
                     snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
                              (int)roundf(weather_data.temp_c),
                              (int)roundf(weather_data.temp_max_c));
-                    snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
-                             weather_data.uv_index, weather_data.uv_index_max);
+                    if (g_parcel_status.length() > 0)
+                        strncpy(uv_str, g_parcel_status.c_str(), sizeof(uv_str) - 1);
+                    else
+                        snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
+                                 weather_data.uv_index, weather_data.uv_index_max);
                 } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
                     strncpy(weather_str, "No weather", sizeof(weather_str) - 1);
                 }
@@ -807,13 +865,16 @@ void loop() {
             CommuteData& cd = is_home ? g_commute_home : g_commute_work;
             const char* label = is_home ? "Work -> Home" : "Home -> Work";
             char weather_str[20] = "";
-            char uv_str[10]      = "";
+            char uv_str[16]      = "";
             if (weather_data.valid) {
                 snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
                          (int)roundf(weather_data.temp_c),
                          (int)roundf(weather_data.temp_max_c));
-                snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
-                         weather_data.uv_index, weather_data.uv_index_max);
+                if (g_parcel_status.length() > 0)
+                    strncpy(uv_str, g_parcel_status.c_str(), sizeof(uv_str) - 1);
+                else
+                    snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
+                             weather_data.uv_index, weather_data.uv_index_max);
             } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
                 strncpy(weather_str, "No weather", sizeof(weather_str) - 1);
             }

@@ -53,6 +53,10 @@ bool config_load_commute(CommuteConfig& out);
 // Load OTA-enabled flag from NVS. Returns true (default) if the user has not disabled it.
 bool config_load_ota_enabled();
 
+// Load parcel tracking config. Returns true if a tracking number is set.
+// out_pulses: how many times to pulse brightness on status change (default 3).
+bool config_load_parcel(String& out_tracking, int& out_pulses);
+
 // Run the AP config portal. Blocks until the user saves (then reboots)
 // or until timeoutMs elapses (then returns so normal boot can continue).
 // Pass timeoutMs=0 for no timeout.

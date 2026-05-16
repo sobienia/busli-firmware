@@ -121,6 +121,12 @@
 #define COMMUTE_REFRESH_SEC  60    // how often the background task re-fetches commute data
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  PARCEL TRACKING (Swiss Post)                                             ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define PARCEL_REFRESH_SEC  3600   // re-check tracking status once per hour
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  FIRMWARE / OTA                                                           ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 // Bump FIRMWARE_VERSION before each release. The device checks OTA_VERSION_URL
@@ -135,7 +141,7 @@
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.4.2"
+#define FIRMWARE_VERSION        "1.5.0"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 

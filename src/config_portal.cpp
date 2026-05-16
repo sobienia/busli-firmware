@@ -30,6 +30,7 @@
 #define NVS_KEY_OPENSKY     "opensky"
 #define NVS_KEY_COMMUTE     "commute"
 #define NVS_KEY_OTA         "ota_en"
+#define NVS_KEY_PARCEL      "parcel"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -146,6 +147,19 @@ bool config_load_ota_enabled() {
     return val;
 }
 
+bool config_load_parcel(String& out_tracking, int& out_pulses) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_PARCEL, "");
+    prefs.end();
+    if (json.isEmpty()) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return false;
+    out_tracking = doc["n"] | "";
+    out_pulses   = doc["p"] | 3;
+    return out_tracking.length() > 0;
+}
+
 bool config_load_commute(CommuteConfig& out) {
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, true);
@@ -166,7 +180,8 @@ static void save_to_nvs(String ssids[], String passes[], String users[], int n_w
                          FlightEntry flights[], int n_flights,
                          const String& opensky_user, const String& opensky_pass,
                          const CommuteConfig& commute,
-                         bool ota_enabled) {
+                         bool ota_enabled,
+                         const String& parcel_tracking, int parcel_pulses) {
     // WiFi JSON
     JsonDocument wdoc;
     JsonArray warr = wdoc.to<JsonArray>();
@@ -253,10 +268,24 @@ static void save_to_nvs(String ssids[], String passes[], String users[], int n_w
     }
 
     prefs.putBool(NVS_KEY_OTA, ota_enabled);
+
+    // Parcel tracking
+    if (parcel_tracking.length() > 0) {
+        JsonDocument pldoc;
+        pldoc["n"] = parcel_tracking;
+        pldoc["p"] = parcel_pulses;
+        String pl_json;
+        serializeJson(pldoc, pl_json);
+        prefs.putString(NVS_KEY_PARCEL, pl_json);
+    } else {
+        prefs.remove(NVS_KEY_PARCEL);
+    }
+
     prefs.end();
 
-    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS, OTA=%s\n",
-                  n_wifi, n_stops, n_flights, ota_enabled ? "on" : "off");
+    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS, OTA=%s parcel=%s\n",
+                  n_wifi, n_stops, n_flights, ota_enabled ? "on" : "off",
+                  parcel_tracking.isEmpty() ? "off" : parcel_tracking.c_str());
 }
 
 // ── HTML builder ──────────────────────────────────────────────────────────────
@@ -280,7 +309,8 @@ static String build_page(String ssids[], String passes[], String users[],
                           FlightEntry flights[], int n_flights,
                           const String& opensky_user, const String& opensky_pass,
                           const CommuteConfig& commute,
-                          bool ota_enabled) {
+                          bool ota_enabled,
+                          const String& parcel_tracking, int parcel_pulses) {
     String h;
     h.reserve(10000);
 
@@ -466,6 +496,20 @@ static String build_page(String ssids[], String passes[], String users[],
         h += "</div>";
     }
 
+    // ── Parcel tracking section ──────────────────────────────────────────────
+    h += F("<h2>Parcel tracking</h2>"
+           "<div class='card'>"
+           "<div class='ct'>Swiss Post <span style='font-weight:normal;color:#666'>(optional)</span></div>"
+           "<p class='hint' style='margin:4px 0 8px'>Status is checked once per hour and shown in the footer "
+           "instead of UV info. When the status changes, the backlight pulses to alert you.</p>");
+    h += "<label>Tracking number</label>"
+         "<input type='text' name='pt_num' placeholder='99.00.000000.00000000' value='"
+         + html_encode(parcel_tracking) + "' autocomplete='off'>";
+    h += "<label>Alert pulses <span class='hint'>how many times to flash the screen when status changes (0&ndash;10)</span></label>"
+         "<input type='number' name='pt_pulses' min='0' max='10' value='"
+         + String(parcel_pulses) + "' style='width:80px'>";
+    h += F("</div>");
+
     // ── Updates section ──────────────────────────────────────────────────────
     h += F("<h2>Updates</h2><div class='card'>");
     h += "<label style='display:flex;align-items:center;gap:10px;cursor:pointer'>"
@@ -544,13 +588,16 @@ static String      s_opensky_user;
 static String      s_opensky_pass;
 static CommuteConfig s_commute;
 static bool          s_ota_enabled = true;
+static String        s_parcel_tracking;
+static int           s_parcel_pulses = 3;
 
 static void handle_root() {
     String page = build_page(s_ssids, s_passes, s_users, s_stops, s_n_stops,
                              s_cd_label, s_cd_target, s_cd_icon,
                              s_flights, s_n_flights,
                              s_opensky_user, s_opensky_pass,
-                             s_commute, s_ota_enabled);
+                             s_commute, s_ota_enabled,
+                             s_parcel_tracking, s_parcel_pulses);
     s_server.send(200, "text/html", page);
 }
 
@@ -625,9 +672,15 @@ static void handle_save() {
 
     bool new_ota_enabled = s_server.arg("ota_en") == "1";
 
+    String new_parcel_tracking = s_server.arg("pt_num"); new_parcel_tracking.trim();
+    int    new_parcel_pulses   = s_server.arg("pt_pulses").toInt();
+    if (new_parcel_pulses < 0)  new_parcel_pulses = 0;
+    if (new_parcel_pulses > 10) new_parcel_pulses = 10;
+
     save_to_nvs(new_ssids, new_passes, new_users, n_wifi, new_stops, n_stops,
                 cd_label, cd_target, cd_icon, new_flights, n_flights,
-                new_opensky_user, new_opensky_pass, new_commute, new_ota_enabled);
+                new_opensky_user, new_opensky_pass, new_commute, new_ota_enabled,
+                new_parcel_tracking, new_parcel_pulses);
 
     s_server.send(200, "text/html",
         F("<!DOCTYPE html><html><head>"
@@ -769,6 +822,9 @@ void config_portal_run(uint32_t timeoutMs) {
     s_commute = {};
     config_load_commute(s_commute);
     s_ota_enabled = config_load_ota_enabled();
+    s_parcel_tracking = "";
+    s_parcel_pulses   = 3;
+    config_load_parcel(s_parcel_tracking, s_parcel_pulses);
 
     // Start AP
     WiFi.disconnect(true);

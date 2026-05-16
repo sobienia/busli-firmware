@@ -51,3 +51,12 @@ void fetch_task_init_flights(const FlightEntry* entries, int count);
 // Enable or disable automatic OTA checks. Call from setup() after loading config.
 // Default is true; set to false if the user has opted out in the portal.
 void fetch_task_set_ota_enabled(bool enabled);
+
+// Configure Swiss Post parcel tracking. Call from setup() after loading config.
+// Pass an empty tracking string to disable. pulses = how many times to flash on change.
+void fetch_task_set_parcel(const String& tracking, int pulses);
+
+// Read the latest parcel status from the background cache.
+// out_changed is set true (once) when the status has changed since last read.
+// Returns false if no tracking number is configured or no fetch has completed yet.
+bool fetch_task_get_parcel(String& out_status, bool& out_changed);

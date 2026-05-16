@@ -18,6 +18,7 @@
 #include "../include/http_lock.h"
 #include "../include/ota.h"
 #include "../include/flight_tracker.h"
+#include "../include/parcel_tracker.h"
 #include "api.h"
 #include "weather.h"
 #include "commute.h"
@@ -51,6 +52,13 @@ static String      s_work_station;
 static CommuteData s_commute_home = {};
 static CommuteData s_commute_work = {};
 static bool        s_commute_ok   = false;
+
+// Parcel tracking
+static String s_parcel_tracking;
+static int    s_parcel_pulses    = 3;
+static String s_parcel_status;
+static bool   s_parcel_changed   = false;
+static bool   s_parcel_ok        = false;  // at least one fetch succeeded
 
 static void do_fetch(int idx) {
     std::vector<Departure> fresh;
@@ -114,6 +122,25 @@ static void do_fetch_commute() {
     xSemaphoreGive(s_mutex);
 }
 
+static void do_fetch_parcel() {
+    if (s_parcel_tracking.isEmpty()) return;
+    String new_status;
+    http_lock_take();
+    bool ok = parcel_fetch(s_parcel_tracking.c_str(), new_status);
+    http_lock_give();
+    if (!ok) return;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool changed = (s_parcel_ok && new_status != s_parcel_status);
+    s_parcel_status  = new_status;
+    s_parcel_ok      = true;
+    if (changed) s_parcel_changed = true;
+    xSemaphoreGive(s_mutex);
+
+    if (changed)
+        Serial.printf("[Parcel] Status changed → '%s'\n", new_status.c_str());
+}
+
 static void fetch_task_loop(void* /*param*/) {
     // Fetch weather and commute immediately so data is available within seconds of boot.
     do_fetch_weather();
@@ -130,6 +157,8 @@ static void fetch_task_loop(void* /*param*/) {
     // First OTA check fires at boot+3min, then every OTA_CHECK_INTERVAL_SEC after that.
     time_t last_ota_check     = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 180;
     time_t last_ntp_sync      = time(nullptr);
+    // First parcel check fires at boot+30s to avoid crowding the initial fetches.
+    time_t last_parcel_fetch  = time(nullptr) - PARCEL_REFRESH_SEC + 30;
 
     for (;;) {
         time_t now = time(nullptr);
@@ -193,6 +222,12 @@ static void fetch_task_loop(void* /*param*/) {
                 g_ota_pending = true;
             }
             last_ota_check = time(nullptr);
+        }
+
+        // ── Parcel tracking ───────────────────────────────────────────────────
+        if (!s_parcel_tracking.isEmpty() && now - last_parcel_fetch >= PARCEL_REFRESH_SEC) {
+            do_fetch_parcel();
+            last_parcel_fetch = time(nullptr);
         }
 
         // ── NTP daily resync ──────────────────────────────────────────────────
@@ -270,6 +305,23 @@ void fetch_task_force_commute_refresh() {
 
 void fetch_task_set_ota_enabled(bool enabled) {
     s_ota_enabled = enabled;
+}
+
+void fetch_task_set_parcel(const String& tracking, int pulses) {
+    s_parcel_tracking = tracking;
+    s_parcel_pulses   = pulses;
+}
+
+bool fetch_task_get_parcel(String& out_status, bool& out_changed) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = s_parcel_ok;
+    if (ok) {
+        out_status  = s_parcel_status;
+        out_changed = s_parcel_changed;
+        s_parcel_changed = false;
+    }
+    xSemaphoreGive(s_mutex);
+    return ok;
 }
 
 void fetch_task_init_flights(const FlightEntry* entries, int count) {
