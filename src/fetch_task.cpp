@@ -160,8 +160,8 @@ static void fetch_task_loop(void* /*param*/) {
 
     time_t last_weather_fetch = time(nullptr);
     time_t last_commute_fetch = time(nullptr);
-    // First OTA check fires at boot+3min, then every OTA_CHECK_INTERVAL_SEC after that.
-    time_t last_ota_check     = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 180;
+    // First OTA check fires at boot+2min, then every OTA_CHECK_INTERVAL_SEC after that.
+    time_t last_ota_check     = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 120;
     time_t last_ntp_sync      = time(nullptr);
     // First parcel check fires at boot+30s to avoid crowding the initial fetches.
     time_t last_parcel_fetch  = time(nullptr) - PARCEL_REFRESH_SEC + 30;

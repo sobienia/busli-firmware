@@ -82,24 +82,41 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         http.end();
 
         Serial.printf("[Parcel] Step1 OK cookie='%s'\n", cookie.c_str());
+        Serial.printf("[Parcel] Step1 body: %.250s\n", body.c_str());
 
-        JsonDocument doc;
-        if (deserializeJson(doc, body)) {
-            Serial.println("[Parcel] Step1 JSON error"); return false;
+        // userId may live under several field names; proceed with empty string
+        // (cookie-only auth) if not found — some API versions omit it.
+        String user_id;
+        if (!body.isEmpty()) {
+            JsonDocument doc;
+            if (!deserializeJson(doc, body)) {
+                // Try the known field name variants
+                for (const char* key : {"userId", "id", "customerId", "ekpUserId"}) {
+                    const char* v = doc[key] | (const char*)nullptr;
+                    if (v && *v) { user_id = v; break; }
+                }
+                // Nested: {"user": {"id": "..."}}
+                if (user_id.isEmpty()) {
+                    const char* v = doc["user"]["id"] | (const char*)nullptr;
+                    if (v && *v) user_id = v;
+                }
+            }
         }
-        String user_id = doc["userId"] | "";
-        if (user_id.isEmpty()) {
-            Serial.println("[Parcel] Step1 no userId"); return false;
-        }
+        if (user_id.isEmpty())
+            Serial.println("[Parcel] Step1 userId not found — continuing with cookie only");
+        else
+            Serial.printf("[Parcel] Step1 userId='%s'\n", user_id.c_str());
 
-        // ── Step 2: POST /history?userId=… → hash ─────────────────────────
+        // ── Step 2: POST /history → hash ───────────────────────────────────
         {
             WiFiClientSecure wc2;
             HTTPClient http2;
             const char* collect2[] = {"Set-Cookie"};
             http2.collectHeaders(collect2, 1);
 
-            String url2 = base + "/history?userId=" + user_id;
+            // Append ?userId= only when we actually have one
+            String url2 = base + "/history";
+            if (!user_id.isEmpty()) url2 += "?userId=" + user_id;
             if (!begin_https(http2, wc2, url2, cookie)) {
                 Serial.println("[Parcel] Step2 begin failed"); return false;
             }
@@ -140,8 +157,8 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
                 WiFiClientSecure wc3;
                 HTTPClient http3;
 
-                String url3 = base + "/history/not-included/" + hash
-                              + "?userId=" + user_id;
+                String url3 = base + "/history/not-included/" + hash;
+                if (!user_id.isEmpty()) url3 += "?userId=" + user_id;
                 if (!begin_https(http3, wc3, url3, cookie)) {
                     Serial.println("[Parcel] Step3 begin failed"); return false;
                 }

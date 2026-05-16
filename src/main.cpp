@@ -731,8 +731,8 @@ void loop() {
             delay(20);
         }
 
-        if (install && g_battery_pct >= 0 && g_battery_pct < 25 && !g_battery_charging) {
-            display_show_status("Battery too low\nCharge to 25% first");
+        if (install && g_battery_pct >= 0 && g_battery_pct < 50 && !g_battery_charging) {
+            display_show_status("Battery too low\nCharge to 50% first");
             delay(4000);
             display_invalidate();
             install = false;
