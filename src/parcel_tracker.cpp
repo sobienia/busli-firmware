@@ -25,6 +25,24 @@ static String strip_cookie_attrs(const String& set_cookie) {
     return (semi >= 0) ? set_cookie.substring(0, semi) : set_cookie;
 }
 
+// Percent-encode characters that are illegal in a URL query-parameter value.
+static String url_encode(const String& s) {
+    String out;
+    out.reserve(s.length() + 16);
+    for (int i = 0; i < (int)s.length(); i++) {
+        char c = s[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += c;
+        } else {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%%%02X", (uint8_t)c);
+            out += buf;
+        }
+    }
+    return out;
+}
+
 // Map the latest event's description text to a short display status.
 static String classify_status(const String& desc) {
     String d = desc;
@@ -91,7 +109,7 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
             JsonDocument doc;
             if (!deserializeJson(doc, body)) {
                 // Try the known field name variants
-                for (const char* key : {"userId", "id", "customerId", "ekpUserId"}) {
+                for (const char* key : {"userIdentifier", "userId", "id", "customerId"}) {
                     const char* v = doc[key] | (const char*)nullptr;
                     if (v && *v) { user_id = v; break; }
                 }
@@ -114,9 +132,9 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
             const char* collect2[] = {"Set-Cookie"};
             http2.collectHeaders(collect2, 1);
 
-            // Append ?userId= only when we actually have one
+            // Append ?userId= only when we actually have one (value needs URL-encoding)
             String url2 = base + "/history";
-            if (!user_id.isEmpty()) url2 += "?userId=" + user_id;
+            if (!user_id.isEmpty()) url2 += "?userId=" + url_encode(user_id);
             if (!begin_https(http2, wc2, url2, cookie)) {
                 Serial.println("[Parcel] Step2 begin failed"); return false;
             }
@@ -158,7 +176,7 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
                 HTTPClient http3;
 
                 String url3 = base + "/history/not-included/" + hash;
-                if (!user_id.isEmpty()) url3 += "?userId=" + user_id;
+                if (!user_id.isEmpty()) url3 += "?userId=" + url_encode(user_id);
                 if (!begin_https(http3, wc3, url3, cookie)) {
                     Serial.println("[Parcel] Step3 begin failed"); return false;
                 }
