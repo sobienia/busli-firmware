@@ -277,13 +277,15 @@ void display_show_ota_prompt(const char* cur_ver, const char* new_ver) {
     if (!gfx) return;
     gfx->fillScreen(BLACK);
 
-    // Title
-    String title = "New firmware available!";
-    draw_text(title, (SCREEN_W - text_w(title, 3)) / 2, 22, 3, c_row0);
+    // Title — two lines to fit: "New firmware available." / "Update?"
+    String title1 = "New firmware available.";
+    String title2 = "Update?";
+    draw_text(title1, (SCREEN_W - text_w(title1, 2)) / 2, 14, 2, c_row0);
+    draw_text(title2, (SCREEN_W - text_w(title2, 3)) / 2, 34, 3, c_row0);
 
-    // Version line  e.g. "v1.2.0 → v1.3.1"
-    String ver_line = String("v") + cur_ver + " \xc2\xbb v" + new_ver;
-    draw_text(ver_line, (SCREEN_W - text_w(ver_line, 2)) / 2, 70, 2, c_dim);
+    // Version line  e.g. "v1.2.0 -> v1.3.1"
+    String ver_line = String("v") + cur_ver + " -> v" + new_ver;
+    draw_text(ver_line, (SCREEN_W - text_w(ver_line, 2)) / 2, 72, 2, c_dim);
 
     // Separator
     gfx->drawFastHLine(PAD, 120, SCREEN_W - PAD * 2, c_meta);
@@ -393,7 +395,8 @@ static void draw_bus_icon(int x, int y, uint16_t color) {
 }
 
 // ── Night-mode brightness ─────────────────────────────────────────────────────
-static uint8_t s_day_brightness = DAY_BRIGHTNESS;  // manual day level; cycled by display_step_brightness()
+static uint8_t s_day_brightness = DAY_BRIGHTNESS;  // cycled by display_step_brightness()
+static bool    s_last_night_state = false;  // tracks last known night/day to detect transitions
 
 static bool is_night_hours() {
     time_t now = time(nullptr);
@@ -405,8 +408,16 @@ static bool is_night_hours() {
         : (h >= NIGHT_START_HOUR && h < NIGHT_END_HOUR);
 }
 
+// Called once per second from draw_board/draw_commute/draw_flight.
+// Only applies automatic brightness at the night/day transition — leaves the
+// user's manual level alone between transitions so step_brightness works at night.
 static void apply_night_brightness() {
-    display_set_brightness(is_night_hours() ? NIGHT_BRIGHTNESS : s_day_brightness);
+    bool night = is_night_hours();
+    if (night != s_last_night_state) {
+        s_last_night_state = night;
+        display_set_brightness(night ? NIGHT_BRIGHTNESS : s_day_brightness);
+        Serial.printf("[Display] Auto brightness: %s mode\n", night ? "night" : "day");
+    }
 }
 
 void display_init_brightness() {
@@ -415,19 +426,22 @@ void display_init_brightness() {
     int b = prefs.getInt("bright_day", DAY_BRIGHTNESS);
     prefs.end();
     if (b >= 20 && b <= 100) s_day_brightness = (uint8_t)b;
-    apply_night_brightness();
-    Serial.printf("[Display] Brightness loaded: %d%%\n", s_day_brightness);
+    // Apply correct brightness for current time and seed the transition tracker.
+    s_last_night_state = is_night_hours();
+    display_set_brightness(s_last_night_state ? NIGHT_BRIGHTNESS : s_day_brightness);
+    Serial.printf("[Display] Brightness loaded: %d%% (%s)\n",
+                  s_day_brightness, s_last_night_state ? "night" : "day");
 }
 
 void display_step_brightness() {
-    // Cycle: 100→80→60→40→20→100
+    // Cycle: 100→80→60→40→20→100 — always applies immediately, even at night.
     s_day_brightness = (s_day_brightness > 20) ? s_day_brightness - 20 : 100;
-    if (!is_night_hours()) display_set_brightness(s_day_brightness);
+    display_set_brightness(s_day_brightness);
     Preferences prefs;
     prefs.begin("tramli", false);
     prefs.putInt("bright_day", s_day_brightness);
     prefs.end();
-    Serial.printf("[Display] Day brightness → %d%%\n", s_day_brightness);
+    Serial.printf("[Display] Brightness → %d%%\n", s_day_brightness);
 }
 
 // ── Header ────────────────────────────────────────────────────────────────────

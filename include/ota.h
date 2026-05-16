@@ -14,5 +14,6 @@ bool ota_check(String& out_url);
 
 // Download the binary at url and flash it via the OTA partition.
 // Returns true on success; caller should ESP.restart() afterward.
+// progress_cb (optional): called with 0-100 percent during the download.
 // Takes the http_lock internally.
-bool ota_apply(const String& url);
+bool ota_apply(const String& url, void (*progress_cb)(int percent) = nullptr);

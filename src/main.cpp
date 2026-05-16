@@ -739,13 +739,18 @@ void loop() {
         }
 
         if (install) {
-            display_show_status("Installing firmware...");
+            display_show_status("Installing firmware...\n0%");
             // HTTPS download needs more stack than loopTask's 8 KB — use a dedicated task.
             // Pass our own handle so the task can resume loop() if the download fails.
             TaskHandle_t loop_task = xTaskGetCurrentTaskHandle();
             xTaskCreate([](void* arg) {
                 TaskHandle_t caller = static_cast<TaskHandle_t>(arg);
-                if (ota_apply(g_ota_url)) {
+                auto progress = [](int pct) {
+                    char msg[40];
+                    snprintf(msg, sizeof(msg), "Installing firmware...\n%d%%", pct);
+                    display_show_status(msg);
+                };
+                if (ota_apply(g_ota_url, progress)) {
                     display_show_status("Update complete!\nRestarting...");
                     vTaskDelay(pdMS_TO_TICKS(2000));
                     ESP.restart();

@@ -69,7 +69,7 @@ bool ota_check(String& out_url) {
     return true;
 }
 
-bool ota_apply(const String& url) {
+bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
     Serial.printf("[OTA] Downloading firmware: %s\n", url.c_str());
 
     WiFiClientSecure wc;
@@ -108,7 +108,10 @@ bool ota_apply(const String& url) {
     WiFiClient* stream = http.getStreamPtr();
     uint8_t buf[1024];
     int written = 0;
+    int last_reported_pct = -1;
     uint32_t deadline = millis() + 120000UL;
+
+    if (progress_cb) progress_cb(0);
 
     while (written < total && millis() < deadline) {
         int av = stream->available();
@@ -116,8 +119,13 @@ bool ota_apply(const String& url) {
             int n = stream->readBytes(buf, min(av, (int)sizeof(buf)));
             Update.write(buf, n);
             written += n;
+            int pct = written * 100 / total;
+            if (progress_cb && pct != last_reported_pct) {
+                last_reported_pct = pct;
+                progress_cb(pct);
+            }
             if (written % 65536 == 0)
-                Serial.printf("[OTA] %d / %d bytes\n", written, total);
+                Serial.printf("[OTA] %d / %d bytes (%d%%)\n", written, total, pct);
         } else {
             delay(1);
         }

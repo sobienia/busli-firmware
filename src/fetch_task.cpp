@@ -55,10 +55,11 @@ static bool        s_commute_ok   = false;
 
 // Parcel tracking
 static String s_parcel_tracking;
-static int    s_parcel_pulses    = 3;
+static int    s_parcel_pulses      = 3;
 static String s_parcel_status;
-static bool   s_parcel_changed   = false;
-static bool   s_parcel_ok        = false;  // at least one fetch succeeded
+static bool   s_parcel_changed     = false;
+static bool   s_parcel_ok          = false;  // at least one fetch succeeded
+static time_t s_parcel_delivered_at = 0;     // epoch when "Delivered" was first recorded
 
 static void do_fetch(int idx) {
     std::vector<Departure> fresh;
@@ -132,9 +133,14 @@ static void do_fetch_parcel() {
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool changed = (s_parcel_ok && new_status != s_parcel_status);
-    s_parcel_status  = new_status;
-    s_parcel_ok      = true;
+    s_parcel_status = new_status;
+    s_parcel_ok     = true;
     if (changed) s_parcel_changed = true;
+    // Track when "Delivered" was first confirmed so we can clear it after 24 h.
+    if (new_status == "Delivered" && s_parcel_delivered_at == 0)
+        s_parcel_delivered_at = time(nullptr);
+    else if (new_status != "Delivered")
+        s_parcel_delivered_at = 0;
     xSemaphoreGive(s_mutex);
 
     if (changed)
@@ -316,9 +322,16 @@ bool fetch_task_get_parcel(String& out_status, bool& out_changed) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool ok = s_parcel_ok;
     if (ok) {
-        out_status  = s_parcel_status;
-        out_changed = s_parcel_changed;
-        s_parcel_changed = false;
+        // Suppress "Delivered" after 24 h — go back to showing UV index.
+        bool delivered_expired = (s_parcel_status == "Delivered" &&
+                                  s_parcel_delivered_at > 0 &&
+                                  time(nullptr) - s_parcel_delivered_at >= 86400);
+        if (delivered_expired) ok = false;
+        else {
+            out_status       = s_parcel_status;
+            out_changed      = s_parcel_changed;
+            s_parcel_changed = false;
+        }
     }
     xSemaphoreGive(s_mutex);
     return ok;
