@@ -28,19 +28,20 @@ static String url_encode(const String& s) {
     return out;
 }
 
-// NVS keys are limited to 15 chars → key by a hash of the station name
-static String cache_key(const String& station) {
+// NVS keys are limited to 15 chars → key by a hash of the name.
+// prefix: 's' = transit station, 'c' = town typed by the user
+static String cache_key(const String& name, char prefix = 's') {
     uint32_t h = 2166136261u;
-    for (char c : station) h = (h ^ (uint8_t)c) * 16777619u;
+    for (char c : name) h = (h ^ (uint8_t)c) * 16777619u;
     char key[12];
-    snprintf(key, sizeof(key), "s%08lx", (unsigned long)h);
+    snprintf(key, sizeof(key), "%c%08lx", prefix, (unsigned long)h);
     return key;
 }
 
-static bool cache_get(const String& station, GeoPlace& out) {
+static bool cache_get(const String& station, GeoPlace& out, char prefix = 's') {
     Preferences prefs;
     prefs.begin(NVS_NS, true);
-    String json = prefs.getString(cache_key(station).c_str(), "");
+    String json = prefs.getString(cache_key(station, prefix).c_str(), "");
     prefs.end();
     if (json.isEmpty()) return false;
     JsonDocument doc;
@@ -52,7 +53,7 @@ static bool cache_get(const String& station, GeoPlace& out) {
     return true;
 }
 
-static void cache_put(const String& station, const GeoPlace& p) {
+static void cache_put(const String& station, const GeoPlace& p, char prefix = 's') {
     JsonDocument doc;
     doc["a"] = p.lat;
     doc["o"] = p.lon;
@@ -61,7 +62,7 @@ static void cache_put(const String& station, const GeoPlace& p) {
     serializeJson(doc, json);
     Preferences prefs;
     prefs.begin(NVS_NS, false);
-    prefs.putString(cache_key(station).c_str(), json);
+    prefs.putString(cache_key(station, prefix).c_str(), json);
     prefs.end();
 }
 
@@ -118,6 +119,37 @@ static bool fetch_town(float lat, float lon, String& out_city) {
         if (v && *v) { out_city = v; return true; }
     }
     return false;
+}
+
+bool geo_resolve_city(const String& name, GeoPlace& out) {
+    String q = name; q.trim();
+    if (q.isEmpty()) return false;
+    if (cache_get(q, out, 'c')) return true;
+
+    String url = "http://geocoding-api.open-meteo.com/v1/search?count=1&language=de&name=" + url_encode(q);
+    HTTPClient http;
+    http.setTimeout(TIMEOUT_MS);
+    http_lock_take();
+    bool ok = http.begin(url);
+    int code = ok ? http.GET() : -1;
+    String body = (code == 200) ? http.getString() : "";
+    http.end();
+    http_lock_give();
+    if (code != 200) { Serial.printf("[Geo] geocoding HTTP %d\n", code); return false; }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return false;
+    JsonObject r = doc["results"][0];
+    if (r.isNull()) { Serial.printf("[Geo] town '%s' not found\n", q.c_str()); return false; }
+    GeoPlace p;
+    p.lat   = r["latitude"]  | 0.0f;
+    p.lon   = r["longitude"] | 0.0f;
+    p.city  = q;               // show it the way the user wrote it
+    p.valid = true;
+    cache_put(q, p, 'c');
+    Serial.printf("[Geo] town %s → %.4f,%.4f\n", q.c_str(), p.lat, p.lon);
+    out = p;
+    return true;
 }
 
 bool geo_resolve_here(GeoPlace& out) {

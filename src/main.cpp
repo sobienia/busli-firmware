@@ -116,7 +116,7 @@ static void setup_stops() {
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 struct PageInfo {
-    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK, STOCKS } type;
+    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK, STOCKS, WEATHER } type;
     int transit_idx; // only meaningful for TRANSIT pages
 };
 static PageInfo g_pages[12];
@@ -153,6 +153,18 @@ static StockQuote   g_stock_quotes[STOCKS_MAX];
 static int          g_stock_sub_page  = 0;   // which group of tickers is on screen
 static uint32_t     g_stock_rotate_ms = 0;   // millis() of the last sub-page change
 static int          g_stock_detail    = -1;  // ticker shown in the detail view; -1 = list
+
+// Weather page — which of its locations is shown (swipe up/down to change)
+static int          g_wx_slot  = 0;
+static int          g_wx_count = 1;
+
+static void step_weather_slot(int delta) {
+    if (g_wx_count < 2) return;
+    g_wx_slot = ((g_wx_slot + delta) % g_wx_count + g_wx_count) % g_wx_count;
+    last_redraw_ms = 0;
+    display_invalidate();
+    Serial.printf("[Weather] Page location → %d\n", g_wx_slot);
+}
 
 // Weather — display-side cache; populated from background task via fetch_task_get_weather()
 static WeatherData weather_data    = {};
@@ -234,10 +246,16 @@ static void setup_pages() {
     if (g_stocks_cfg.count > 0 && g_num_pages < 12) {
         g_pages[g_num_pages++] = { PageInfo::STOCKS, 0 };
     }
-    Serial.printf("[Pages] %d pages (%d transit, commute %s, stocks %s)\n",
+    // Last, so saved page numbers from older firmware still point to the same pages
+    bool weather_page = config_load_weather_page();
+    if (weather_page && g_num_pages < 12) {
+        g_pages[g_num_pages++] = { PageInfo::WEATHER, 0 };
+    }
+    Serial.printf("[Pages] %d pages (%d transit, commute %s, stocks %s, weather %s)\n",
                   g_num_pages, g_num_stops,
                   commute_configured() ? "on" : "off",
-                  g_stocks_cfg.count > 0 ? "on" : "off");
+                  g_stocks_cfg.count > 0 ? "on" : "off",
+                  weather_page ? "on" : "off");
 }
 
 // Number of ticker groups on the stocks page (each fits on one screen).
@@ -541,6 +559,7 @@ static void update_weather_place() {
         case PageInfo::COMMUTE_WORK: fetch_task_set_weather_place(WEATHER_PLACE_HOME);   break;  // from home
         case PageInfo::COMMUTE_HOME: fetch_task_set_weather_place(WEATHER_PLACE_WORK);   break;  // from work
         case PageInfo::STOCKS:       fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
+        case PageInfo::WEATHER:      fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
     }
 }
 
@@ -775,6 +794,8 @@ static void check_touch(TouchGesture gesture) {
                 }
             } else if (g_pages[g_current_page].type == PageInfo::STOCKS) {
                 fetch_task_force_stocks_refresh();
+            } else if (g_pages[g_current_page].type == PageInfo::WEATHER) {
+                fetch_task_force_weather_refresh();
             } else {
                 // Commute: ask background task to re-fetch on its next iteration
                 fetch_task_force_commute_refresh();
@@ -812,6 +833,8 @@ static void check_touch(TouchGesture gesture) {
                     set_stock_sub_page(g_stock_sub_page + 1);
                     Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
                 }
+            } else if (g_pages[g_current_page].type == PageInfo::WEATHER) {
+                step_weather_slot(+1);
             } else {
                 // Commute: advance to next connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
@@ -841,6 +864,8 @@ static void check_touch(TouchGesture gesture) {
                     set_stock_sub_page(g_stock_sub_page - 1);
                     Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
                 }
+            } else if (g_pages[g_current_page].type == PageInfo::WEATHER) {
+                step_weather_slot(-1);
             } else {
                 // Commute: go back to previous connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
@@ -1171,6 +1196,12 @@ void setup() {
     fetch_task_set_ota_enabled(config_load_ota_enabled());
     fetch_task_set_stocks(g_stocks_cfg.symbols, g_stocks_cfg.count);
     {
+        WeatherLocations wl;
+        config_load_weather_locations(wl);
+        fetch_task_set_weather_locations(wl);
+        g_wx_count = (wl.device ? 1 : 0) + wl.n_towns;
+    }
+    {
         String pt_tracking;
         if (config_load_parcel(pt_tracking, g_parcel_pulses)) {
             fetch_task_set_parcel(pt_tracking, g_parcel_pulses);
@@ -1451,6 +1482,8 @@ void loop() {
 
     // Redraw every second (clock + age counter; commute marquee advances from millis())
     PageInfo& page = g_pages[g_current_page];
+    // The weather page's extra data is only fetched while someone can see it
+    fetch_task_set_weather_page(page.type == PageInfo::WEATHER && display_screen_on(), g_wx_slot);
     if (config_hint_stage == 0 && !overlay_active() && display_screen_on() &&
         now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
@@ -1559,6 +1592,22 @@ void loop() {
                                     weather_data.valid && weather_data.snow_today,
                                     weather_data.valid && weather_data.clear_today);
             }
+        } else if (page.type == PageInfo::WEATHER) {
+            WeatherDetail wd;
+            String name;
+            bool not_found = false;
+            bool have = fetch_task_get_weather_detail(g_wx_slot, wd, name, not_found);
+            char label[56];
+            if (g_wx_count > 1)
+                snprintf(label, sizeof(label), "Weather  %s  %d/%d", name.c_str(), g_wx_slot + 1, g_wx_count);
+            else
+                snprintf(label, sizeof(label), "Weather  %s", name.c_str());
+            FooterInfo f;
+            f.wifi_ok          = WiFi.status() == WL_CONNECTED;
+            f.battery_pct      = g_battery_pct;
+            f.battery_charging = g_battery_charging;
+            display_draw_weather(label, g_current_page, g_num_pages,
+                                 have ? &wd : nullptr, not_found, f);
         } else {
             // Commute page
             bool is_home = (page.type == PageInfo::COMMUTE_HOME);

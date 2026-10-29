@@ -71,6 +71,9 @@ static uint32_t  s_stocks_weather_hash  = 0xFFFFFFFF;
 static int       s_detail_idx_sig       = -1;
 static int       s_detail_minute        = -1;
 static uint32_t  s_detail_weather       = 0xFFFFFFFF;
+// Weather page: fetch time of the data drawn (-1 = full repaint needed)
+static time_t    s_wx_drawn_fetch       = -1;
+static int       s_wx_minute            = -1;
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -355,6 +358,7 @@ void display_invalidate() {
     s_commute_weather_hash  = 0xFFFFFFFF;
     s_stocks_last_first     = -1;
     s_detail_idx_sig        = -1;
+    s_wx_drawn_fetch        = -1;
 }
 
 // ── Umbrella icon (12×15) ────────────────────────────────────────────────────
@@ -641,6 +645,8 @@ static uint32_t rows_signature(const std::vector<Departure>& shown, int max_rows
     for (int i = 0; i < n; i++) {
         h = (h ^ (uint32_t)departure_minutes(shown[i], now)) * 16777619u;
         h = (h ^ (uint32_t)shown[i].delay) * 16777619u;
+        h = (h ^ (uint32_t)shown[i].platform_changed) * 16777619u;
+        for (char c : shown[i].platform)    h = (h ^ (uint8_t)c) * 16777619u;
         for (char c : shown[i].line)        h = (h ^ (uint8_t)c) * 16777619u;
         for (char c : shown[i].destination) h = (h ^ (uint8_t)c) * 16777619u;
     }
@@ -683,22 +689,40 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
         String ln = to_latin1(dep.line);
         draw_text(ln, num_col_end - text_w(ln, row_fsz), text_y, row_fsz, c_row0);
 
-        // Destination — truncated to fit, leaving room for delay badge + time
-        String dest    = to_latin1(dep.destination);
-        int dest_max_w = SCREEN_W - dest_start - right_margin - PAD;
-        if (disrupted) dest_max_w -= 40;
-        while (dest.length() > 1 && text_w(dest, row_fsz) > dest_max_w)
-            dest = dest.substring(0, dest.length() - 1);
-        draw_text(dest, dest_start, text_y, row_fsz, c_row0);
+        // Right-hand extras, laid out right to left before the time column:
+        //   [destination …] [Pl. 3] [+4m] [7']
+        int extras_x = SCREEN_W - PAD - right_margin;   // left edge of the time column
 
         // Delay badge
         if (disrupted && dep.delay > 0) {
             char badge[8];
             snprintf(badge, sizeof(badge), "+%dm", dep.delay);
             String bs = badge;
-            int bx = SCREEN_W - PAD - right_margin - text_w(bs, 2) - 4;
-            draw_text(bs, bx, text_y + 4, 2, c_row0);
+            extras_x -= text_w(bs, 2) + 4;
+            draw_text(bs, extras_x, text_y + 4, 2, c_row0);
+            extras_x -= 6;
         }
+
+        // Platform — small, dim; inverted (filled box) when it differs from the timetable
+        if (dep.platform.length() > 0) {
+            String ps = "Pl. " + to_latin1(dep.platform);
+            int pw = text_w(ps, 2);
+            extras_x -= pw + 6;
+            if (dep.platform_changed) {
+                gfx->fillRect(extras_x - 3, text_y + 3, pw + 6, 19, c_row0);
+                draw_text(ps, extras_x, text_y + 4, 2, BLACK);
+            } else {
+                draw_text(ps, extras_x, text_y + 4, 2, c_dim);
+            }
+            extras_x -= 8;
+        }
+
+        // Destination — truncated to whatever room is left
+        String dest    = to_latin1(dep.destination);
+        int dest_max_w = extras_x - dest_start - 4;
+        while (dest.length() > 1 && text_w(dest, row_fsz) > dest_max_w)
+            dest = dest.substring(0, dest.length() - 1);
+        draw_text(dest, dest_start, text_y, row_fsz, c_row0);
 
         // Time or bus icon
         int mins = departure_minutes(dep, now);
@@ -1359,6 +1383,147 @@ void display_draw_stock_detail(const char* label, int page_idx, int page_count,
     FrameBuffered band(fy, FOOTER_H);   // canvas band still holds the static footer
     draw_footer_dynamic(fy, false, f.wifi_ok, age_seconds, false, 0, 0,
                         market_open ? nullptr : "closed");
+}
+
+// ── Weather page ─────────────────────────────────────────────────────────────
+
+// Footer texts: "Air: Good (32)" and "Pollen: Grass high, Birch low" / "none"
+static void weather_footer_texts(const WeatherDetail& d, String& air, String& pollen) {
+    air = (d.aqi >= 0) ? String("Air: ") + weather_aqi_text(d.aqi) + " (" + d.aqi + ")" : String("");
+
+    // Up to two pollen types with the highest level
+    int best[2] = { -1, -1 }, best_lvl[2] = { 0, 0 };
+    bool reported = false;
+    for (int i = 0; i < POLLEN_COUNT; i++) {
+        if (d.pollen[i] < 0) continue;
+        reported = true;
+        int lvl = weather_pollen_level((Pollen)i, d.pollen[i]);
+        if (lvl > best_lvl[0])      { best[1] = best[0]; best_lvl[1] = best_lvl[0]; best[0] = i; best_lvl[0] = lvl; }
+        else if (lvl > best_lvl[1]) { best[1] = i; best_lvl[1] = lvl; }
+    }
+    if (!reported) { pollen = ""; return; }
+    if (best[0] < 0) { pollen = "Pollen: none"; return; }
+    pollen = String("Pollen: ") + weather_pollen_name((Pollen)best[0]) + " " + weather_level_text(best_lvl[0]);
+    if (best[1] >= 0)
+        pollen += String(", ") + weather_pollen_name((Pollen)best[1]) + " " + weather_level_text(best_lvl[1]);
+}
+
+// Next hours: rain-chance bars (dim) with the temperature as a line on top
+static void draw_hourly_chart(const WeatherDetail& d, int x0, int y0, int w, int h) {
+    if (d.hours < 2) return;
+    const int label_h = 18;                 // hour labels below the plot
+    const int plot_h  = h - label_h;
+    const int slot    = w / d.hours;
+
+    // Rain chance: 0–100 % over the full plot height
+    for (int i = 0; i < d.hours; i++) {
+        int bh = d.hour_rain_prob[i] * (plot_h - 2) / 100;
+        if (bh > 0) gfx->fillRect(x0 + i * slot + 3, y0 + plot_h - bh, slot - 6, bh, c_meta);
+    }
+    gfx->drawFastHLine(x0, y0 + plot_h, w, c_meta);
+
+    // Temperature: scaled to the period's range, kept clear of the labels above
+    float lo = d.hour_temp[0], hi = lo;
+    for (int i = 0; i < d.hours; i++) { lo = std::min(lo, d.hour_temp[i]); hi = std::max(hi, d.hour_temp[i]); }
+    if (hi - lo < 2) { float mid = (hi + lo) / 2; lo = mid - 1; hi = mid + 1; }
+    const int t_top = y0 + 20, t_bot = y0 + plot_h - 8;
+    auto ty = [&](float v) { return t_bot - (int)lroundf((v - lo) / (hi - lo) * (t_bot - t_top)); };
+    auto cx = [&](int i)   { return x0 + i * slot + slot / 2; };
+    for (int i = 1; i < d.hours; i++) {
+        gfx->drawLine(cx(i - 1), ty(d.hour_temp[i - 1]),     cx(i), ty(d.hour_temp[i]),     c_row0);
+        gfx->drawLine(cx(i - 1), ty(d.hour_temp[i - 1]) + 1, cx(i), ty(d.hour_temp[i]) + 1, c_row0);
+    }
+
+    // Every third hour: temperature above the line, hour below the axis
+    for (int i = 0; i < d.hours; i += 3) {
+        char t[8], hr[4];
+        snprintf(t, sizeof(t), "%d\xB0", (int)lroundf(d.hour_temp[i]));
+        struct tm tm_h; localtime_r(&d.hour_time[i], &tm_h);
+        snprintf(hr, sizeof(hr), "%02d", tm_h.tm_hour);
+        String ts = t, hs = hr;
+        gfx->fillRect(cx(i) - 2, ty(d.hour_temp[i]) - 2, 5, 5, c_row0);
+        draw_text(ts, cx(i) - text_w(ts, 2) / 2, ty(d.hour_temp[i]) - 20, 2, c_row0);
+        draw_text(hs, cx(i) - text_w(hs, 2) / 2, y0 + plot_h + 2, 2, c_dim);
+    }
+}
+
+void display_draw_weather(const char* label, int page_idx, int page_count,
+                          const WeatherDetail* d, bool not_found, const FooterInfo& f) {
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now_t, &tm_now);
+    int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
+    int fy = SCREEN_H - FOOTER_H;
+    time_t fetched = d ? d->fetched : 0;
+    int age_s = (fetched > 0) ? (int)(now_t - fetched) : 0;
+
+    if (fetched != s_wx_drawn_fetch || cur_minute != s_wx_minute) {
+        s_wx_drawn_fetch = fetched;
+        s_wx_minute      = cur_minute;
+        s_last_battery_pct      = f.battery_pct;
+        s_last_battery_charging = f.battery_charging;
+
+        FrameBuffered frame;   // whole screen off-screen → no flicker
+        gfx->fillScreen(BLACK);
+        draw_header(label, page_idx, page_count, false, false, f.battery_pct, f.battery_charging);
+
+        if (!d) {
+            String msg = not_found ? "Town not found" : "Loading weather...";
+            draw_text(msg, (SCREEN_W - text_w(msg, 3)) / 2, HEADER_H + 50, 3, c_meta);
+            if (not_found) {
+                String hint = "Check the spelling in Settings";
+                draw_text(hint, (SCREEN_W - text_w(hint, 2)) / 2, HEADER_H + 86, 2, c_meta);
+            }
+            draw_footer_static(fy, "", "", false, 0, false, false, false);
+            draw_footer_dynamic(fy, false, f.wifi_ok, 0, false, 0, 0, "");
+            return;
+        }
+
+        // Left: now + today (each line clipped so it never runs into the chart)
+        const int top     = HEADER_H + 6;
+        const int chart_x = 196;
+        const int left_max = chart_x - 6;
+        draw_text(weather_condition_text(d->weather_code), PAD, top, 2, c_dim);
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%d\xB0" "C", (int)lroundf(d->temp_c));
+        draw_text(buf, PAD, top + 20, 4, c_row0);
+        snprintf(buf, sizeof(buf), "Feels like %d\xB0", (int)lroundf(d->feels_like_c));
+        draw_text_safe(buf, PAD, top + 56, 2, c_row0, 0, left_max);
+        snprintf(buf, sizeof(buf), "Low %d\xB0  High %d\xB0",
+                 (int)lroundf(d->temp_min_c), (int)lroundf(d->temp_max_c));
+        draw_text_safe(buf, PAD, top + 74, 2, c_row0, 0, left_max);
+        snprintf(buf, sizeof(buf), "Rain %d%%   UV %d", d->rain_prob_max, d->uv_index);
+        draw_text_safe(buf, PAD, top + 92, 2, c_row0, 0, left_max);
+        // Wind; gusts only when they're notably stronger than the wind itself
+        int wind = (int)lroundf(d->wind_kmh), gust = (int)lroundf(d->gust_kmh);
+        if (gust >= wind + 15) snprintf(buf, sizeof(buf), "Wind %d, gusts %d", wind, gust);
+        else                   snprintf(buf, sizeof(buf), "Wind %d km/h", wind);
+        draw_text_safe(buf, PAD, top + 110, 2, c_row0, 0, left_max);
+        // Next sun event: sunrise before dawn, sunset during the day
+        if (d->sunrise > 0 && d->sunset > 0) {
+            bool before_sunrise = now_t < d->sunrise;
+            time_t ev = (before_sunrise || now_t >= d->sunset) ? d->sunrise : d->sunset;
+            struct tm te; localtime_r(&ev, &te);
+            snprintf(buf, sizeof(buf), "%s %02d:%02d",
+                     (ev == d->sunrise) ? "Sunrise" : "Sunset", te.tm_hour, te.tm_min);
+            draw_text_safe(buf, PAD, top + 128, 2, c_dim, 0, left_max);
+        }
+
+        // Right: next 12 hours
+        draw_hourly_chart(*d, chart_x, top, SCREEN_W - PAD - chart_x, fy - 4 - top);
+
+        String air, pollen;
+        weather_footer_texts(*d, air, pollen);
+        draw_footer_static(fy, air.c_str(), pollen.c_str(), false, 0, false, false, false);
+        draw_footer_dynamic(fy, false, f.wifi_ok, age_s, false, 0, 0);
+        return;
+    }
+
+    FrameBuffered band(fy, FOOTER_H);   // canvas band still holds the static footer
+    draw_footer_dynamic(fy, false, f.wifi_ok, age_s, false, 0, 0, d ? nullptr : "");
 }
 
 // ── Flight screen ─────────────────────────────────────────────────────────────

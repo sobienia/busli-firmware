@@ -20,3 +20,44 @@ struct WeatherData {
 // Fetch current weather, today's outlook and the short-term rain forecast for
 // a location from Open-Meteo. Returns true on success; `out` is unchanged on failure.
 bool weather_fetch(float lat, float lon, WeatherData& out);
+
+// ── Weather page ─────────────────────────────────────────────────────────────
+
+#define WEATHER_HOURS 12
+
+enum Pollen { POLLEN_ALDER, POLLEN_BIRCH, POLLEN_GRASS, POLLEN_MUGWORT,
+              POLLEN_OLIVE, POLLEN_RAGWEED, POLLEN_COUNT };
+
+struct WeatherDetail {
+    float  temp_c       = 0;
+    float  feels_like_c = 0;               // apparent temperature (wind, humidity)
+    float  wind_kmh     = 0;
+    float  gust_kmh     = 0;
+    int    weather_code = 0;
+    int    uv_index     = 0;
+    float  temp_min_c   = 0, temp_max_c = 0;
+    int    rain_prob_max = 0;              // today, %
+    time_t sunrise = 0, sunset = 0;
+    // Next WEATHER_HOURS hours, starting with the current hour
+    int    hours = 0;
+    time_t hour_time[WEATHER_HOURS];
+    float  hour_temp[WEATHER_HOURS];
+    int    hour_rain_prob[WEATHER_HOURS];  // %
+    // Air quality (Open-Meteo air-quality API; pollen: Europe, in season)
+    int    aqi = -1;                       // European AQI; -1 = unknown
+    float  pollen[POLLEN_COUNT];           // grains/m³; < 0 = not reported
+    time_t fetched = 0;
+    bool   valid = false;
+};
+
+// Forecast + air quality for the weather page (two small requests, ~2 KB).
+// Returns true if the forecast part succeeded; air quality is best effort.
+bool weather_fetch_detail(float lat, float lon, WeatherDetail& out);
+
+// Words for the page
+const char* weather_condition_text(int wmo_code);   // "Partly cloudy"
+const char* weather_aqi_text(int aqi);              // "Good", "Fair", … "" if unknown
+// 0 = none, 1 = low, 2 = moderate, 3 = high, 4 = very high (per-type thresholds)
+int         weather_pollen_level(Pollen type, float grains);
+const char* weather_pollen_name(Pollen type);       // "Birch"
+const char* weather_level_text(int level);          // "low" … "very high"

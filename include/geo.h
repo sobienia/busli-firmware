@@ -28,3 +28,8 @@ bool geo_resolve_station(const String& station, GeoPlace& out);
 // right to the city; a VPN or company proxy can report somewhere else.
 // Blocking HTTP — call from the fetch task.
 bool geo_resolve_here(GeoPlace& out);
+
+// Coordinates of a town typed by the user ("Bern", "Genève"), via Open-Meteo's
+// geocoding (free, no key); NVS-cached. out.city is the name as typed.
+// Blocking HTTP on a cache miss — call from the fetch task or the portal.
+bool geo_resolve_city(const String& name, GeoPlace& out);

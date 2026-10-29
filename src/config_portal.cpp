@@ -23,6 +23,7 @@
 #include "../include/swiss_stops.h"
 #include "../include/stocks.h"
 #include "../include/http_lock.h"
+#include "../include/geo.h"
 #include "display.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -47,6 +48,8 @@
 #define NVS_KEY_PAGER       "pager"
 #define NVS_KEY_STOCKS      "stocks"
 #define NVS_KEY_NIGHT       "night"
+#define NVS_KEY_WX_PAGE     "wx_page"
+#define NVS_KEY_WX_LOCS     "wx_locs"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -269,6 +272,44 @@ void config_save_pager(const PagerConfig& cfg) {
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, false);
     prefs.putString(NVS_KEY_PAGER, json);
+    prefs.end();
+}
+
+bool config_load_weather_page() {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    bool on = prefs.getBool(NVS_KEY_WX_PAGE, true);
+    prefs.end();
+    return on;
+}
+
+void config_load_weather_locations(WeatherLocations& out) {
+    out = WeatherLocations();
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_WX_LOCS, "");
+    prefs.end();
+    if (json.isEmpty()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return;
+    out.device = doc["d"] | true;
+    for (const char* t : doc["t"].as<JsonArray>()) {
+        if (out.n_towns >= WEATHER_TOWNS_MAX) break;
+        if (t && *t) out.towns[out.n_towns++] = t;
+    }
+    if (!out.device && out.n_towns == 0) out.device = true;   // never an empty page
+}
+
+static void config_save_weather_locations(const WeatherLocations& w) {
+    JsonDocument doc;
+    doc["d"] = w.device;
+    JsonArray t = doc["t"].to<JsonArray>();
+    for (int i = 0; i < w.n_towns; i++) t.add(w.towns[i]);
+    String json;
+    serializeJson(doc, json);
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putString(NVS_KEY_WX_LOCS, json);
     prefs.end();
 }
 
@@ -784,6 +825,32 @@ static String build_page(String ssids[], String passes[], String users[],
     }
     h += F("</div>");
 
+    // ── Weather page section ─────────────────────────────────────────────────
+    h += "<h2>Weather page</h2><div class='card'>"
+         "<label style='display:flex;align-items:center;gap:10px;cursor:pointer;color:#ddd'>"
+         "<input type='checkbox' name='wx_page' value='1' style='width:auto'"
+         + String(config_load_weather_page() ? " checked" : "") + "><span>Show the weather page</span></label>"
+         "<p class='hint' style='margin-top:6px'>Current weather, the next 12 hours, air quality and "
+         "pollen. With several locations, swipe up/down on the page to switch.</p>";
+    {
+        WeatherLocations wl;
+        config_load_weather_locations(wl);
+        h += "<label style='display:flex;align-items:center;gap:10px;cursor:pointer;color:#ddd;margin-top:12px'>"
+             "<input type='checkbox' name='wx_dev' value='1' style='width:auto'"
+             + String(wl.device ? " checked" : "") + "><span>This device's location "
+             "<span class='hint' style='margin:0'>(from its internet connection)</span></span></label>";
+        h += F("<label>Towns <span class='hint'>up to 3, e.g. Bern, Gen&egrave;ve, Lugano</span></label>");
+        for (int i = 0; i < WEATHER_TOWNS_MAX; i++) {
+            String t = (i < wl.n_towns) ? wl.towns[i] : "";
+            h += "<div style='display:flex;gap:8px;margin-top:6px;align-items:center'>"
+                 "<input type='text' name='wt" + String(i) + "' id='wt" + String(i) + "' value='"
+                 + html_encode(t) + "' placeholder='Town' autocomplete='off' style='flex:1;margin-top:0'>"
+                 "<button type='button' class='tbtn' onclick='checkTown(this," + String(i) + ")'>Check</button>"
+                 "<span id='wr" + String(i) + "' style='width:90px;font-size:12px;color:#999'></span></div>";
+        }
+    }
+    h += F("</div>");
+
     // ── Night mode section ───────────────────────────────────────────────────
     h += F("<h2>Night mode</h2><div class='card'>"
            "<p class='hint' style='margin:0 0 8px'>During these hours the screen is dimmed or "
@@ -875,6 +942,16 @@ static String build_page(String ssids[], String passes[], String users[],
                "})"
                ".catch(function(){btn.textContent='✗ err';btn.disabled=false;"
                  "setTimeout(function(){btn.textContent='Test';},3000);});"
+           "}"
+           "function checkTown(btn,i){"
+             "var q=document.getElementById('wt'+i).value.trim(),r=document.getElementById('wr'+i);"
+             "if(!q){r.textContent='';return;}"
+             "btn.disabled=true;r.style.color='#999';r.textContent='checking\\u2026';"
+             "fetch('/town_check?q='+encodeURIComponent(q))"
+               ".then(function(x){return x.json();})"
+               ".then(function(d){btn.disabled=false;"
+                 "r.style.color=d.ok?'#4c4':'#f55';r.textContent=d.ok?'\\u2713 found':'\\u2717 '+d.msg;})"
+               ".catch(function(){btn.disabled=false;r.style.color='#f55';r.textContent='\\u2717 error';});"
            "}"
            "function checkStock(btn,i){"
              "var s=document.getElementById('st'+i).value.trim(),r=document.getElementById('sr'+i);"
@@ -1130,6 +1207,22 @@ static void handle_save() {
     new_night.screen_off = s_server.arg("nt_o") == "1";
     config_save_night(new_night);
 
+    {
+        Preferences prefs;
+        prefs.begin(NVS_NAMESPACE, false);
+        prefs.putBool(NVS_KEY_WX_PAGE, s_server.arg("wx_page") == "1");
+        prefs.end();
+    }
+    {
+        WeatherLocations wl;
+        wl.device = s_server.arg("wx_dev") == "1";
+        for (int i = 0; i < WEATHER_TOWNS_MAX; i++) {
+            String t = s_server.arg("wt" + String(i)); t.trim();
+            if (t.length() > 0) wl.towns[wl.n_towns++] = t;
+        }
+        config_save_weather_locations(wl);
+    }
+
     save_to_nvs(new_ssids, new_passes, new_users, n_wifi, new_stops, n_stops,
                 cd_label, cd_target, cd_icon, new_flights, n_flights,
                 new_opensky_user, new_opensky_pass, new_commute, new_ota_enabled,
@@ -1269,6 +1362,26 @@ static void handle_stock_check() {
     s_server.send(200, "application/json", out);
 }
 
+// Look up a town for the weather page so typos are caught before saving.
+static void handle_town_check() {
+    if (!authorized()) { send_forbidden(); return; }
+    String q = s_server.arg("q"); q.trim();
+    JsonDocument doc;
+    GeoPlace p;
+    if (q.isEmpty()) {
+        doc["ok"] = false; doc["msg"] = "empty";
+    } else if (WiFi.status() != WL_CONNECTED) {
+        doc["ok"] = false; doc["msg"] = "offline";
+    } else if (geo_resolve_city(q, p)) {
+        doc["ok"] = true; doc["lat"] = p.lat; doc["lon"] = p.lon;
+    } else {
+        doc["ok"] = false; doc["msg"] = "not found";
+    }
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
 static void handle_not_found() {
     if (!from_setup_hotspot()) { s_server.send(404, "text/plain", "Not found"); return; }
     // Captive-portal redirect — iOS/Android auto-detect and open the browser
@@ -1324,6 +1437,7 @@ static void ensure_routes() {
     s_server.on("/stations",    HTTP_GET,  handle_stations);
     s_server.on("/pager_test",  HTTP_GET,  handle_pager_test);
     s_server.on("/stock_check", HTTP_GET,  handle_stock_check);
+    s_server.on("/town_check",  HTTP_GET,  handle_town_check);
     s_server.on("/update",      HTTP_GET,  handle_update_page);
     s_server.on("/update",      HTTP_POST, handle_update_finish, handle_update_upload);
     s_server.onNotFound(handle_not_found);

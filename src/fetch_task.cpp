@@ -146,8 +146,27 @@ static bool place_configured(int place) {
     return place == place_here() || !place_station(place).isEmpty();
 }
 
+// Coordinates for a place, looking them up first if needed (see below)
+static void place_coords(int place, float& lat, float& lon);
+
 static bool do_fetch_weather(int place) {
     if (place < 0 || place >= MAX_PLACES) return false;
+    PlaceWeather& pw = s_places[place];
+    float lat, lon;
+    place_coords(place, lat, lon);
+
+    WeatherData wd;
+    http_lock_take();
+    bool ok = weather_fetch(lat, lon, wd);
+    http_lock_give();
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    pw.last_attempt = time(nullptr);
+    if (ok) { pw.wx = wd; pw.ok = true; }
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+static void place_coords(int place, float& lat, float& lon) {
     PlaceWeather& pw = s_places[place];
     time_t now = time(nullptr);
 
@@ -167,18 +186,56 @@ static bool do_fetch_weather(int place) {
     const GeoPlace& g = pw.geo.valid ? pw.geo
                       : (place == place_here() && s_places[0].geo.valid) ? s_places[0].geo
                       : pw.geo;
-    float lat = g.valid ? g.lat : (float)WEATHER_LAT;
-    float lon = g.valid ? g.lon : (float)WEATHER_LON;
+    lat = g.valid ? g.lat : (float)WEATHER_LAT;
+    lon = g.valid ? g.lon : (float)WEATHER_LON;
+}
 
-    WeatherData wd;
+// Weather page (hourly + air quality) for each of its locations: the device's
+// own location and/or towns from Settings. Only the location on screen is
+// fetched — right when it's shown, then every WEATHER_DETAIL_REFRESH_SEC.
+static const int WX_SLOTS = 1 + WEATHER_TOWNS_MAX;
+struct WxSlot {
+    bool          device    = false;   // true = IP location, else `town`
+    String        town;
+    GeoPlace      geo;                 // towns: resolved via geocoding
+    time_t        geo_tried = 0;
+    bool          not_found = false;   // town unknown to the geocoder
+    WeatherDetail d;                   // guarded by s_mutex
+    time_t        attempt   = 0;       // last fetch attempt (0 = never)
+};
+static WxSlot         s_wx[WX_SLOTS];
+static int            s_wx_count       = 0;
+static volatile int   s_wx_active      = 0;
+static volatile bool  s_wx_page_active = false;
+
+static void do_fetch_weather_detail(int slot) {
+    WxSlot& w = s_wx[slot];
+    float lat, lon;
+    if (w.device) {
+        place_coords(place_here(), lat, lon);
+    } else {
+        time_t now = time(nullptr);
+        if (!w.geo.valid && (w.geo_tried == 0 || now - w.geo_tried >= 3600)) {
+            w.geo_tried = now;
+            GeoPlace g;
+            bool found = geo_resolve_city(w.town, g);
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (found) w.geo = g;
+            w.not_found = !found;
+            xSemaphoreGive(s_mutex);
+        }
+        if (!w.geo.valid) { w.attempt = time(nullptr); return; }
+        lat = w.geo.lat; lon = w.geo.lon;
+    }
+    WeatherDetail d;
     http_lock_take();
-    bool ok = weather_fetch(lat, lon, wd);
+    bool ok = weather_fetch_detail(lat, lon, d);
     http_lock_give();
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    pw.last_attempt = time(nullptr);
-    if (ok) { pw.wx = wd; pw.ok = true; }
+    if (ok) w.d = d;
+    // Success: full interval; failure: retry in about a minute
+    w.attempt = time(nullptr) - (ok ? 0 : WEATHER_DETAIL_REFRESH_SEC - 60);
     xSemaphoreGive(s_mutex);
-    return ok;
 }
 
 static void do_fetch_commute() {
@@ -357,6 +414,13 @@ static void fetch_task_loop(void* /*param*/) {
                 s_chart_time = time(nullptr);
                 xSemaphoreGive(s_mutex);
             }
+        }
+
+        // ── Weather page (user is looking at it) ──────────────────────────────
+        if (s_wx_page_active && s_wx_count > 0) {
+            int slot = s_wx_active;
+            if (s_wx[slot].attempt == 0 || now - s_wx[slot].attempt >= WEATHER_DETAIL_REFRESH_SEC)
+                do_fetch_weather_detail(slot);
         }
 
         // ── Transit: adaptive scheduling ──────────────────────────────────────
@@ -615,6 +679,45 @@ void fetch_task_set_power_mode(FetchPower mode) {
 
 void fetch_task_force_flight_refresh(int slot) {
     if (slot >= 0 && slot < 2) { s_flight_forced[slot] = true; wake_task(); }
+}
+
+void fetch_task_set_weather_locations(const WeatherLocations& wl) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = 0;
+    if (wl.device) { s_wx[n] = WxSlot(); s_wx[n].device = true; n++; }
+    for (int i = 0; i < wl.n_towns && n < WX_SLOTS; i++) {
+        s_wx[n] = WxSlot();
+        s_wx[n].town = wl.towns[i];
+        n++;
+    }
+    s_wx_count  = n;
+    s_wx_active = 0;
+    xSemaphoreGive(s_mutex);
+}
+
+void fetch_task_force_weather_refresh() {
+    s_wx[s_wx_active].attempt = 0;
+    wake_task();
+}
+
+void fetch_task_set_weather_page(bool active, int slot) {
+    if (slot < 0 || slot >= s_wx_count) slot = 0;
+    bool changed = (active != s_wx_page_active) || (slot != s_wx_active);
+    s_wx_active      = slot;
+    s_wx_page_active = active;
+    if (changed && active) wake_task();
+}
+
+bool fetch_task_get_weather_detail(int slot, WeatherDetail& out, String& out_name, bool& out_not_found) {
+    if (slot < 0 || slot >= s_wx_count) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    const WxSlot& w = s_wx[slot];
+    out_name      = w.device ? s_places[place_here()].geo.city : w.town;
+    out_not_found = w.not_found;
+    bool ok = w.d.valid;
+    if (ok) out = w.d;
+    xSemaphoreGive(s_mutex);
+    return ok;
 }
 
 void fetch_task_request_stock_chart(int idx) {

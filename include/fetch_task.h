@@ -111,6 +111,23 @@ int  fetch_task_get_stocks(StockQuote out[]);
 // Re-fetch all tickers (staggered), even outside market hours.
 void fetch_task_force_stocks_refresh();
 
+// Weather page locations (call once from setup(), after fetch_task_start()).
+// Slots in order: the device's location (if enabled), then the towns.
+void fetch_task_set_weather_locations(const WeatherLocations& wl);
+
+// Is the weather page on screen, and which location (slot)? While active, that
+// slot's data (hourly forecast, air quality, pollen) is fetched right away and
+// refreshed every WEATHER_DETAIL_REFRESH_SEC.
+void fetch_task_set_weather_page(bool active, int slot);
+
+// Long press on the weather page: re-fetch the current location now.
+void fetch_task_force_weather_refresh();
+
+// Weather page data for a slot, plus its display name. Returns false until the
+// first fetch has completed; out_not_found = the town couldn't be located.
+bool fetch_task_get_weather_detail(int slot, WeatherDetail& out, String& out_name,
+                                   bool& out_not_found);
+
 // Detail view: ask for ticker idx's fine-grained chart (-1 = detail view closed).
 // Fetched right away, then refreshed with the quotes while the market is open.
 void fetch_task_request_stock_chart(int idx);

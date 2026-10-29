@@ -85,6 +85,19 @@ struct NightConfig {
 // Load night-mode settings (defaults when nothing is saved).
 void config_load_night(NightConfig& out);
 
+// Show the weather page in the page cycle? (default: yes)
+bool config_load_weather_page();
+
+// Weather page locations, in swipe order: the device's own location (unless
+// turned off) followed by up to WEATHER_TOWNS_MAX towns typed in Settings.
+#define WEATHER_TOWNS_MAX 3
+struct WeatherLocations {
+    bool   device  = true;
+    String towns[WEATHER_TOWNS_MAX];
+    int    n_towns = 0;
+};
+void config_load_weather_locations(WeatherLocations& out);
+
 // Load stock tickers + display settings. Returns true if at least one ticker is set.
 bool config_load_stocks(StocksConfig& out);
 

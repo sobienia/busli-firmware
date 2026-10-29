@@ -110,6 +110,8 @@ static bool process_json_body(
     filter["stationboard"][0]["to"]                             = true;
     filter["stationboard"][0]["stop"]["departure"]              = true;
     filter["stationboard"][0]["stop"]["prognosis"]["departure"] = true;
+    filter["stationboard"][0]["stop"]["platform"]               = true;
+    filter["stationboard"][0]["stop"]["prognosis"]["platform"]  = true;
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json, json_len,
@@ -167,11 +169,18 @@ static bool process_json_body(
             : 0;
         if (actual < now - 30) { dbg_past++; continue; }
 
+        // Platform: the prognosis (live) platform wins when it's reported and
+        // differs from the planned one — that's a platform change
+        String planned  = String((const char*)(entry["stop"]["platform"] | ""));
+        String live     = String((const char*)(entry["stop"]["prognosis"]["platform"] | ""));
+
         Departure d;
         d.line        = line;
         d.destination = dest;
         d.dep_time    = actual;
         d.delay       = delay_minutes;
+        d.platform    = live.length() ? live : planned;
+        d.platform_changed = live.length() && planned.length() && live != planned;
         results.push_back(d);
 
         if ((int)results.size() >= max_results) break;
@@ -209,7 +218,9 @@ bool api_fetch_departures(
     // passList and a 20-entry board is ~240 KB instead of ~3 KB.
     url += "&fields[]=stationboard/number&fields[]=stationboard/category"
            "&fields[]=stationboard/to&fields[]=stationboard/stop/departure"
-           "&fields[]=stationboard/stop/prognosis/departure";
+           "&fields[]=stationboard/stop/prognosis/departure"
+           "&fields[]=stationboard/stop/platform"
+           "&fields[]=stationboard/stop/prognosis/platform";
 
     Serial.print("[API] Fetching: ");
     Serial.println(url);

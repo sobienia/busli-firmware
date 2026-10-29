@@ -9,6 +9,7 @@
 #include "../include/flight_tracker.h"
 #include "../include/commute.h"
 #include "../include/stocks.h"
+#include "weather.h"
 
 // One transit departure (used by both display and api modules)
 struct Departure {
@@ -17,6 +18,8 @@ struct Departure {
     time_t dep_time;    // actual (prognosis) departure, UTC epoch — minutes are
                         // computed at draw time so the board counts down live
     int    delay;       // delay in minutes (0 = on time)
+    String platform;    // e.g. "3", "41/42", "C"; "" = not reported
+    bool   platform_changed = false;  // differs from the timetable — highlighted
 };
 
 // Initialize the display hardware (call once in setup())
@@ -170,6 +173,14 @@ void display_draw_stock_detail(const char* label, int page_idx, int page_count,
                                const StockQuote& q, const StockChart* chart,
                                bool market_open, int age_seconds,
                                const FooterInfo& footer);
+
+// Weather page: current conditions + today (left), next 12 hours as a
+// temperature line over rain-chance bars (right), air quality and pollen in
+// the footer. d == nullptr while the first fetch is running (or, with
+// not_found, when a town from Settings couldn't be located).
+// label: header text, e.g. "Weather  Zürich  1/3".
+void display_draw_weather(const char* label, int page_idx, int page_count,
+                          const WeatherDetail* d, bool not_found, const FooterInfo& footer);
 
 // Boot animation (Matrix-style cascading characters).
 // Start it before the blocking setup steps; update the status text as each

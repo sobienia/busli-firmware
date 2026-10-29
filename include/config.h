@@ -118,6 +118,7 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 #define RAIN_ALERT_MINUTES     120      // footer warns about rain starting within this window
 #define WEATHER_REFRESH_SEC     900     // 15 minutes
 #define WEATHER_OFF_REFRESH_SEC 3600    // while the screen is off at night
+#define WEATHER_DETAIL_REFRESH_SEC 1800 // weather page (hourly, air quality, pollen)
 #define WEATHER_TIMEOUT_MS     5000
 #define WEATHER_RAIN_PROB_PCT    30     // umbrella if daily precip probability >= this
 
@@ -168,7 +169,7 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.7.0"
+#define FIRMWARE_VERSION        "1.7.1"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 
