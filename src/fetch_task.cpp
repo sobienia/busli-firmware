@@ -24,6 +24,7 @@
 #include "weather.h"
 #include "commute.h"
 #include "../include/geo.h"
+#include "../include/today_data.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -100,6 +101,51 @@ static StockChart    s_chart;                // guarded by s_mutex
 static int           s_chart_idx     = -1;   // ticker s_chart belongs to
 static time_t        s_chart_time    = 0;
 
+// Today page extras (only fetched when the page is enabled; guarded by s_mutex)
+static volatile bool s_today_enabled = false;
+static WaterTemps    s_water;
+static time_t        s_water_attempt = 0;
+static DailyQuote    s_quote;
+static time_t        s_quote_attempt = 0;
+
+static String local_date(time_t t) {
+    struct tm tm_l; localtime_r(&t, &tm_l);
+    char buf[11];
+    strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_l);
+    return buf;
+}
+
+static void do_fetch_today(time_t now) {
+    // Water temperatures: once at startup (any time, so the page has a value),
+    // then every 3 h between WATER_FROM_HOUR and WATER_UNTIL_HOUR; a failed
+    // attempt is retried after 15 min
+    bool water_ok = !isnan(s_water.lake_c) || !isnan(s_water.river_c);
+    struct tm lt; localtime_r(&now, &lt);
+    bool daytime = lt.tm_hour >= WATER_FROM_HOUR && lt.tm_hour < WATER_UNTIL_HOUR;
+    long water_wait = water_ok ? TODAY_WATER_REFRESH_SEC : 900;
+    bool water_due = (s_water_attempt == 0) ||
+                     (daytime && now - s_water_attempt >= water_wait);
+    if (water_due) {
+        s_water_attempt = now;
+        WaterTemps w;
+        http_lock_take();
+        bool ok = water_fetch(w);
+        http_lock_give();
+        if (ok) { xSemaphoreTake(s_mutex, portMAX_DELAY); s_water = w; xSemaphoreGive(s_mutex); }
+        return;   // one request batch per loop iteration
+    }
+    // Quote: once per day (after midnight local time), retry every 30 min
+    if (now > 1700000000 && (!s_quote.valid || s_quote.date != local_date(now)) &&
+        (s_quote_attempt == 0 || now - s_quote_attempt >= 1800)) {
+        s_quote_attempt = now;
+        DailyQuote q;
+        http_lock_take();
+        bool ok = quote_fetch(q);
+        http_lock_give();
+        if (ok) { xSemaphoreTake(s_mutex, portMAX_DELAY); s_quote = q; xSemaphoreGive(s_mutex); }
+    }
+}
+
 // Per-source health for the device info page (guarded by s_mutex)
 static SourceStatus  s_status[SRC_COUNT];
 
@@ -109,6 +155,11 @@ static void note_result(DataSource src, bool ok) {
     (ok ? s_status[src].last_ok : s_status[src].last_fail) = time(nullptr);
     xSemaphoreGive(s_mutex);
 }
+
+// Startup handshake: the task waits for setup() to finish configuring it, then
+// runs one batch of every fetch; the boot animation waits for that batch.
+static volatile bool s_config_done  = false;
+static volatile bool s_startup_done = false;
 
 // Lets the UI cut the loop's idle wait short for user-triggered work
 static TaskHandle_t  s_task = nullptr;
@@ -382,10 +433,15 @@ static bool weather_due(int place, time_t now) {
 }
 
 static void fetch_task_loop(void* /*param*/) {
-    // Startup: departures first — they're what the screen shows. The visible stop
-    // goes first, then the others (~3 KB each, so this takes a few seconds).
-    // Weather and commute follow; flights (up to a 1 MB download) are left to the
-    // normal schedule below so they never delay the first board.
+    // Wait until setup() has handed over everything (stocks, Today page, …)
+    while (!s_config_done) vTaskDelay(pdMS_TO_TICKS(20));
+
+    // ── Startup batch ────────────────────────────────────────────────────────
+    // Everything the pages show, once, before the normal schedule — the boot
+    // animation stays up until this is done (fetch_task_startup_done()), so the
+    // first page appears complete. Departures first (visible stop first), then
+    // weather, commute, Today extras, parcel and one quote per ticker. Flights
+    // (up to a 1 MB download) are left to the normal schedule.
     do_fetch(s_active_stop);
     s_stop_last_attempt[s_active_stop] = time(nullptr);
     for (int i = 0; i < s_num_stops; i++) {
@@ -395,13 +451,28 @@ static void fetch_task_loop(void* /*param*/) {
     }
     do_fetch_weather(s_weather_place);
     do_fetch_commute();
+    if (s_today_enabled) {
+        do_fetch_today(time(nullptr));   // water temperatures
+        do_fetch_today(time(nullptr));   // quote of the day
+    }
+    time_t last_parcel_fetch;
+    if (!s_parcel_tracking.isEmpty()) {
+        do_fetch_parcel();
+        last_parcel_fetch = time(nullptr);
+    } else {
+        last_parcel_fetch = 0;
+    }
+    for (int i = 0; i < s_stock_count; i++) {
+        do_fetch_stock(i);
+        s_stock_last_attempt[i] = time(nullptr);
+    }
+    s_startup_done = true;
+    Serial.println("[Fetch] Startup batch done");
 
     time_t last_commute_fetch = time(nullptr);
     // First OTA check fires at boot+2min, then every OTA_CHECK_INTERVAL_SEC after that.
     time_t last_ota_check     = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 120;
     time_t last_ntp_sync      = time(nullptr);
-    // First parcel check fires at boot+30s to avoid crowding the initial fetches.
-    time_t last_parcel_fetch  = time(nullptr) - PARCEL_REFRESH_SEC + 30;
     // First pager poll fires at boot+15s.
     time_t last_pager_poll    = time(nullptr) - PAGER_POLL_SEC + 15;
 
@@ -487,6 +558,9 @@ static void fetch_task_loop(void* /*param*/) {
                 }
             }
         }
+
+        // ── Today page extras (water temperatures, quote of the day) ─────────
+        if (s_today_enabled) do_fetch_today(now);
 
         // ── Commute ───────────────────────────────────────────────────────────
         if (s_force_commute || (now - last_commute_fetch >= COMMUTE_REFRESH_SEC)) {
@@ -684,6 +758,20 @@ void fetch_task_init_flights(const FlightEntry* entries, int count) {
     flight_tracker_init(entries, count);
     s_flight_count = count;
     for (int i = 0; i < count; i++) s_flight_last_fetch[i] = 0; // trigger immediate fetch
+}
+
+void fetch_task_config_done() { s_config_done = true; }
+bool fetch_task_startup_done() { return s_startup_done; }
+
+void fetch_task_set_today_enabled(bool enabled) {
+    s_today_enabled = enabled;
+}
+
+void fetch_task_get_today(WaterTemps& water, DailyQuote& quote) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    water = s_water;
+    quote = s_quote;
+    xSemaphoreGive(s_mutex);
 }
 
 void fetch_task_get_source_status(SourceStatus out[SRC_COUNT]) {

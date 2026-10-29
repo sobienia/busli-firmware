@@ -27,6 +27,7 @@
 #include "../include/flight_tracker.h"
 #include <esp_wifi.h>
 #include <esp_system.h>
+#include <ArduinoJson.h>
 
 // loop() makes HTTPS calls (pager send, config-portal Check/Test buttons). A TLS
 // handshake needs more stack than the default 8 KB loopTask — overflowing it
@@ -117,10 +118,12 @@ static void setup_stops() {
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 struct PageInfo {
-    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK, STOCKS, WEATHER, DEVICE } type;
+    // Values are stored in NVS (saved page) — append new types, don't reorder
+    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK, STOCKS, WEATHER, DEVICE, TODAY } type;
     int transit_idx; // only meaningful for TRANSIT pages
 };
-static PageInfo g_pages[12];
+static const int MAX_PAGES = 16;
+static PageInfo g_pages[MAX_PAGES];
 static int      g_num_pages    = 0;
 static int      g_current_page = 0;
 
@@ -238,34 +241,55 @@ static bool commute_configured() {
     return g_home_station.length() > 0 && g_work_station.length() > 0;
 }
 
+static void add_page(PageInfo::Type type, int idx = 0) {
+    if (g_num_pages < MAX_PAGES) g_pages[g_num_pages++] = { type, idx };
+}
+
 static void setup_pages() {
     g_num_pages = 0;
-    for (int i = 0; i < g_num_stops && g_num_pages < 12; i++) {
-        g_pages[g_num_pages++] = { PageInfo::TRANSIT, i };
-    }
+    bool today_page = config_load_today_page();
+    if (today_page) add_page(PageInfo::TODAY);           // the morning overview comes first
+    for (int i = 0; i < g_num_stops; i++) add_page(PageInfo::TRANSIT, i);
     // Both stations required: home commute = work→home, work commute = home→work
     if (commute_configured()) {
-        if (g_num_pages < 12) g_pages[g_num_pages++] = { PageInfo::COMMUTE_HOME, 0 };
-        if (g_num_pages < 12) g_pages[g_num_pages++] = { PageInfo::COMMUTE_WORK, 0 };
+        add_page(PageInfo::COMMUTE_HOME);
+        add_page(PageInfo::COMMUTE_WORK);
     }
-    if (g_stocks_cfg.count > 0 && g_num_pages < 12) {
-        g_pages[g_num_pages++] = { PageInfo::STOCKS, 0 };
-    }
-    // Last, so saved page numbers from older firmware still point to the same pages
+    if (g_stocks_cfg.count > 0) add_page(PageInfo::STOCKS);
     bool weather_page = config_load_weather_page();
-    if (weather_page && g_num_pages < 12) {
-        g_pages[g_num_pages++] = { PageInfo::WEATHER, 0 };
-    }
+    if (weather_page) add_page(PageInfo::WEATHER);
     bool info_page = config_load_info_page();
-    if (info_page && g_num_pages < 12) {
-        g_pages[g_num_pages++] = { PageInfo::DEVICE, 0 };
-    }
-    Serial.printf("[Pages] %d pages (%d transit, commute %s, stocks %s, weather %s, info %s)\n",
-                  g_num_pages, g_num_stops,
+    if (info_page) add_page(PageInfo::DEVICE);
+    Serial.printf("[Pages] %d pages (today %s, %d transit, commute %s, stocks %s, weather %s, info %s)\n",
+                  g_num_pages, today_page ? "on" : "off", g_num_stops,
                   commute_configured() ? "on" : "off",
                   g_stocks_cfg.count > 0 ? "on" : "off",
                   weather_page ? "on" : "off",
                   info_page ? "on" : "off");
+}
+
+// Saved page = what it is (type + stop index), not its position, so adding or
+// removing pages in Settings doesn't make the device come back on another page
+static int page_key(const PageInfo& p) { return (int)p.type * 32 + p.transit_idx; }
+
+static int find_page_by_key(int key) {
+    for (int i = 0; i < g_num_pages; i++) if (page_key(g_pages[i]) == key) return i;
+    return -1;
+}
+
+// Short name of a page (remote control page list)
+static String page_name(int i) {
+    const PageInfo& p = g_pages[i];
+    switch (p.type) {
+        case PageInfo::TRANSIT:      return g_stop_configs[p.transit_idx].label;
+        case PageInfo::COMMUTE_HOME: return "Work -> Home";
+        case PageInfo::COMMUTE_WORK: return "Home -> Work";
+        case PageInfo::STOCKS:       return "Portfolio";
+        case PageInfo::WEATHER:      return "Weather";
+        case PageInfo::DEVICE:       return "Device";
+        case PageInfo::TODAY:        return "Today";
+    }
+    return "?";
 }
 
 static bool is_commute_page() {
@@ -631,10 +655,29 @@ static void update_weather_place() {
         case PageInfo::STOCKS:       fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
         case PageInfo::WEATHER:      fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
         case PageInfo::DEVICE:       break;   // footer shows the settings address, not weather
+        case PageInfo::TODAY:        fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
     }
 }
 
-static void switch_page(int new_page) {
+// Re-fetch whatever the current page shows (long press, remote "Refresh")
+static void force_refresh_current_page() {
+    switch (g_pages[g_current_page].type) {
+        case PageInfo::TRANSIT:
+            if (g_view == VIEW_BOARD) fetch_task_force_refresh();
+            else fetch_task_force_flight_refresh(g_view == VIEW_FLIGHT1 ? 1 : 0);  // core 0, ~5 s
+            break;
+        case PageInfo::STOCKS:       fetch_task_force_stocks_refresh();   break;
+        case PageInfo::WEATHER:      fetch_task_force_weather_refresh();  break;
+        case PageInfo::COMMUTE_HOME:
+        case PageInfo::COMMUTE_WORK: fetch_task_force_commute_refresh();  break;
+        case PageInfo::TODAY:        fetch_task_force_refresh();          break;  // its departures
+        case PageInfo::DEVICE:       break;
+    }
+}
+
+// by_user = false for kiosk rotation: those pages aren't saved (a write every
+// few seconds would wear the flash) and don't count as interaction
+static void switch_page(int new_page, bool by_user = true) {
     g_current_page     = new_page;
     g_commute_conn_idx = 0;
     g_view             = VIEW_BOARD;
@@ -650,16 +693,17 @@ static void switch_page(int new_page) {
     update_weather_place();
     // Remember the page once the user settles on it (not on every swipe —
     // each NVS write wears flash). Saved by save_page_tick().
-    g_page_save_at_ms = millis() + PAGE_SAVE_DELAY_MS;
+    if (by_user) g_page_save_at_ms = millis() + PAGE_SAVE_DELAY_MS;
     display_invalidate();
 }
 
 static void save_page_tick() {
     if (g_page_save_at_ms == 0 || (int32_t)(millis() - g_page_save_at_ms) < 0) return;
     g_page_save_at_ms = 0;
+    int key = page_key(g_pages[g_current_page]);
     Preferences prefs;
     prefs.begin("tramli", false);
-    if (prefs.getInt("page", -1) != g_current_page) prefs.putInt("page", g_current_page);
+    if (prefs.getInt("page_key", -1) != key) prefs.putInt("page_key", key);
     prefs.end();
 }
 
@@ -851,20 +895,7 @@ static void check_touch(TouchGesture gesture) {
             break;
         case TOUCH_LONG_PRESS:
             Serial.println("[Touch] Long press → force refresh");
-            if (g_pages[g_current_page].type == PageInfo::TRANSIT) {
-                if (g_view == VIEW_BOARD) fetch_task_force_refresh();
-                else {
-                    int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
-                    fetch_task_force_flight_refresh(slot);  // runs on core 0 within ~5 s
-                }
-            } else if (g_pages[g_current_page].type == PageInfo::STOCKS) {
-                fetch_task_force_stocks_refresh();
-            } else if (g_pages[g_current_page].type == PageInfo::WEATHER) {
-                fetch_task_force_weather_refresh();
-            } else if (is_commute_page()) {
-                // Commute: ask background task to re-fetch on its next iteration
-                fetch_task_force_commute_refresh();
-            }
+            force_refresh_current_page();
             break;
         case TOUCH_DOUBLE_TAP:
             // Font size only applies to the departure board; on the portfolio a
@@ -1124,6 +1155,34 @@ static void parcel_pulse_tick() {
     }
 }
 
+// "Zürich 11°C/12°C" — town of the place on screen + current/max temperature
+static String weather_temp_text() {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s%s%d°C/%d°C",
+             g_weather_city.c_str(), g_weather_city.isEmpty() ? "" : " ",
+             (int)roundf(weather_data.temp_c), (int)roundf(weather_data.temp_max_c));
+    return buf;
+}
+
+// Rain alert when rain is coming or falling, otherwise UV (which doesn't
+// matter while it rains): "Rain from 17:15", "Rain until 18:30", "UV3/4"
+static String weather_info_text() {
+    char info[24];
+    struct tm t;
+    if (weather_data.raining_now && weather_data.rain_end > 0) {
+        localtime_r(&weather_data.rain_end, &t);
+        snprintf(info, sizeof(info), "Rain until %02d:%02d", t.tm_hour, t.tm_min);
+    } else if (weather_data.raining_now) {
+        snprintf(info, sizeof(info), "Raining");
+    } else if (weather_data.rain_start > 0) {
+        localtime_r(&weather_data.rain_start, &t);
+        snprintf(info, sizeof(info), "Rain from %02d:%02d", t.tm_hour, t.tm_min);
+    } else {
+        snprintf(info, sizeof(info), "UV%d/%d", weather_data.uv_index, weather_data.uv_index_max);
+    }
+    return info;
+}
+
 // Footer text shared by all pages:
 //   weather_str  "Zürich 10C/11C"  (town of the stop on screen + now/max temperature)
 //   uv_str       a rain alert when rain is coming or falling, otherwise "UV3/4";
@@ -1135,30 +1194,12 @@ static void format_footer_weather(char* weather_str, size_t weather_len,
     weather_str[0] = '\0';
     uv_str[0]      = '\0';
     if (weather_data.valid) {
-        snprintf(weather_str, weather_len, "%s%s%dC/%dC",
-                 g_weather_city.c_str(), g_weather_city.isEmpty() ? "" : " ",
-                 (int)roundf(weather_data.temp_c),
-                 (int)roundf(weather_data.temp_max_c));
-
-        // Rain alert replaces UV (which doesn't matter while it rains)
-        char info[24];
-        struct tm t;
-        if (weather_data.raining_now && weather_data.rain_end > 0) {
-            localtime_r(&weather_data.rain_end, &t);
-            snprintf(info, sizeof(info), "Rain until %02d:%02d", t.tm_hour, t.tm_min);
-        } else if (weather_data.raining_now) {
-            snprintf(info, sizeof(info), "Raining");
-        } else if (weather_data.rain_start > 0) {
-            localtime_r(&weather_data.rain_start, &t);
-            snprintf(info, sizeof(info), "Rain from %02d:%02d", t.tm_hour, t.tm_min);
-        } else {
-            snprintf(info, sizeof(info), "UV%d/%d",
-                     weather_data.uv_index, weather_data.uv_index_max);
-        }
+        snprintf(weather_str, weather_len, "%s", weather_temp_text().c_str());
+        String info = weather_info_text();
         if (g_parcel_status.length() > 0)
-            snprintf(uv_str, uv_len, "%s | %s%s", info, parcel_prefix, g_parcel_status.c_str());
+            snprintf(uv_str, uv_len, "%s | %s%s", info.c_str(), parcel_prefix, g_parcel_status.c_str());
         else
-            snprintf(uv_str, uv_len, "%s", info);
+            snprintf(uv_str, uv_len, "%s", info.c_str());
     } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
         strncpy(weather_str, "No weather", weather_len - 1);
         weather_str[weather_len - 1] = '\0';
@@ -1267,6 +1308,135 @@ static void draw_device_info_page() {
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  TODAY PAGE                                                               ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+// The morning overview: weather and rain alert for this location, water
+// temperatures, the portfolio's average change, parcel status, and the quote
+// of the day. Values are in the large font, so rows are kept short.
+
+static void draw_today_page() {
+    time_t now = time(nullptr);
+    InfoRow rows[5];
+    int n = 0;
+
+    if (weather_data.valid) {
+        // Rain gets its own row (too long next to the temperature at this size);
+        // otherwise the UV index fits beside it
+        bool rain = weather_data.raining_now || weather_data.rain_start > 0;
+        rows[n++] = { "Weather", weather_temp_text() + (rain ? String("") : "  " + weather_info_text()) };
+        if (rain) {
+            String r = weather_info_text();          // "Rain from 17:15" / "Rain until …" / "Raining"
+            if (r.startsWith("Rain ")) r = r.substring(5);
+            else if (r == "Raining")   r = "now";
+            rows[n++] = { "Rain", r };
+        }
+    } else {
+        rows[n++] = { "Weather", "loading..." };
+    }
+
+    WaterTemps water;
+    DailyQuote quote;
+    fetch_task_get_today(water, quote);
+    if (!isnan(water.lake_c) || !isnan(water.river_c)) {
+        String v;
+        if (!isnan(water.lake_c))  v += "Lake " + String(water.lake_c, 1) + "°C";
+        if (!isnan(water.river_c)) v += String(v.length() ? "  " : "") + "Limmat " + String(water.river_c, 1) + "°C";
+        rows[n++] = { "Water", v };
+    } else {
+        rows[n++] = { "Water", "loading..." };
+    }
+
+    // Portfolio: average daily change of the tickers (no quantities are stored)
+    int count = fetch_task_get_stocks(g_stock_quotes);
+    float sum = 0;
+    int ok = 0, up = 0, down = 0;
+    for (int i = 0; i < count; i++) {
+        if (g_stock_quotes[i].status != STOCK_OK) continue;
+        float p = g_stock_quotes[i].change_pct;
+        sum += p; ok++;
+        if (p > 0.005f) up++; else if (p < -0.005f) down++;
+    }
+    if (ok > 0) {
+        float avg = sum / ok;
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%+.2f%%  (%d up, %d down)", avg, up, down);
+        uint16_t col = avg > 0.005f ? COLOR_STOCK_UP : avg < -0.005f ? COLOR_STOCK_DOWN : 0;
+        rows[n++] = { "Portfolio", buf, 0, col };
+    }
+
+    if (g_parcel_status.length() > 0) rows[n++] = { "Parcel", g_parcel_status };
+
+    char label[32] = "Today";
+    if (now > 1700000000) {
+        struct tm t; localtime_r(&now, &t);
+        strftime(label, sizeof(label), "Today  %a %d %b", &t);
+    }
+    FooterInfo f;
+    f.battery_pct      = g_battery_pct;
+    f.battery_charging = g_battery_charging;
+    display_draw_today(label, g_current_page, g_num_pages, rows, n, quote.text, quote.author, f);
+}
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  KIOSK MODE + REMOTE CONTROL                                              ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+static KioskConfig g_kiosk;
+static uint32_t    g_kiosk_last_ms = 0;   // last automatic page turn
+static uint32_t    g_last_input_ms = 0;   // last touch/button (or remote action)
+
+// Kiosk mode: turn to the next page every g_kiosk.interval_sec; any interaction
+// pauses it for KIOSK_PAUSE_SEC. Not while something else owns the screen.
+static void kiosk_tick() {
+    uint32_t now = millis();
+    if (any_input_down()) g_last_input_ms = now;
+    if (!g_kiosk.enabled || g_num_pages < 2) return;
+    bool busy = g_pager_state != PAGER_OFF || g_clock_showing || !display_screen_on() ||
+                g_overlay_until_ms != 0 || config_hint_stage != 0;
+    bool paused = g_last_input_ms != 0 && now - g_last_input_ms < KIOSK_PAUSE_SEC * 1000UL;
+    if (busy || paused) { g_kiosk_last_ms = now; return; }   // full interval after a pause
+    if (now - g_kiosk_last_ms >= (uint32_t)g_kiosk.interval_sec * 1000UL) {
+        g_kiosk_last_ms = now;
+        switch_page((g_current_page + 1) % g_num_pages, false);
+    }
+}
+
+// ── Remote control (Settings → Remote) ───────────────────────────────────────
+// The browser page calls these through config_portal (always in loop() context).
+
+static String remote_state() {
+    JsonDocument doc;
+    doc["page"] = g_current_page;
+    JsonArray pages = doc["pages"].to<JsonArray>();
+    for (int i = 0; i < g_num_pages; i++) pages.add(page_name(i));
+    doc["kiosk"]    = g_kiosk.enabled;
+    doc["screen"]   = !display_screen_on() ? "off" : g_clock_showing ? "clock" : "on";
+    doc["night"]    = display_is_night();
+    doc["firmware"] = FIRMWARE_VERSION;
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+static bool remote_command(const String& cmd, int arg) {
+    // Any remote action shows the pages (wakes the screen / leaves the clock)
+    g_woken         = true;
+    g_woke_at_ms    = millis();
+    g_last_input_ms = millis();   // and pauses kiosk rotation like a touch would
+    if      (cmd == "page" && arg >= 0 && arg < g_num_pages) switch_page(arg);
+    else if (cmd == "next")    switch_page((g_current_page + 1) % g_num_pages);
+    else if (cmd == "prev")    switch_page((g_current_page - 1 + g_num_pages) % g_num_pages);
+    else if (cmd == "refresh") force_refresh_current_page();
+    else if (cmd == "wake")    { /* woken above */ }
+    else if (cmd == "bright")  display_step_brightness();
+    else if (cmd == "kiosk")   { g_kiosk.enabled = arg != 0; config_save_kiosk(g_kiosk); }
+    else return false;
+    last_redraw_ms = 0;
+    Serial.printf("[Remote] %s %d\n", cmd.c_str(), arg);
+    return true;
+}
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  ARDUINO ENTRY POINTS                                                     ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
@@ -1366,6 +1536,14 @@ void setup() {
     fetch_task_start(g_stop_configs, g_num_stops);
     fetch_task_set_ota_enabled(config_load_ota_enabled());
     fetch_task_set_stocks(g_stocks_cfg.symbols, g_stocks_cfg.count);
+    fetch_task_set_today_enabled(config_load_today_page());
+    config_load_kiosk(g_kiosk);
+    {
+        RemoteHooks hooks;
+        hooks.state   = remote_state;
+        hooks.command = remote_command;
+        config_web_set_remote(hooks);
+    }
     {
         WeatherLocations wl;
         config_load_weather_locations(wl);
@@ -1397,8 +1575,12 @@ void setup() {
     {
         Preferences prefs;
         prefs.begin("tramli", true);
-        int saved = prefs.getInt("page", -1);
+        int key   = prefs.getInt("page_key", -1);
+        int old_i = prefs.getInt("page", -1);   // firmware ≤ 1.7.2 saved the position
         prefs.end();
+        int saved = (key >= 0) ? find_page_by_key(key)
+                  : (old_i >= 0) ? old_i + (g_pages[0].type == PageInfo::TODAY ? 1 : 0)
+                  : -1;
         if (saved >= 0 && saved < g_num_pages) {
             g_current_page = saved;
             PageInfo& p = g_pages[saved];
@@ -1426,6 +1608,28 @@ void setup() {
 
     // Weather and commute are now fetched by the background task immediately after
     // it starts, so setup() can complete without blocking on those HTTP calls.
+    // Configuration complete → the fetch task loads every data source once. The
+    // boot animation keeps running until that's done (or BOOT_WAIT_MAX_MS), so the
+    // first page appears fully populated instead of filling in piece by piece.
+    // Full CPU speed meanwhile: each HTTPS handshake is CPU-bound and takes ~3 s
+    // at the power-saving 80 MHz; back to 80 MHz once the first page is ready.
+    // Never stuck here: at most BOOT_WAIT_MAX_MS (no internet, a slow source …),
+    // and any touch or button skips the wait — data still loading fills in later.
+    setCpuFrequencyMhz(240);
+    fetch_task_config_done();
+    uint32_t wait_start = millis();
+    bool skipped = false;
+    while (!fetch_task_startup_done() && millis() - wait_start < BOOT_WAIT_MAX_MS) {
+        touch_poll();
+        if (any_input_down()) { skipped = true; break; }
+        delay(50);
+    }
+    Serial.printf("[Boot] Data %s after %lu ms\n",
+                  fetch_task_startup_done() ? "ready" : skipped ? "wait skipped" : "wait timed out",
+                  (unsigned long)(millis() - wait_start));
+    if (skipped) g_input_swallowed = true;   // the skipping press does nothing else
+    setCpuFrequencyMhz(80);
+
     g_setup_done_ms = millis();
     display_boot_animation_stop();
 }
@@ -1443,6 +1647,7 @@ void loop() {
         check_touch(gesture);
     }
     save_page_tick();
+    kiosk_tick();
     wifi_reconnect_tick();
     config_web_poll();
 
@@ -1796,6 +2001,8 @@ void loop() {
                                  have ? &wd : nullptr, not_found, f);
         } else if (page.type == PageInfo::DEVICE) {
             draw_device_info_page();
+        } else if (page.type == PageInfo::TODAY) {
+            draw_today_page();
         } else {
             // Commute page
             bool is_home = (page.type == PageInfo::COMMUTE_HOME);

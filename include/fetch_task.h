@@ -8,6 +8,7 @@
 #include "commute.h"          // CommuteData
 #include "flight_tracker.h"   // FlightEntry
 #include "stocks.h"           // StockQuote
+#include "today_data.h"       // WaterTemps, DailyQuote
 
 struct StopCache {
     std::vector<Departure> departures;
@@ -28,6 +29,12 @@ struct SourceStatus {
 };
 void fetch_task_get_source_status(SourceStatus out[SRC_COUNT]);
 
+// Today page extras: water temperatures (at startup, then every 3 h during the
+// day — see WATER_*_HOUR) and the quote of the day (once a day). Only fetched
+// while the page is enabled.
+void fetch_task_set_today_enabled(bool enabled);
+void fetch_task_get_today(WaterTemps& water, DailyQuote& quote);
+
 // How eagerly to refresh transit data (see TRANSIT_*_SEC in config.h)
 enum FetchPower {
     FETCH_POWER_NORMAL,      // day: visible stop every 30 s
@@ -39,8 +46,16 @@ enum FetchPower {
 void fetch_task_set_power_mode(FetchPower mode);
 
 // Call once from setup() after WiFi is connected. Launches the background
-// FreeRTOS task (core 0), which loads all stops' departures first, then the rest.
+// FreeRTOS task (core 0). It waits for fetch_task_config_done(), then fetches
+// everything once (departures first) before its normal schedule.
 void fetch_task_start(const StopConfig* stops, int num_stops);
+
+// setup() has finished calling the fetch_task_set_* functions — start fetching.
+void fetch_task_config_done();
+
+// True once that first round of every data source has completed (the boot
+// animation waits for it so the first page appears fully populated).
+bool fetch_task_startup_done();
 
 // Read the cached data for a stop. Takes the mutex briefly; never blocks.
 void fetch_task_get(int stop_idx,

@@ -96,6 +96,25 @@ bool config_load_weather_page();
 // Show the device info page in the page cycle? (default: yes)
 bool config_load_info_page();
 
+// Show the Today page (first in the cycle)? (default: yes)
+bool config_load_today_page();
+
+// Kiosk mode: pages turn by themselves every interval_sec
+struct KioskConfig {
+    bool enabled      = false;
+    int  interval_sec = 15;
+};
+void config_load_kiosk(KioskConfig& out);
+void config_save_kiosk(const KioskConfig& cfg);
+
+// Remote control (Settings → Remote): the browser page asks the main program
+// for its state and sends it commands. Both run in loop() context.
+struct RemoteHooks {
+    String (*state)()                                = nullptr;  // JSON for the page
+    bool   (*command)(const String& cmd, int arg)    = nullptr;  // false = unknown
+};
+void config_web_set_remote(const RemoteHooks& hooks);
+
 // Weather page locations, in swipe order: the device's own location (unless
 // turned off) followed by up to WEATHER_TOWNS_MAX towns typed in Settings.
 #define WEATHER_TOWNS_MAX 3

@@ -1538,6 +1538,92 @@ void display_draw_weather(const char* label, int page_idx, int page_count,
 
 // ── Device info page ─────────────────────────────────────────────────────────
 
+static uint16_t info_value_color(const InfoRow& r) {
+    if (r.color) return r.color;
+    return (r.state == 2) ? COLOR_STOCK_DOWN : c_row0;
+}
+
+// Split text into lines that fit max_w at font size fsz (at most max_lines;
+// the last one gets "..." if the text doesn't fit)
+static int wrap_text(const String& text, int max_w, uint8_t fsz, String* lines, int max_lines) {
+    int n = 0;
+    String cur;
+    int pos = 0;
+    while (pos < (int)text.length() && n < max_lines) {
+        int sp = text.indexOf(' ', pos);
+        String word = (sp < 0) ? text.substring(pos) : text.substring(pos, sp);
+        pos = (sp < 0) ? text.length() : sp + 1;
+        String trial = cur.length() ? cur + " " + word : word;
+        if (text_w(trial, fsz) <= max_w || cur.isEmpty()) {
+            cur = trial;
+        } else {
+            lines[n++] = cur;
+            cur = word;
+        }
+    }
+    if (cur.length() && n < max_lines) lines[n++] = cur;
+    if (pos < (int)text.length() && n == max_lines) {        // didn't all fit
+        String& last = lines[max_lines - 1];
+        while (last.length() > 1 && text_w(last + "...", fsz) > max_w) last.remove(last.length() - 1);
+        last += "...";
+    }
+    return n;
+}
+
+void display_draw_today(const char* label, int page_idx, int page_count,
+                        const InfoRow* rows, int n_rows,
+                        const String& quote, const String& author,
+                        const FooterInfo& f) {
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now_t, &tm_now);
+
+    // Repaint only when the text (or the minute) changes
+    uint32_t sig = 2166136261u;
+    auto mix = [&](const String& s) { for (char c : s) sig = (sig ^ (uint8_t)c) * 16777619u; };
+    for (int i = 0; i < n_rows; i++) { mix(rows[i].label); mix(rows[i].value); sig ^= rows[i].color; }
+    mix(quote);
+    sig ^= (uint32_t)(tm_now.tm_hour * 60 + tm_now.tm_min) << 7;
+    sig ^= (uint32_t)(f.battery_pct + 1) << 20;
+    if (sig == 0) sig = 1;
+    if (sig == s_info_sig) return;
+    s_info_sig = sig;
+    s_last_battery_pct      = f.battery_pct;
+    s_last_battery_charging = f.battery_charging;
+
+    FrameBuffered frame;
+    gfx->fillScreen(BLACK);
+    draw_header(label, page_idx, page_count, false, false, f.battery_pct, f.battery_charging);
+
+    // Rows: small dim label, large value (TramliLarge, 28 px line), label
+    // vertically centred on the value
+    const int top = HEADER_H + 6, line_h = 30, value_x = PAD + 96;
+    for (int i = 0; i < n_rows; i++) {
+        int y = top + i * line_h;
+        draw_text(rows[i].label, PAD, y + 7, 2, c_dim);
+        draw_text_safe(to_latin1(rows[i].value), value_x, y, 3, info_value_color(rows[i]), 0, SCREEN_W - PAD);
+    }
+
+    // Quote of the day fills the space below the rows
+    if (quote.length()) {
+        int qy = top + n_rows * line_h + 6;
+        gfx->drawFastHLine(PAD, qy - 5, SCREEN_W - 2 * PAD, c_meta);
+        int max_lines = std::max(1, (SCREEN_H - 4 - qy) / 18 - 1);   // keep a line for the author
+        String lines[4];
+        // Straight quotes: the fonts are Latin-1, curly quotes would show as "?"
+        int n = wrap_text(to_latin1(String("\"") + quote + "\""), SCREEN_W - 2 * PAD, 2,
+                          lines, std::min(max_lines, 4));
+        for (int i = 0; i < n; i++) draw_text(lines[i], PAD, qy + i * 18, 2, c_dim);
+        if (author.length()) {
+            String a = to_latin1(String("- ") + author);
+            draw_text(a, SCREEN_W - PAD - text_w(a, 2), qy + n * 18, 2, c_meta);
+        }
+    }
+}
+
 void display_draw_info(const char* label, int page_idx, int page_count,
                        const InfoRow* left, int n_left,
                        const InfoRow* right, int n_right,
@@ -1567,14 +1653,11 @@ void display_draw_info(const char* label, int page_idx, int page_count,
     draw_header(label, page_idx, page_count, false, false, f.battery_pct, f.battery_charging);
 
     const int top = HEADER_H + 6, line_h = 18;
-    auto value_color = [&](uint8_t st) {
-        return st == 1 ? c_row0 : st == 2 ? COLOR_STOCK_DOWN : c_row0;
-    };
     auto column = [&](const InfoRow* rows, int n, int x, int value_x, int x_max) {
         for (int i = 0; i < n; i++) {
             int y = top + i * line_h;
             draw_text(rows[i].label, x, y, 2, c_dim);
-            draw_text_safe(to_latin1(rows[i].value), value_x, y, 2, value_color(rows[i].state), 0, x_max);
+            draw_text_safe(to_latin1(rows[i].value), value_x, y, 2, info_value_color(rows[i]), 0, x_max);
         }
     };
     column(left,  n_left,  PAD, PAD + 78, 250);

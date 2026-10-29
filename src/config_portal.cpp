@@ -51,6 +51,8 @@
 #define NVS_KEY_WX_PAGE     "wx_page"
 #define NVS_KEY_WX_LOCS     "wx_locs"
 #define NVS_KEY_INFO_PAGE   "info_page"
+#define NVS_KEY_TODAY_PAGE  "today_page"
+#define NVS_KEY_KIOSK       "kiosk"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -296,6 +298,39 @@ bool config_load_weather_page() {
     bool on = prefs.getBool(NVS_KEY_WX_PAGE, true);
     prefs.end();
     return on;
+}
+
+bool config_load_today_page() {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    bool on = prefs.getBool(NVS_KEY_TODAY_PAGE, true);
+    prefs.end();
+    return on;
+}
+
+void config_load_kiosk(KioskConfig& out) {
+    out = KioskConfig();
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_KIOSK, "");
+    prefs.end();
+    if (json.isEmpty()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return;
+    out.enabled      = doc["on"] | false;
+    out.interval_sec = constrain(doc["s"] | 15, 5, 300);
+}
+
+void config_save_kiosk(const KioskConfig& cfg) {
+    JsonDocument doc;
+    doc["on"] = cfg.enabled;
+    doc["s"]  = cfg.interval_sec;
+    String json;
+    serializeJson(doc, json);
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putString(NVS_KEY_KIOSK, json);
+    prefs.end();
 }
 
 bool config_load_info_page() {
@@ -618,7 +653,8 @@ static String build_page(String ssids[], String passes[], String users[],
         ? F("<p class='sub'>Connected to <b>Busli&#8209;Config</b> &mdash; "
             "save to reboot with new settings</p>")
         : F("<p class='sub'>Settings over your Wi-Fi &mdash; "
-            "save to reboot with new settings</p>");
+            "save to reboot with new settings &nbsp;&middot;&nbsp; "
+            "<a href='/remote' style='color:#f7b500'>Remote control &#8594;</a></p>");
     h += F("<form method='POST' action='/save'>");
 
     // ── WiFi section ─────────────────────────────────────────────────────────
@@ -875,6 +911,30 @@ static String build_page(String ssids[], String passes[], String users[],
         }
     }
     h += F("</div>");
+
+    // ── Today page ───────────────────────────────────────────────────────────
+    h += "<h2>Today page</h2><div class='card'>"
+         "<label style='display:flex;align-items:center;gap:10px;cursor:pointer;color:#ddd'>"
+         "<input type='checkbox' name='today_page' value='1' style='width:auto'"
+         + String(config_load_today_page() ? " checked" : "") + "><span>Show the Today page (first page)</span></label>"
+         "<p class='hint' style='margin-top:6px'>Next departures, weather and rain alert, Lake Z&uuml;rich "
+         "and Limmat water temperatures, portfolio average and parcel status. Inspirational quotes "
+         "provided by <a href='https://zenquotes.io/' style='color:#999'>ZenQuotes API</a>.</p></div>";
+
+    // ── Kiosk mode ───────────────────────────────────────────────────────────
+    {
+        KioskConfig k;
+        config_load_kiosk(k);
+        h += "<h2>Kiosk mode</h2><div class='card'>"
+             "<label style='display:flex;align-items:center;gap:10px;cursor:pointer;color:#ddd'>"
+             "<input type='checkbox' name='kiosk_on' value='1' style='width:auto'"
+             + String(k.enabled ? " checked" : "") + "><span>Turn pages automatically</span></label>"
+             "<label>Seconds per page</label>"
+             "<input type='number' name='kiosk_s' min='5' max='300' value='" + String(k.interval_sec)
+             + "' style='width:80px'>"
+             "<p class='hint' style='margin-top:6px'>Touching the screen or a button pauses it for "
+             + String(KIOSK_PAUSE_SEC) + "&nbsp;s. Can also be switched on and off from Remote.</p></div>";
+    }
 
     // ── Device info page ─────────────────────────────────────────────────────
     h += "<h2>Device info page</h2><div class='card'>"
@@ -1259,7 +1319,14 @@ static void handle_save() {
         prefs.begin(NVS_NAMESPACE, false);
         prefs.putBool(NVS_KEY_WX_PAGE, s_server.arg("wx_page") == "1");
         prefs.putBool(NVS_KEY_INFO_PAGE, s_server.arg("info_page") == "1");
+        prefs.putBool(NVS_KEY_TODAY_PAGE, s_server.arg("today_page") == "1");
         prefs.end();
+    }
+    {
+        KioskConfig k;
+        k.enabled      = s_server.arg("kiosk_on") == "1";
+        k.interval_sec = constrain(s_server.arg("kiosk_s").toInt(), 5, 300);
+        config_save_kiosk(k);
     }
     {
         WeatherLocations wl;
@@ -1410,6 +1477,70 @@ static void handle_stock_check() {
     s_server.send(200, "application/json", out);
 }
 
+// ── Remote control ───────────────────────────────────────────────────────────
+// /remote is a small page that shows what's on screen and sends commands
+// (/api/state, /api/cmd) — the main program supplies both via RemoteHooks.
+
+static RemoteHooks s_remote;
+void config_web_set_remote(const RemoteHooks& hooks) { s_remote = hooks; }
+
+static const char REMOTE_PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang='en'><head>
+<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Busli remote</title><style>
+*{box-sizing:border-box}
+body{font:15px/1.5 sans-serif;max-width:500px;margin:0 auto;padding:16px 14px 40px;background:#111;color:#f7b500}
+h1{font-size:22px;margin:0}
+.now{color:#999;margin:2px 0 16px;min-height:1.5em}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{padding:14px 8px;background:#1a1a1a;color:#eee;border:1px solid #383838;border-radius:8px;
+font-size:15px;cursor:pointer}
+button.on{border-color:#f7b500;color:#f7b500;font-weight:bold}
+.row{display:flex;gap:8px;margin-top:12px}.row button{flex:1}
+a{color:#999;font-size:13px}
+</style></head><body>
+<h1>Busli remote</h1><p class='now' id='now'>Connecting&hellip;</p>
+<div class='grid' id='pages'></div>
+<div class='row'><button onclick="cmd('prev')">&#9664; Previous</button>
+<button onclick="cmd('refresh')">Refresh</button><button onclick="cmd('next')">Next &#9654;</button></div>
+<div class='row'><button onclick="cmd('wake')">Wake screen</button>
+<button onclick="cmd('bright')">Brightness</button><button id='kiosk'>Kiosk</button></div>
+<p style='margin-top:24px'><a href='/'>&#8592; Settings</a></p>
+<script>
+var kiosk=false;
+function render(s){
+  var extra=s.screen=='off'?' (screen off)':s.screen=='clock'?' (night clock)':'';
+  document.getElementById('now').textContent='Showing: '+s.pages[s.page]+extra;
+  var g=document.getElementById('pages');g.innerHTML='';
+  s.pages.forEach(function(n,i){var b=document.createElement('button');b.textContent=n;
+    if(i==s.page)b.className='on';b.onclick=function(){cmd('page',i);};g.appendChild(b);});
+  kiosk=s.kiosk;var k=document.getElementById('kiosk');
+  k.textContent='Kiosk: '+(kiosk?'on':'off');k.className=kiosk?'on':'';
+  k.onclick=function(){cmd('kiosk',kiosk?0:1);};
+}
+function load(){fetch('/api/state').then(function(r){
+  if(r.status==403){location.href='/';return;}return r.json();}).then(function(s){if(s)render(s);})
+  .catch(function(){document.getElementById('now').textContent='Not reachable';});}
+function cmd(c,a){fetch('/api/cmd?c='+c+'&a='+(a||0),{method:'POST'}).then(load);}
+load();setInterval(load,2000);
+</script></body></html>)HTML";
+
+static void handle_remote_page() {
+    if (!authorized()) { send_pair_page(nullptr); return; }
+    s_server.send_P(200, "text/html", REMOTE_PAGE);
+}
+
+static void handle_api_state() {
+    if (!authorized()) { send_forbidden(); return; }
+    if (!s_remote.state) { s_server.send(503, "application/json", "{}"); return; }
+    s_server.send(200, "application/json", s_remote.state());
+}
+
+static void handle_api_cmd() {
+    if (!authorized()) { send_forbidden(); return; }
+    bool ok = s_remote.command && s_remote.command(s_server.arg("c"), s_server.arg("a").toInt());
+    s_server.send(ok ? 200 : 400, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
 // Look up a town for the weather page so typos are caught before saving.
 static void handle_town_check() {
     if (!authorized()) { send_forbidden(); return; }
@@ -1487,6 +1618,9 @@ static void ensure_routes() {
     s_server.on("/pager_test",  HTTP_GET,  handle_pager_test);
     s_server.on("/stock_check", HTTP_GET,  handle_stock_check);
     s_server.on("/town_check",  HTTP_GET,  handle_town_check);
+    s_server.on("/remote",      HTTP_GET,  handle_remote_page);
+    s_server.on("/api/state",   HTTP_GET,  handle_api_state);
+    s_server.on("/api/cmd",     HTTP_POST, handle_api_cmd);
     s_server.on("/update",      HTTP_GET,  handle_update_page);
     s_server.on("/update",      HTTP_POST, handle_update_finish, handle_update_upload);
     s_server.onNotFound(handle_not_found);

@@ -182,13 +182,16 @@ void display_draw_stock_detail(const char* label, int page_idx, int page_count,
 void display_draw_weather(const char* label, int page_idx, int page_count,
                           const WeatherDetail* d, bool not_found, const FooterInfo& footer);
 
-// One "label  value" line on an info page. state: 0 = normal, 1 = good, 2 = problem
+// One "label  value" line on an info page. state: 0 = normal, 1 = good, 2 = problem.
+// color: explicit value colour (RGB565) instead of the state's; 0 = use state.
 struct InfoRow {
-    String  label;
-    String  value;
-    uint8_t state = 0;
+    String   label;
+    String   value;
+    uint8_t  state = 0;
+    uint16_t color = 0;
     InfoRow() {}
-    InfoRow(const String& l, const String& v, uint8_t s = 0) : label(l), value(v), state(s) {}
+    InfoRow(const String& l, const String& v, uint8_t s = 0, uint16_t c = 0)
+        : label(l), value(v), state(s), color(c) {}
 };
 
 // Two-column list page (device info). Repaints only when the text changes.
@@ -204,6 +207,13 @@ void display_show_setup_qr(const char* ssid, const char* url);
 // Settings shortcut: one QR code that opens (and pairs) the settings page on
 // the normal Wi-Fi, with the address in words beside it.
 void display_show_settings_qr(const char* url, const char* hostname, const char* ip);
+
+// Today page: one column of "label  value" rows, then the quote of the day
+// (word-wrapped, with its author) at the bottom. quote may be "" (not loaded).
+void display_draw_today(const char* label, int page_idx, int page_count,
+                        const InfoRow* rows, int n_rows,
+                        const String& quote, const String& author,
+                        const FooterInfo& footer);
 
 // Night clock: large dim HH:MM with a small line underneath (e.g. date + temp).
 // Repaints once a minute.
