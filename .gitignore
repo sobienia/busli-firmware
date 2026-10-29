@@ -4,6 +4,9 @@
 .pioenvs/
 .piolibdeps/
 
+# Release binaries are attached to GitHub Releases, not committed
+/firmware.bin
+
 # Your WiFi password lives here — never commit it
 include/secrets.h
 

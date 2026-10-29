@@ -20,12 +20,19 @@
 #include "../include/config_portal.h"
 #include "../include/commute.h"
 #include "../include/pager.h"
+#include "../include/stocks.h"
 
 #include "display.h"
 #include "api.h"
 #include "weather.h"
 #include "../include/flight_tracker.h"
 #include <esp_wifi.h>
+
+// loop() makes HTTPS calls (pager send, config-portal Check/Test buttons). A TLS
+// handshake needs more stack than the default 8 KB loopTask — overflowing it
+// crashes with "Double exception". Measured: a portal stock Check uses ~9 KB.
+// 16 KB matches FETCH_TASK_STACK.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  HARDCODED STOP DEFAULTS — used when NVS has no saved stops               ║
@@ -110,7 +117,7 @@ static void setup_stops() {
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 struct PageInfo {
-    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK } type;
+    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK, STOCKS } type;
     int transit_idx; // only meaningful for TRANSIT pages
 };
 static PageInfo g_pages[12];
@@ -138,6 +145,12 @@ static CommuteData g_commute_work  = {};
 static String      g_home_station;
 static String      g_work_station;
 static int         g_commute_conn_idx = 0;
+
+// Stocks — config from NVS; quotes are copied from the background cache on each redraw
+static StocksConfig g_stocks_cfg;
+static StockQuote   g_stock_quotes[STOCKS_MAX];
+static int          g_stock_sub_page  = 0;   // which group of tickers is on screen
+static uint32_t     g_stock_rotate_ms = 0;   // millis() of the last sub-page change
 
 // Weather — display-side cache; populated from background task via fetch_task_get_weather()
 static WeatherData weather_data    = {};
@@ -178,7 +191,11 @@ static uint32_t   last_battery_ms   = 0;
 // Button debounce state — BOOT button
 static bool     button_was_pressed    = false;
 static uint32_t button_press_start_ms = 0;
-static bool     config_hint_shown     = false;
+// Config-hold prompt: 0 = none, 1 = "Hold to configure...", 2 = "Release to configure".
+// While non-zero, loop() skips page redraws so the prompt stays on screen.
+static int      config_hint_stage     = 0;
+static const uint32_t CONFIG_HINT_MS = 1000;  // show "Hold to configure..."
+static const uint32_t CONFIG_HOLD_MS = 3000;  // releasing after this opens the portal
 
 // Button debounce state — bottom-right button (brightness cycle)
 // ≥50ms hold required to filter GPIO glitches and touch-IRQ pulses.
@@ -208,8 +225,26 @@ static void setup_pages() {
         if (g_num_pages < 12) g_pages[g_num_pages++] = { PageInfo::COMMUTE_HOME, 0 };
         if (g_num_pages < 12) g_pages[g_num_pages++] = { PageInfo::COMMUTE_WORK, 0 };
     }
-    Serial.printf("[Pages] %d pages (%d transit, %d commute)\n",
-                  g_num_pages, g_num_stops, g_num_pages - g_num_stops);
+    if (g_stocks_cfg.count > 0 && g_num_pages < 12) {
+        g_pages[g_num_pages++] = { PageInfo::STOCKS, 0 };
+    }
+    Serial.printf("[Pages] %d pages (%d transit, commute %s, stocks %s)\n",
+                  g_num_pages, g_num_stops,
+                  commute_configured() ? "on" : "off",
+                  g_stocks_cfg.count > 0 ? "on" : "off");
+}
+
+// Number of ticker groups on the stocks page (each fits on one screen).
+static int stock_sub_page_count() {
+    int per_page = stocks_per_page(g_stocks_cfg.layout, g_stocks_cfg.count);
+    return std::max(1, (g_stocks_cfg.count + per_page - 1) / per_page);
+}
+
+static void set_stock_sub_page(int idx) {
+    int n = stock_sub_page_count();
+    g_stock_sub_page  = ((idx % n) + n) % n;
+    g_stock_rotate_ms = millis();
+    last_redraw_ms    = 0;   // force immediate redraw
 }
 
 // Set initial page based on time: morning → work commute, afternoon/evening → home commute.
@@ -312,6 +347,8 @@ static void switch_page(int new_page) {
     g_current_page     = new_page;
     g_commute_conn_idx = 0;
     g_view             = VIEW_BOARD;
+    g_stock_sub_page   = 0;
+    g_stock_rotate_ms  = millis();
     last_redraw_ms     = 0;   // force immediate redraw
     PageInfo& p = g_pages[new_page];
     if (p.type == PageInfo::TRANSIT) {
@@ -341,23 +378,32 @@ static void check_button() {
 
     if (pressed && !button_was_pressed) {
         button_press_start_ms = millis();
-        config_hint_shown     = false;
+        config_hint_stage     = 0;
     } else if (pressed && button_was_pressed) {
-        // Still held — show hint when approaching config threshold
+        // Still held — prompt the user, then tell them when it's safe to let go
         uint32_t held_ms = millis() - button_press_start_ms;
-        if (held_ms >= 1000 && !config_hint_shown) {
-            config_hint_shown = true;
+        if (held_ms >= CONFIG_HOLD_MS && config_hint_stage < 2) {
+            config_hint_stage = 2;
+            display_show_status("Release to configure");
+        } else if (held_ms >= CONFIG_HINT_MS && config_hint_stage < 1) {
+            config_hint_stage = 1;
             display_show_status("Hold to configure...");
         }
     } else if (!pressed && button_was_pressed) {
         uint32_t held_ms = millis() - button_press_start_ms;
-        config_hint_shown = false;
-        if (held_ms >= 3000) {
+        if (config_hint_stage > 0) {
+            // Prompt covered the screen — repaint whatever was showing
+            last_redraw_ms = 0;
+            g_pager_dirty  = true;
+        }
+        config_hint_stage = 0;
+        if (held_ms >= CONFIG_HOLD_MS) {
             Serial.println("[Button] 3s hold → config portal");
             config_portal_run(PORTAL_TIMEOUT_MS);  // reboots on save; returns on timeout
         } else if (held_ms >= TOUCH_LONG_PRESS_MS) {
             Serial.println("[Button] Long press → force refresh");
-            fetch_task_force_refresh();
+            if (g_pages[g_current_page].type == PageInfo::STOCKS) fetch_task_force_stocks_refresh();
+            else                                                   fetch_task_force_refresh();
         } else if (held_ms >= 50) {
             Serial.println("[Button] Short press → prev page");
             switch_page((g_current_page - 1 + g_num_pages) % g_num_pages);
@@ -489,7 +535,11 @@ static void check_btn_theme() {
 }
 
 static void check_touch() {
-    switch (touch_poll()) {
+    // Always poll (handle_pager_touch reads the press state it updates), but while
+    // the pager is open its own tap handling owns the screen — ignore gestures.
+    TouchGesture gesture = touch_poll();
+    if (g_pager_state != PAGER_OFF) return;
+    switch (gesture) {
         case TOUCH_SWIPE_LEFT:
             Serial.println("[Touch] Swipe left → next page");
             switch_page((g_current_page + 1) % g_num_pages);
@@ -504,9 +554,10 @@ static void check_touch() {
                 if (g_view == VIEW_BOARD) fetch_task_force_refresh();
                 else {
                     int slot = (g_view == VIEW_FLIGHT1) ? 1 : 0;
-                    flight_tracker_refresh(slot);  // user-triggered: brief core-1 block is OK
-                    display_invalidate();
+                    fetch_task_force_flight_refresh(slot);  // runs on core 0 within ~5 s
                 }
+            } else if (g_pages[g_current_page].type == PageInfo::STOCKS) {
+                fetch_task_force_stocks_refresh();
             } else {
                 // Commute: ask background task to re-fetch on its next iteration
                 fetch_task_force_commute_refresh();
@@ -528,6 +579,9 @@ static void check_touch() {
                     Serial.printf("[Touch] Swipe down → flight view %d\n", (int)nv);
                     if (nv != g_view) { g_view = nv; display_invalidate(); }
                 }
+            } else if (g_pages[g_current_page].type == PageInfo::STOCKS) {
+                set_stock_sub_page(g_stock_sub_page + 1);
+                Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
             } else {
                 // Commute: advance to next connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
@@ -550,6 +604,9 @@ static void check_touch() {
                     Serial.printf("[Touch] Swipe up → flight view %d\n", (int)nv);
                     if (nv != g_view) { g_view = nv; display_invalidate(); }
                 }
+            } else if (g_pages[g_current_page].type == PageInfo::STOCKS) {
+                set_stock_sub_page(g_stock_sub_page - 1);
+                Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
             } else {
                 // Commute: go back to previous connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
@@ -739,6 +796,30 @@ static void parcel_pulse_tick() {
     }
 }
 
+// Footer text shared by all pages: "12C/18C" and "UV2/4" (+ " | <parcel_prefix><status>").
+// Shows "No weather" once the first fetch is clearly overdue.
+static void format_footer_weather(char* weather_str, size_t weather_len,
+                                  char* uv_str, size_t uv_len,
+                                  const char* parcel_prefix) {
+    weather_str[0] = '\0';
+    uv_str[0]      = '\0';
+    if (weather_data.valid) {
+        snprintf(weather_str, weather_len, "%dC/%dC",
+                 (int)roundf(weather_data.temp_c),
+                 (int)roundf(weather_data.temp_max_c));
+        if (g_parcel_status.length() > 0)
+            snprintf(uv_str, uv_len, "UV%d/%d | %s%s",
+                     weather_data.uv_index, weather_data.uv_index_max,
+                     parcel_prefix, g_parcel_status.c_str());
+        else
+            snprintf(uv_str, uv_len, "UV%d/%d",
+                     weather_data.uv_index, weather_data.uv_index_max);
+    } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
+        strncpy(weather_str, "No weather", weather_len - 1);
+        weather_str[weather_len - 1] = '\0';
+    }
+}
+
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  ARDUINO ENTRY POINTS                                                     ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -828,12 +909,17 @@ void setup() {
         fetch_task_set_commute(g_home_station, g_work_station);
     }
 
+    if (config_load_stocks(g_stocks_cfg))
+        Serial.printf("[Stocks] %d ticker(s), layout %d, rotate %ds\n",
+                      g_stocks_cfg.count, g_stocks_cfg.layout, g_stocks_cfg.rotate_sec);
+
     setup_pages();
     set_initial_page();
 
     http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);
     fetch_task_set_ota_enabled(config_load_ota_enabled());
+    fetch_task_set_stocks(g_stocks_cfg.symbols, g_stocks_cfg.count);
     {
         String pt_tracking;
         if (config_load_parcel(pt_tracking, g_parcel_pulses)) {
@@ -1103,7 +1189,7 @@ void loop() {
 
     // Redraw every second (clock + age counter; commute marquee advances from millis())
     PageInfo& page = g_pages[g_current_page];
-    if (now_ms - last_redraw_ms >= 1000) {
+    if (config_hint_stage == 0 && now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
 
         if (page.type == PageInfo::TRANSIT) {
@@ -1119,22 +1205,10 @@ void loop() {
                 time_t now_t  = time(nullptr);
                 int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
 
-                char weather_str[20] = "";
-                char uv_str[32]      = "";
-                if (weather_data.valid) {
-                    snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
-                             (int)roundf(weather_data.temp_c),
-                             (int)roundf(weather_data.temp_max_c));
-                    if (g_parcel_status.length() > 0)
-                        snprintf(uv_str, sizeof(uv_str), "UV%d/%d | Package: %s",
-                                 weather_data.uv_index, weather_data.uv_index_max,
-                                 g_parcel_status.c_str());
-                    else
-                        snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
-                                 weather_data.uv_index, weather_data.uv_index_max);
-                } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
-                    strncpy(weather_str, "No weather", sizeof(weather_str) - 1);
-                }
+                char weather_str[20];
+                char uv_str[32];
+                format_footer_weather(weather_str, sizeof(weather_str),
+                                      uv_str, sizeof(uv_str), "Package: ");
 
                 display_draw_board(
                     stop.label,
@@ -1164,27 +1238,47 @@ void loop() {
                 display_draw_flight(slot, g_flight_count, fi, WiFi.status() == WL_CONNECTED);
             }
 
+        } else if (page.type == PageInfo::STOCKS) {
+            int count    = fetch_task_get_stocks(g_stock_quotes);
+            int per_page = stocks_per_page(g_stocks_cfg.layout, count);
+            int n_sub    = stock_sub_page_count();
+
+            // Auto-rotate through ticker groups (swipe up/down resets the timer)
+            if (n_sub > 1 && now_ms - g_stock_rotate_ms >= (uint32_t)g_stocks_cfg.rotate_sec * 1000)
+                set_stock_sub_page(g_stock_sub_page + 1);
+            if (g_stock_sub_page >= n_sub) g_stock_sub_page = 0;
+
+            char label[32] = "Portfolio";
+            if (n_sub > 1)
+                snprintf(label, sizeof(label), "Portfolio %d/%d", g_stock_sub_page + 1, n_sub);
+            if (!stocks_market_open(time(nullptr)))
+                strncat(label, " - closed", sizeof(label) - strlen(label) - 1);
+
+            // Footer age = time since the newest quote arrived
+            time_t newest = 0;
+            for (int i = 0; i < count; i++) newest = std::max(newest, g_stock_quotes[i].fetch_time);
+            int age_s = (newest > 0) ? (int)(time(nullptr) - newest) : 0;
+
+            char weather_str[20];
+            char uv_str[32];
+            format_footer_weather(weather_str, sizeof(weather_str), uv_str, sizeof(uv_str), "");
+            display_draw_stocks(label, g_current_page, g_num_pages,
+                                g_stock_quotes, count,
+                                g_stock_sub_page * per_page, per_page, age_s,
+                                WiFi.status() == WL_CONNECTED, g_battery_pct, g_battery_charging,
+                                weather_str, uv_str,
+                                weather_data.valid && weather_data.rain_today,
+                                weather_data.valid ? weather_data.precip_prob_pct : 0,
+                                weather_data.valid && weather_data.snow_today,
+                                weather_data.valid && weather_data.clear_today);
         } else {
             // Commute page
             bool is_home = (page.type == PageInfo::COMMUTE_HOME);
             CommuteData& cd = is_home ? g_commute_home : g_commute_work;
             const char* label = is_home ? "Work -> Home" : "Home -> Work";
-            char weather_str[20] = "";
-            char uv_str[32]      = "";
-            if (weather_data.valid) {
-                snprintf(weather_str, sizeof(weather_str), "%dC/%dC",
-                         (int)roundf(weather_data.temp_c),
-                         (int)roundf(weather_data.temp_max_c));
-                if (g_parcel_status.length() > 0)
-                    snprintf(uv_str, sizeof(uv_str), "UV%d/%d | %s",
-                             weather_data.uv_index, weather_data.uv_index_max,
-                             g_parcel_status.c_str());
-                else
-                    snprintf(uv_str, sizeof(uv_str), "UV%d/%d",
-                             weather_data.uv_index, weather_data.uv_index_max);
-            } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
-                strncpy(weather_str, "No weather", sizeof(weather_str) - 1);
-            }
+            char weather_str[20];
+            char uv_str[32];
+            format_footer_weather(weather_str, sizeof(weather_str), uv_str, sizeof(uv_str), "");
             display_draw_commute(label, g_current_page, g_num_pages,
                                  cd, g_commute_conn_idx,
                                  WiFi.status() == WL_CONNECTED, g_battery_pct, g_battery_charging,

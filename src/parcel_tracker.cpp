@@ -42,29 +42,41 @@ static String url_encode(const String& s) {
     return out;
 }
 
-// Map a Swiss Post eventCode (PARCEL.*.X.NNNN) to a short status string.
-// Falls back to keyword matching on the city name for customs detection.
-static String classify_event_code(const String& code, const String& city) {
-    // Extract the trailing numeric segment
-    int last_dot = code.lastIndexOf('.');
-    int n = (last_dot >= 0) ? code.substring(last_dot + 1).toInt() : 0;
+// Map a Swiss Post eventCode ("PARCEL.*.0.4000") to a short footer status.
+// Codes come from Swiss Post's own text table:
+//   https://service.post.ch/ekp-web/core/rest/translations/en/shipment-text-messages
+// (keys "PARCEL.*.*.<code>.*" under "shipment-text--"). Returns "" for purely
+// informational events (recipient orders, cash-on-delivery processing, enquiries)
+// so they don't overwrite the real delivery status.
+static String classify_event_code(const String& code) {
+    // The numeric event is the 4th dot-separated field: PARCEL . * . 0 . 4000
+    int start = 0;
+    for (int i = 0; i < 3 && start >= 0; i++) {
+        start = code.indexOf('.', start);
+        if (start >= 0) start++;
+    }
+    if (start < 0) return "";
+    int n = code.substring(start).toInt();  // toInt() stops at the next '.'
 
-    // Known event code ranges (from Swiss Post public API docs + community research):
-    if (n >= 6500 && n < 7000) return "Delivered";   // 6500-6699 = delivered
-    if (n >= 5600 && n < 5700) return "In delivery";  // 5600-5699 = out for delivery
-    if (n >= 5500 && n < 5600) return "In delivery";  // 5500-5599 = delivery attempt
+    auto in = [n](int lo, int hi) { return n >= lo && n <= hi; };
 
-    // Sorting center
-    String ci = city; ci.toLowerCase();
-    if (ci.indexOf("paketzentrum") >= 0) return "Sorted";
-
-    // Customs: detect via code keyword or city name
-    String c = code; c.toLowerCase();
-    if (c.indexOf("custom") >= 0 || c.indexOf("zoll") >= 0 ||
-        ci.indexOf("zoll") >= 0  || ci.indexOf("customs") >= 0)
+    if (n == 938 || n == 2000 || n == 3800 || in(3900, 3901) ||
+        in(4000, 4002) || n == 4200 || n == 4600 || n == 9106 || n == 9704)
+        return "Delivered";
+    if (n == 910 || in(2100, 2102) || n == 9400)                 return "Pick up";
+    if (in(922, 937) || n == 3100 || n == 3700 || n == 4100)     return "Failed";
+    if (n == 3401 || in(3600, 3602))                             return "Returned";
+    if (in(1000, 1005) || n == 1100 || n == 1400)                return "In delivery";
+    if (in(801, 805) || n == 819 || in(842, 849) || n == 853 || n == 858 ||
+        in(901, 904) || n == 919 || in(942, 949))
         return "Customs";
-
-    return "Shipped";
+    if (n == 400 || n == 807 || n == 820 || in(906, 909) || n == 920 ||
+        in(951, 953) || in(1200, 1204) || in(1300, 1304))
+        return "Sorted";
+    if (n == 100 || n == 200 || in(500, 502) || n == 600 || n == 854 || n == 859 ||
+        n == 912 || in(813, 818) || in(839, 841) || n == 915 || in(939, 941))
+        return "Shipped";
+    return "";
 }
 
 // Fallback: keyword matching on human-readable description text.
@@ -218,9 +230,11 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
     // Try URL patterns in order — the correct one varies across API versions.
     {
         // Candidates to try in sequence; %s = identity (already ASCII-safe)
+        // Verified 2026-10-29: "/shipment/id/%s/events" works; the trailing-slash
+        // variant returns 404. Fallbacks stay in case the API changes again.
         static const char* PATTERNS[] = {
-            "/shipment/id/%s/events/",
             "/shipment/id/%s/events",
+            "/shipment/id/%s/events/",
             "/shipment/%s/events/",
             "/shipment/%s/events",
         };
@@ -248,26 +262,33 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         JsonDocument doc;
         if (deserializeJson(doc, body)) { Serial.println("[Parcel] Step4 JSON error"); return false; }
 
-        // Events are newest-first — take the first one that parses successfully.
+        // Don't rely on list order — pick the newest event (by timestamp) that
+        // carries a delivery status. Timestamps are ISO local time
+        // ("2026-04-27T18:12:04+02:00"); comparing the first 19 chars as text is
+        // chronological except within the one repeated hour when DST ends.
         String latest_status;
+        String latest_ts;
         auto walk_events = [&](JsonArray arr) {
             for (JsonObject ev : arr) {
                 const char* code_str = ev["eventCode"] | (const char*)nullptr;
-                const char* city_str = ev["city"]      | (const char*)nullptr;
+                String status;
                 if (code_str && *code_str) {
-                    latest_status = classify_event_code(String(code_str),
-                                                        city_str ? String(city_str) : String());
-                    Serial.printf("[Parcel] event code=%s city=%s → %s\n",
-                                  code_str, city_str ? city_str : "", latest_status.c_str());
-                    return;  // newest event wins; stop here
+                    status = classify_event_code(String(code_str));
+                } else {
+                    // Fallback: description fields (older API variants)
+                    const char* d = ev["description"]      | ev["eventDescription"] |
+                                    ev["text"]             | ev["status"]           |
+                                    ev["descriptionLocal"] | (const char*)nullptr;
+                    if (d && *d) status = classify_desc(String(d));
                 }
-                // Fallback: description fields (older API variants)
-                const char* d = ev["description"]      | ev["eventDescription"] |
-                                ev["text"]             | ev["status"]           |
-                                ev["descriptionLocal"] | (const char*)nullptr;
-                if (d && *d) {
-                    latest_status = classify_desc(String(d));
-                    return;
+                String ts = String(ev["timestamp"] | "").substring(0, 19);
+                Serial.printf("[Parcel] event %s at %s → %s\n",
+                              code_str ? code_str : "-", ts.c_str(),
+                              status.isEmpty() ? "(info only)" : status.c_str());
+                if (status.isEmpty()) continue;
+                if (latest_status.isEmpty() || ts > latest_ts) {
+                    latest_status = status;
+                    latest_ts     = ts;
                 }
             }
         };

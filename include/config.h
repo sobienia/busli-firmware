@@ -127,6 +127,19 @@
 #define PARCEL_REFRESH_SEC  3600   // re-check tracking status once per hour
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  STOCKS                                                                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+#define STOCKS_REFRESH_SEC      300  // each ticker re-fetched every 5 min while markets are open
+#define STOCKS_OPEN_HOUR          9  // polling window, Zürich local time, Mon–Fri
+#define STOCKS_CLOSE_HOUR        22  //   (covers SIX/Xetra/LSE and the US session)
+#define STOCKS_ROTATE_SEC_DEFAULT 10 // page rotation when there are 2+ pages of tickers
+
+// % change colors (standard RGB565 — this panel is RGB-ordered, same as the themes)
+#define COLOR_STOCK_UP    0x2728   // ~RGB 32,228,64  green
+#define COLOR_STOCK_DOWN  0xF9C7   // ~RGB 248,56,56  red
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  FIRMWARE / OTA                                                           ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 // Bump FIRMWARE_VERSION before each release. The device checks OTA_VERSION_URL
@@ -141,7 +154,7 @@
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.5.5"
+#define FIRMWARE_VERSION        "1.6.0"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 

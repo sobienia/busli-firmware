@@ -1,21 +1,28 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // config_portal.cpp — AP-mode web config portal
 // ─────────────────────────────────────────────────────────────────────────────
-// Triggered by a 5-second hold of the BOOT button. Starts a WiFi AP named
-// "Tramli-Config". Any device that joins and opens a browser (or is auto-
+// Triggered by a 3-second hold of the BOOT button. Starts a WiFi AP named
+// "Busli-Config". Any device that joins and opens a browser (or is auto-
 // redirected by the captive-portal DNS trick) gets a single config page:
 //   • Up to 3 WiFi credentials
 //   • Up to 6 stops (label, station name, optional line/direction filters)
+//   • Countdown, flights, commute, parcel, pager, stocks, updates
 // Saving writes to NVS and reboots.
+//
+// If the device is online when the portal starts, it stays connected (AP+STA)
+// so buttons that need the internet — pager Test, stock Check — work.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/config_portal.h"
 #include "../include/config.h"
 #include "../include/pager.h"
 #include "../include/swiss_stops.h"
+#include "../include/stocks.h"
+#include "../include/http_lock.h"
 #include "display.h"
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -33,6 +40,7 @@
 #define NVS_KEY_OTA         "ota_en"
 #define NVS_KEY_PARCEL      "parcel"
 #define NVS_KEY_PAGER       "pager"
+#define NVS_KEY_STOCKS      "stocks"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -212,6 +220,42 @@ void config_save_pager(const PagerConfig& cfg) {
     prefs.end();
 }
 
+bool config_load_stocks(StocksConfig& out) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_STOCKS, "");
+    prefs.end();
+    out.count = 0;
+    if (json.isEmpty()) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return false;
+    for (const char* sym : doc["t"].as<JsonArray>()) {
+        if (out.count >= STOCKS_MAX) break;
+        if (sym && *sym) out.symbols[out.count++] = sym;
+    }
+    out.layout     = constrain(doc["l"] | (int)STOCKS_LAYOUT_AUTO, 0, 2);
+    out.rotate_sec = constrain(doc["r"] | STOCKS_ROTATE_SEC_DEFAULT, 3, 300);
+    return out.count > 0;
+}
+
+void config_save_stocks(const StocksConfig& cfg) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    if (cfg.count > 0) {
+        JsonDocument doc;
+        JsonArray ta = doc["t"].to<JsonArray>();
+        for (int i = 0; i < cfg.count; i++) ta.add(cfg.symbols[i]);
+        doc["l"] = cfg.layout;
+        doc["r"] = cfg.rotate_sec;
+        String json;
+        serializeJson(doc, json);
+        prefs.putString(NVS_KEY_STOCKS, json);
+    } else {
+        prefs.remove(NVS_KEY_STOCKS);
+    }
+    prefs.end();
+}
+
 bool config_load_commute(CommuteConfig& out) {
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, true);
@@ -363,9 +407,10 @@ static String build_page(String ssids[], String passes[], String users[],
                           const CommuteConfig& commute,
                           bool ota_enabled,
                           const String& parcel_tracking, int parcel_pulses,
-                          const PagerConfig& pager) {
+                          const PagerConfig& pager,
+                          const StocksConfig& stocks) {
     String h;
-    h.reserve(10000);
+    h.reserve(16000);
 
     h += F("<!DOCTYPE html><html lang='en'><head>"
            "<meta charset='UTF-8'>"
@@ -486,7 +531,9 @@ static String build_page(String ssids[], String passes[], String users[],
     h += F("<h2>Flights</h2>"
            "<p class='hint' style='margin:-4px 0 10px'>Swipe down/up on the device to see flight status. "
            "Enter the flight number (IATA like <b>LX161</b> or ICAO like <b>SWR161</b>). "
-           "Both work. IATA is the number on your ticket.</p>");
+           "Both work. IATA is the number on your ticket. Live position is looked up from "
+           "3&nbsp;h before departure until 1&nbsp;h after arrival &mdash; enter the times "
+           "below to narrow that window (otherwise the whole departure day is searched).</p>");
     const char* swipe_label[] = { "swipe down", "swipe up" };
     for (int i = 0; i < MAX_FLIGHTS; i++) {
         String cs   = (i < n_flights) ? flights[i].callsign     : "";
@@ -565,6 +612,44 @@ static String build_page(String ssids[], String passes[], String users[],
     h += "<label>Alert pulses <span class='hint'>how many times to flash the screen when status changes (0&ndash;10)</span></label>"
          "<input type='number' name='pt_pulses' min='0' max='10' value='"
          + String(parcel_pulses) + "' style='width:80px'>";
+    h += F("</div>");
+
+    // ── Stocks section ───────────────────────────────────────────────────────
+    h += F("<h2>Portfolio</h2>"
+           "<p class='hint' style='margin:-4px 0 10px'>Adds a <b>Portfolio</b> page to the rotation showing "
+           "price and daily % change. Use Yahoo symbols: <b>AAPL</b> (US), <b>NESN.SW</b> (SIX), "
+           "<b>VWCE.DE</b> (Xetra), <b>VWRL.L</b> (London). Tap <b>Check</b> to verify a symbol.</p>"
+           "<div class='card'><div class='ct'>Tickers <span style='font-weight:normal;color:#666'>(up to 20)</span></div>");
+    for (int i = 0; i < STOCKS_MAX; i++) {
+        String sym = (i < stocks.count) ? stocks.symbols[i] : "";
+        h += "<div style='display:flex;gap:8px;margin-top:6px;align-items:center'>"
+             "<span style='width:20px;color:#666;font-size:12px'>" + String(i + 1) + "</span>"
+             "<input type='text' name='st" + String(i) + "' id='st" + String(i) + "' value='"
+             + html_encode(sym) + "' placeholder='e.g. NESN.SW' autocomplete='off' "
+             "spellcheck='false' autocapitalize='characters' style='flex:1;margin-top:0'>"
+             "<button type='button' class='tbtn' onclick='checkStock(this," + String(i) + ")'>Check</button>"
+             "<span id='sr" + String(i) + "' style='width:110px;font-size:12px;color:#999'></span>"
+             "</div>";
+    }
+    h += F("</div><div class='card'><div class='ct'>Display</div>"
+           "<label>Layout</label>"
+           "<select name='st_l' style='width:100%;padding:9px 10px;margin-top:3px;background:#1a1a1a;"
+           "color:#eee;border:1px solid #383838;border-radius:5px;font-size:14px'>");
+    const char* layout_names[] = { "Auto (big for 1&ndash;5, compact for more)",
+                                   "Always big (5 per page)",
+                                   "Always compact (10 per page)" };
+    for (int i = 0; i < 3; i++) {
+        h += "<option value='" + String(i) + "'";
+        if (stocks.layout == i) h += " selected";
+        h += ">";
+        h += layout_names[i];
+        h += "</option>";
+    }
+    h += F("</select>");
+    h += "<label>Page rotation <span class='hint'>seconds per page when tickers don't fit on one page "
+         "(swipe up/down to flip manually)</span></label>"
+         "<input type='number' name='st_r' min='3' max='300' value='"
+         + String(stocks.rotate_sec) + "' style='width:80px'>";
     h += F("</div>");
 
     // ── Pager section ────────────────────────────────────────────────────────
@@ -672,6 +757,20 @@ static String build_page(String ssids[], String passes[], String users[],
                ".catch(function(){btn.textContent='✗ err';btn.disabled=false;"
                  "setTimeout(function(){btn.textContent='Test';},3000);});"
            "}"
+           "function checkStock(btn,i){"
+             "var s=document.getElementById('st'+i).value.trim(),r=document.getElementById('sr'+i);"
+             "if(!s){r.textContent='';return;}"
+             "btn.disabled=true;r.style.color='#999';r.textContent='checking\\u2026';"
+             "fetch('/stock_check?s='+encodeURIComponent(s))"
+               ".then(function(x){return x.json();})"
+               ".then(function(d){"
+                 "btn.disabled=false;"
+                 "if(d.ok){r.style.color=d.pct<0?'#f55':'#4c4';"
+                   "r.textContent=d.price+' '+d.cur+' '+(d.pct>=0?'+':'')+d.pct.toFixed(2)+'%';}"
+                 "else{r.style.color='#f55';r.textContent='\\u2717 '+d.msg;}"
+               "})"
+               ".catch(function(){btn.disabled=false;r.style.color='#f55';r.textContent='\\u2717 error';});"
+           "}"
            "</script>"
            "</body></html>");
     return h;
@@ -696,6 +795,7 @@ static bool          s_ota_enabled = true;
 static String        s_parcel_tracking;
 static int           s_parcel_pulses = 3;
 static PagerConfig   s_pager;
+static StocksConfig  s_stocks;
 
 static void handle_root() {
     String page = build_page(s_ssids, s_passes, s_users, s_stops, s_n_stops,
@@ -704,7 +804,7 @@ static void handle_root() {
                              s_opensky_user, s_opensky_pass,
                              s_commute, s_ota_enabled,
                              s_parcel_tracking, s_parcel_pulses,
-                             s_pager);
+                             s_pager, s_stocks);
     s_server.send(200, "text/html", page);
 }
 
@@ -800,6 +900,16 @@ static void handle_save() {
         }
     }
     config_save_pager(new_pager);
+
+    // Parse stocks — blank fields are skipped so the list stays compact
+    StocksConfig new_stocks;
+    for (int i = 0; i < STOCKS_MAX; i++) {
+        String sym = s_server.arg("st" + String(i)); sym.trim(); sym.toUpperCase();
+        if (sym.length() > 0) new_stocks.symbols[new_stocks.count++] = sym;
+    }
+    new_stocks.layout     = constrain(s_server.arg("st_l").toInt(), 0, 2);
+    new_stocks.rotate_sec = constrain(s_server.arg("st_r").toInt(), 3, 300);
+    config_save_stocks(new_stocks);
 
     save_to_nvs(new_ssids, new_passes, new_users, n_wifi, new_stops, n_stops,
                 cd_label, cd_target, cd_icon, new_flights, n_flights,
@@ -903,6 +1013,38 @@ static void handle_pager_test() {
                   ok ? F("{\"ok\":true}") : F("{\"ok\":false,\"msg\":\"send failed\"}"));
 }
 
+// Fetch one quote so the user can verify a symbol/suffix before saving.
+static void handle_stock_check() {
+    String sym = s_server.arg("s"); sym.trim(); sym.toUpperCase();
+    Serial.printf("[Portal] Stock check '%s' — STA status %d, IP %s\n", sym.c_str(),
+                  (int)WiFi.status(), WiFi.localIP().toString().c_str());
+    JsonDocument doc;
+    if (sym.isEmpty()) {
+        doc["ok"] = false; doc["msg"] = "empty";
+    } else if (WiFi.status() != WL_CONNECTED) {
+        doc["ok"] = false; doc["msg"] = "device offline";
+    } else {
+        StockQuote q;
+        http_lock_take();
+        StockFetchResult r = stocks_fetch_quote(sym, q);
+        http_lock_give();
+        if (r == STOCK_FETCH_OK) {
+            char price[16];
+            snprintf(price, sizeof(price), "%.2f", q.price);
+            doc["ok"]    = true;
+            doc["price"] = price;
+            doc["cur"]   = q.currency;
+            doc["pct"]   = q.change_pct;
+        } else {
+            doc["ok"]  = false;
+            doc["msg"] = (r == STOCK_FETCH_NOT_FOUND) ? "not found" : "fetch failed";
+        }
+    }
+    String out;
+    serializeJson(doc, out);
+    s_server.send(200, "application/json", out);
+}
+
 static void handle_not_found() {
     // Captive-portal redirect — iOS/Android auto-detect and open the browser
     s_server.sendHeader("Location", "http://192.168.4.1/", true);
@@ -964,13 +1106,24 @@ void config_portal_run(uint32_t timeoutMs) {
     config_load_parcel(s_parcel_tracking, s_parcel_pulses);
     s_pager = {};
     config_load_pager(s_pager);
+    s_stocks = {};
+    config_load_stocks(s_stocks);
 
-    // Start AP
-    WiFi.disconnect(true);
-    delay(100);
-    WiFi.mode(WIFI_AP);
+    // Start AP. If we're online, keep the station link (AP+STA) so the portal can
+    // reach the internet; the AP then runs on the router's channel. Modem sleep
+    // doesn't work while the AP is up, so it's switched off for the portal's lifetime.
+    bool sta_online = (WiFi.status() == WL_CONNECTED);
+    if (sta_online) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        WiFi.mode(WIFI_AP_STA);
+    } else {
+        WiFi.disconnect(true);   // stop reconnect scans — they'd disrupt the AP
+        delay(100);
+        WiFi.mode(WIFI_AP);
+    }
     WiFi.softAP(PORTAL_SSID);
     delay(200);
+    Serial.printf("[Portal] Internet via STA: %s\n", sta_online ? "yes" : "no");
 
     IPAddress ip = WiFi.softAPIP();
     Serial.printf("[Portal] AP '%s' up at %s\n", PORTAL_SSID, ip.toString().c_str());
@@ -983,6 +1136,7 @@ void config_portal_run(uint32_t timeoutMs) {
     s_server.on("/save",       HTTP_POST, handle_save);
     s_server.on("/stations",   HTTP_GET,  handle_stations);
     s_server.on("/pager_test", HTTP_GET,  handle_pager_test);
+    s_server.on("/stock_check", HTTP_GET, handle_stock_check);
     s_server.on("/update",     HTTP_GET,  handle_update_page);
     s_server.on("/update",     HTTP_POST, handle_update_finish, handle_update_upload);
     s_server.onNotFound(handle_not_found);
@@ -1003,7 +1157,8 @@ void config_portal_run(uint32_t timeoutMs) {
             Serial.println("[Portal] Timeout — returning to normal boot");
             s_server.stop();
             s_dns.stop();
-            WiFi.softAPdisconnect(true);
+            WiFi.softAPdisconnect(true);   // back to STA-only; an existing link stays up
+            if (sta_online) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
             return;
         }
         delay(5);

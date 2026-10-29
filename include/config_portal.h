@@ -1,6 +1,8 @@
 #pragma once
 #include <Arduino.h>
 #include "pager.h"
+#include "stocks.h"
+#include "config.h"
 
 // One stop's editable fields — strings only, no raw pointer arrays.
 // Call config_build_stop_configs() after loading to produce StopConfig[].
@@ -65,6 +67,19 @@ bool config_load_pager(PagerConfig& out);
 
 // Persist pager config to NVS.
 void config_save_pager(const PagerConfig& cfg);
+
+struct StocksConfig {
+    String symbols[STOCKS_MAX];  // Yahoo format, e.g. "NESN.SW"; only [0, count) are used
+    int    count      = 0;
+    int    layout     = STOCKS_LAYOUT_AUTO;
+    int    rotate_sec = STOCKS_ROTATE_SEC_DEFAULT;  // sub-page rotation interval
+};
+
+// Load stock tickers + display settings. Returns true if at least one ticker is set.
+bool config_load_stocks(StocksConfig& out);
+
+// Persist stock config to NVS (removes the key when no tickers are set).
+void config_save_stocks(const StocksConfig& cfg);
 
 // Run the AP config portal. Blocks until the user saves (then reboots)
 // or until timeoutMs elapses (then returns so normal boot can continue).

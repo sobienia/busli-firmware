@@ -198,7 +198,7 @@ bool api_fetch_departures(
     String encoded = "";
     for (size_t i = 0; i < station.length(); i++) {
         char c = station[i];
-        if (isalnum(c)) {
+        if (isalnum((uint8_t)c)) {   // cast: UTF-8 bytes are negative as char (UB in isalnum)
             encoded += c;
         } else {
             char hex[4];
@@ -324,6 +324,8 @@ bool api_fetch_departures(
             if (got > 0) {
                 if (buf_len + got <= alloc_len) { memcpy(buf + buf_len, rbuf, got); buf_len += got; }
                 rem -= got;
+            } else if (!stream.connected() && !stream.available()) {
+                break;   // server closed early — don't spin until the deadline
             } else {
                 delay(1);
             }

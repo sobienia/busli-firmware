@@ -7,6 +7,7 @@
 #include "weather.h"          // WeatherData
 #include "commute.h"          // CommuteData
 #include "flight_tracker.h"   // FlightEntry
+#include "stocks.h"           // StockQuote
 
 struct StopCache {
     std::vector<Departure> departures;
@@ -49,6 +50,11 @@ void fetch_task_force_commute_refresh();
 // The background task performs all fetches on core 0 — setup() never blocks on HTTP.
 void fetch_task_init_flights(const FlightEntry* entries, int count);
 
+// Ask the background task to refresh one flight slot on its next iteration (≤5 s).
+// Use this from the UI instead of calling flight_tracker_refresh() directly, so the
+// UI never blocks on HTTP and the slot is never refreshed from two cores at once.
+void fetch_task_force_flight_refresh(int slot);
+
 // Enable or disable automatic OTA checks. Call from setup() after loading config.
 // Default is true; set to false if the user has opted out in the portal.
 void fetch_task_set_ota_enabled(bool enabled);
@@ -72,3 +78,15 @@ bool fetch_task_get_pager_incoming(PagerIncoming& out);
 // Signal that the pager was just used (send/receive/open). Switches poll interval
 // to 15 s for the next 5 minutes, then falls back to 60 s when idle.
 void fetch_task_notify_pager_activity();
+
+// Configure stock tickers. Call from setup() after fetch_task_start(); count 0 disables.
+// One ticker is fetched per loop iteration (staggered), each every STOCKS_REFRESH_SEC
+// while markets are open. Outside market hours only missing quotes and one final
+// closing-price pass are fetched.
+void fetch_task_set_stocks(const String symbols[], int count);
+
+// Copy the quote cache into out[] (must hold STOCKS_MAX entries). Returns the ticker count.
+int  fetch_task_get_stocks(StockQuote out[]);
+
+// Re-fetch all tickers (staggered), even outside market hours.
+void fetch_task_force_stocks_refresh();

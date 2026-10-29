@@ -59,6 +59,13 @@ static int       s_commute_last_minute = -1;
 static int       s_commute_last_conn   = -2;
 static uint32_t  s_commute_scroll_ms   = 0;   // millis() when current connection started (for marquee)
 static uint32_t  s_commute_weather_hash = 0xFFFFFFFF;
+// Stocks screen partial-redraw state — one entry per on-screen cell (max 10)
+struct StockCellState { int8_t status; float price; float pct; };  // status -1 = needs paint
+static StockCellState s_stock_cells[10];
+static int       s_stocks_last_first    = -1;  // -1 forces a full repaint
+static int       s_stocks_last_per_page = -1;
+static int       s_stocks_last_minute   = -1;
+static uint32_t  s_stocks_weather_hash  = 0xFFFFFFFF;
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -244,16 +251,7 @@ void display_set_brightness(uint8_t percent) {
 
 void display_show_status(const char* message) {
     if (!gfx) return;
-    s_last_fetch_time       = -1;
-    s_last_clock_minute     = -1;
-    s_last_battery_pct      = -2;
-    s_last_battery_charging = false;
-    s_footer_static_drawn   = false;
-    s_commute_last_fetch    = -1;
-    s_commute_last_minute   = -1;
-    s_commute_last_conn     = -2;
-    s_commute_scroll_ms     = 0;
-    s_commute_weather_hash  = 0xFFFFFFFF;
+    display_invalidate();   // screen is wiped — every view must fully repaint afterwards
     gfx->fillScreen(BLACK);
 
     // Split on '\n' and center each line independently.
@@ -321,6 +319,7 @@ void display_invalidate() {
     s_commute_last_conn     = -2;
     s_commute_scroll_ms     = 0;
     s_commute_weather_hash  = 0xFFFFFFFF;
+    s_stocks_last_first     = -1;
 }
 
 // ── Umbrella icon (12×15) ────────────────────────────────────────────────────
@@ -910,6 +909,146 @@ void display_draw_commute(
     draw_footer_dynamic(fy, false, wifi_ok, age_s, false, 0, 0);
 }
 
+// ── Stocks screen ─────────────────────────────────────────────────────────────
+// Content area is 5 rows. per_page=5: one full-width column, large font.
+// per_page=10: two 240px columns of 5, small font, divider at SCREEN_W/2.
+
+static const int STOCK_ROWS = 5;
+
+static void stock_cell_rect(int slot, int per_page, int& x, int& y, int& w, int& h) {
+    const int rows_h = SCREEN_H - FOOTER_H - HEADER_H;
+    h = rows_h / STOCK_ROWS;
+    w = (per_page > STOCK_ROWS) ? SCREEN_W / 2 : SCREEN_W;
+    x = (slot / STOCK_ROWS) * w;
+    y = HEADER_H + (slot % STOCK_ROWS) * h;
+}
+
+// Price with precision that fits the column: 343.83 / 1234.5 / 12345
+static String format_stock_price(float p) {
+    char buf[16];
+    if      (p >= 10000.0f) snprintf(buf, sizeof(buf), "%.0f", p);
+    else if (p >=  1000.0f) snprintf(buf, sizeof(buf), "%.1f", p);
+    else                    snprintf(buf, sizeof(buf), "%.2f", p);
+    return buf;
+}
+
+// Repaints one cell. Bottom pixel row is left alone (row separator lives there).
+static void draw_stock_cell(int slot, int per_page, const StockQuote& q) {
+    int x, y, w, h;
+    stock_cell_rect(slot, per_page, x, y, w, h);
+    gfx->fillRect(x, y, w, h - 1, BLACK);
+    if (per_page > STOCK_ROWS) gfx->drawFastVLine(SCREEN_W / 2, y, h, c_meta);
+
+    const bool    big    = (per_page <= STOCK_ROWS);
+    const uint8_t fsz    = big ? 3 : 2;
+    const int     yadv   = big ? 28 : 16;
+    const int     text_y = y + (h - yadv) / 2;
+    const int     left   = x + ((x > 0) ? PAD + 4 : PAD);  // clear the divider in column 2
+    const int     right  = x + w - PAD;
+    // Fixed-width % column so prices line up regardless of sign/digits
+    const int     price_right = right - (big ? 120 : 66) - (big ? 16 : 8);
+
+    String   price;
+    uint16_t price_col;
+    if (q.status == STOCK_OK)             { price = format_stock_price(q.price); price_col = c_row0; }
+    else if (q.status == STOCK_NOT_FOUND) { price = "n/a";                       price_col = c_dim;  }
+    else                                  { price = "--";                        price_col = c_meta; }
+    int price_w = text_w(price, fsz);
+    draw_text(price, price_right - price_w, text_y, fsz, price_col);
+
+    String sym = to_latin1(stocks_display_symbol(q.symbol));
+    int sym_max = price_right - price_w - 8 - left;
+    while (sym.length() > 1 && text_w(sym, fsz) > sym_max)
+        sym = sym.substring(0, sym.length() - 1);
+    draw_text(sym, left, text_y, fsz, (q.status == STOCK_NOT_FOUND) ? c_dim : c_row0);
+
+    if (q.status != STOCK_OK) return;
+    // Colour by the value as displayed, so "-0.00%" never shows up in red
+    long hundredths = lroundf(q.change_pct * 100.0f);
+    char pbuf[12];
+    uint16_t pct_col;
+    if (hundredths == 0) {
+        snprintf(pbuf, sizeof(pbuf), "0.00%%");
+        pct_col = c_dim;
+    } else {
+        snprintf(pbuf, sizeof(pbuf), "%+.2f%%", hundredths / 100.0f);
+        pct_col = (hundredths > 0) ? COLOR_STOCK_UP : COLOR_STOCK_DOWN;
+    }
+    String pct = pbuf;
+    draw_text(pct, right - text_w(pct, fsz), text_y, fsz, pct_col);
+}
+
+void display_draw_stocks(
+    const char* label,
+    int page_idx, int page_count,
+    const StockQuote quotes[], int count,
+    int first, int per_page,
+    int age_seconds,
+    bool wifi_ok,
+    int battery_pct,
+    bool battery_charging,
+    const char* weather_str, const char* uv_str,
+    bool rain_today, int rain_pct,
+    bool snow_today, bool clear_today)
+{
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now_t, &tm_now);
+    int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
+
+    int on_page = std::max(0, std::min(per_page, count - first));
+
+    // Sub-page or layout changed → clear the content area and lay out separators
+    bool full_redraw = (first != s_stocks_last_first || per_page != s_stocks_last_per_page);
+    if (full_redraw) {
+        s_stocks_last_first    = first;
+        s_stocks_last_per_page = per_page;
+        for (auto& c : s_stock_cells) c.status = -1;
+
+        const int rows_h = SCREEN_H - FOOTER_H - HEADER_H;
+        const int row_h  = rows_h / STOCK_ROWS;
+        gfx->fillRect(0, HEADER_H, SCREEN_W, rows_h, BLACK);
+        int rows_used = std::min(on_page, STOCK_ROWS);
+        for (int r = 0; r < rows_used - 1; r++)
+            gfx->drawFastHLine(0, HEADER_H + (r + 1) * row_h - 1, SCREEN_W, c_meta);
+        if (on_page == 0) {
+            String msg = "No tickers";
+            draw_text(msg, (SCREEN_W - text_w(msg, 2)) / 2, HEADER_H + rows_h / 2 - 8, 2, c_meta);
+        }
+    }
+
+    // Header: label carries the sub-page and "closed" marker, which only change
+    // on a sub-page switch (full_redraw) or on the hour (minute change)
+    if (full_redraw || cur_minute != s_stocks_last_minute ||
+        battery_pct != s_last_battery_pct || battery_charging != s_last_battery_charging) {
+        s_stocks_last_minute    = cur_minute;
+        s_last_battery_pct      = battery_pct;
+        s_last_battery_charging = battery_charging;
+        draw_header(label, page_idx, page_count, false, false, battery_pct, battery_charging);
+    }
+
+    // Cells: repaint only those whose displayed values changed
+    for (int s = 0; s < on_page; s++) {
+        const StockQuote& q = quotes[first + s];
+        StockCellState& c = s_stock_cells[s];
+        if (c.status == (int8_t)q.status && c.price == q.price && c.pct == q.change_pct) continue;
+        c = { (int8_t)q.status, q.price, q.change_pct };
+        draw_stock_cell(s, per_page, q);
+    }
+
+    int fy = SCREEN_H - FOOTER_H;
+    uint32_t wh = weather_hash(weather_str, uv_str, rain_today, rain_pct, snow_today, clear_today);
+    if (wh != s_stocks_weather_hash || full_redraw) {
+        s_stocks_weather_hash = wh;
+        draw_footer_static(fy, weather_str, uv_str, rain_today, rain_pct,
+                           snow_today, clear_today, false);
+    }
+    draw_footer_dynamic(fy, false, wifi_ok, age_seconds, false, 0, 0);
+}
+
 // ── Flight screen ─────────────────────────────────────────────────────────────
 
 // Small plane icon pointing right, centered at (cx, cy), ~14×10 px (header use)
@@ -1010,9 +1149,13 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
 
     bool no_signal = !fi.airborne && fi.dep_icao.isEmpty() && fi.arr_icao.isEmpty()
                      && fi.dep_time == 0 && fi.arr_time == 0;
+    // Flight phase from vertical rate: ±2.5 m/s ≈ ±500 ft/min
     String status_str;
-    if      (fi.airborne)                              status_str = "In flight";
+    if      (fi.airborne && fi.vert_rate >  2.5f)      status_str = "Climbing";
+    else if (fi.airborne && fi.vert_rate < -2.5f)      status_str = "Descending";
+    else if (fi.airborne)                              status_str = "Cruising";
     else if (fi.arr_time > 0 && now_t > fi.arr_time)  status_str = "Landed";
+    else if (fi.dep_actual && fi.arr_time > 0)         status_str = "In flight";  // coverage gap
     else if (fi.dep_time > 0 && now_t < fi.dep_time)  status_str = "Pre-flight";
     else if (!fi.on_ground && fi.dep_time > 0)         status_str = "In flight";
     else if (no_signal)                                status_str = "No signal";
@@ -1028,25 +1171,27 @@ static void draw_flight_content(time_t now_t, const FlightInfo& fi) {
     draw_text(arr_iata, SCREEN_W - PAD - arr_w,   APT_Y, 4, apt_col);
 
     // Departure / arrival times below airport codes
-    // Left-aligned under departure code; right-aligned under arrival code
+    // Left-aligned under departure code; right-aligned under arrival code.
+    // "~" marks an estimated arrival (computed from live position).
     char dep_tbuf[12] = "--:--";
-    char arr_tbuf[14] = "--:--";
+    char arr_tbuf[16] = "--:--";
     if (fi.dep_time > 0) {
         struct tm td; localtime_r(&fi.dep_time, &td);
         snprintf(dep_tbuf, sizeof(dep_tbuf), "%02d:%02d", td.tm_hour, td.tm_min);
     }
     if (fi.arr_time > 0) {
         struct tm ta; localtime_r(&fi.arr_time, &ta);
+        const char* est = fi.arr_estimated ? "~" : "";
         if (fi.dep_time > 0) {
             struct tm td2; localtime_r(&fi.dep_time, &td2);
             int delta_days = ta.tm_yday - td2.tm_yday;
             if (delta_days != 0)
-                snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d+%d",
-                         ta.tm_hour, ta.tm_min, delta_days);
+                snprintf(arr_tbuf, sizeof(arr_tbuf), "%s%02d:%02d+%d",
+                         est, ta.tm_hour, ta.tm_min, delta_days);
             else
-                snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
+                snprintf(arr_tbuf, sizeof(arr_tbuf), "%s%02d:%02d", est, ta.tm_hour, ta.tm_min);
         } else {
-            snprintf(arr_tbuf, sizeof(arr_tbuf), "%02d:%02d", ta.tm_hour, ta.tm_min);
+            snprintf(arr_tbuf, sizeof(arr_tbuf), "%s%02d:%02d", est, ta.tm_hour, ta.tm_min);
         }
     }
     uint16_t time_col = no_signal ? c_meta : c_row0;

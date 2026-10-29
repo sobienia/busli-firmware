@@ -42,6 +42,7 @@ static time_t s_stop_last_attempt[8] = {};
 // Flight state (registered via fetch_task_init_flights, managed on core 0)
 static int    s_flight_count = 0;
 static time_t s_flight_last_fetch[2] = {0, 0};
+static volatile bool s_flight_forced[2] = {false, false};  // set by main loop (long press)
 
 // Weather cache
 static WeatherData s_weather   = {};
@@ -70,6 +71,14 @@ static String s_parcel_status;
 static bool   s_parcel_changed     = false;
 static bool   s_parcel_ok          = false;  // at least one fetch succeeded
 static time_t s_parcel_delivered_at = 0;     // epoch when "Delivered" was first recorded
+
+// Stocks — s_stock_quotes[] is protected by s_mutex; scheduling state is core-0 only
+// except s_stock_forced[], which the main loop sets via fetch_task_force_stocks_refresh().
+static StockQuote    s_stock_quotes[STOCKS_MAX];
+static volatile int  s_stock_count = 0;
+static time_t        s_stock_last_attempt[STOCKS_MAX] = {};
+static bool          s_stock_need_close[STOCKS_MAX]   = {};  // last fetch was during market hours
+static volatile bool s_stock_forced[STOCKS_MAX]       = {};
 
 static void do_fetch(int idx) {
     std::vector<Departure> fresh;
@@ -176,6 +185,48 @@ static void do_fetch_parcel() {
         Serial.printf("[Parcel] Status changed → '%s'\n", new_status.c_str());
 }
 
+// A ticker is due when its refresh interval has passed and either the market is
+// open, it has no result yet, or it still needs the closing price (its last fetch
+// happened during market hours). A forced refresh skips all of that.
+static bool stock_due(int i, time_t now, bool market_open) {
+    if (s_stock_forced[i]) return true;
+    if (s_stock_last_attempt[i] != 0 && now - s_stock_last_attempt[i] < STOCKS_REFRESH_SEC)
+        return false;
+    if (market_open) return true;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool pending = (s_stock_quotes[i].status == STOCK_PENDING);
+    xSemaphoreGive(s_mutex);
+    return pending || s_stock_need_close[i];
+}
+
+static void do_fetch_stock(int i) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    String symbol = s_stock_quotes[i].symbol;
+    xSemaphoreGive(s_mutex);
+
+    StockQuote q;
+    http_lock_take();
+    StockFetchResult r = stocks_fetch_quote(symbol, q);
+    http_lock_give();
+
+    time_t now = time(nullptr);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    StockQuote& c = s_stock_quotes[i];
+    if (r == STOCK_FETCH_OK) {
+        c.status     = STOCK_OK;
+        c.price      = q.price;
+        c.change_pct = q.change_pct;
+        c.currency   = q.currency;
+        c.fetch_time = now;
+        s_stock_need_close[i] = stocks_market_open(now);
+    } else if (r == STOCK_FETCH_NOT_FOUND) {
+        c.status = STOCK_NOT_FOUND;
+        s_stock_need_close[i] = false;
+    }
+    // STOCK_FETCH_ERROR: keep the last good quote; retried after STOCKS_REFRESH_SEC
+    xSemaphoreGive(s_mutex);
+}
+
 static void fetch_task_loop(void* /*param*/) {
     // Fetch weather and commute immediately so data is available within seconds of boot.
     do_fetch_weather();
@@ -244,7 +295,8 @@ static void fetch_task_loop(void* /*param*/) {
         // ── Flights ───────────────────────────────────────────────────────────
         // Refresh one slot per loop iteration to avoid back-to-back blocking calls.
         for (int i = 0; i < s_flight_count; i++) {
-            if (now - s_flight_last_fetch[i] >= FLIGHT_REFRESH_SEC) {
+            if (s_flight_forced[i] || now - s_flight_last_fetch[i] >= FLIGHT_REFRESH_SEC) {
+                s_flight_forced[i] = false;
                 flight_tracker_refresh(i);
                 s_flight_last_fetch[i] = time(nullptr);
                 break;
@@ -274,6 +326,23 @@ static void fetch_task_loop(void* /*param*/) {
             if (now - last_pager_poll >= poll_sec) {
                 do_poll_pager();
                 last_pager_poll = time(nullptr);
+            }
+        }
+
+        // ── Stocks ────────────────────────────────────────────────────────────
+        // At most one ticker per iteration so transit refreshes stay responsive.
+        // Picks the ticker that has waited longest.
+        if (s_stock_count > 0) {
+            bool open = stocks_market_open(now);
+            int  pick = -1;
+            for (int i = 0; i < s_stock_count; i++) {
+                if (!stock_due(i, now, open)) continue;
+                if (pick < 0 || s_stock_last_attempt[i] < s_stock_last_attempt[pick]) pick = i;
+            }
+            if (pick >= 0) {
+                s_stock_forced[pick] = false;
+                do_fetch_stock(pick);
+                s_stock_last_attempt[pick] = time(nullptr);
             }
         }
 
@@ -403,6 +472,35 @@ void fetch_task_init_flights(const FlightEntry* entries, int count) {
     for (int i = 0; i < count; i++) s_flight_last_fetch[i] = 0; // trigger immediate fetch
 }
 
+void fetch_task_force_flight_refresh(int slot) {
+    if (slot >= 0 && slot < 2) s_flight_forced[slot] = true;
+}
+
 void fetch_task_notify_pager_activity() {
     s_pager_last_activity = time(nullptr);
+}
+
+void fetch_task_set_stocks(const String symbols[], int count) {
+    if (count > STOCKS_MAX) count = STOCKS_MAX;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < count; i++) {
+        s_stock_quotes[i]        = StockQuote();
+        s_stock_quotes[i].symbol = symbols[i];
+        s_stock_last_attempt[i]  = 0;   // fetch everything once at boot
+        s_stock_need_close[i]    = false;
+    }
+    s_stock_count = count;
+    xSemaphoreGive(s_mutex);
+}
+
+int fetch_task_get_stocks(StockQuote out[]) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = s_stock_count;
+    for (int i = 0; i < n; i++) out[i] = s_stock_quotes[i];
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+void fetch_task_force_stocks_refresh() {
+    for (int i = 0; i < STOCKS_MAX; i++) s_stock_forced[i] = true;
 }

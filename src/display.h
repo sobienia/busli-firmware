@@ -8,6 +8,7 @@
 #include <vector>
 #include "../include/flight_tracker.h"
 #include "../include/commute.h"
+#include "../include/stocks.h"
 
 // One transit departure (used by both display and api modules)
 struct Departure {
@@ -88,6 +89,31 @@ void display_draw_commute(
     int page_count,
     const CommuteData& data,
     int connection_idx,
+    bool wifi_ok,
+    int battery_pct,
+    bool battery_charging,
+    const char* weather_str,
+    const char* uv_str,
+    bool rain_today,
+    int  rain_pct,
+    bool snow_today,
+    bool clear_today
+);
+
+// Draw the stock ticker page (one sub-page of up to per_page tickers).
+// label:    header text, e.g. "Portfolio 1/2" or "Portfolio - closed"
+// quotes:   all configured tickers; first = index of the first one on this sub-page
+// per_page: 5 → large font, one column; 10 → small font, two columns of 5
+// Only cells whose quote changed are repainted, so updates don't flicker.
+void display_draw_stocks(
+    const char* label,
+    int page_idx,
+    int page_count,
+    const StockQuote quotes[],
+    int count,
+    int first,
+    int per_page,
+    int age_seconds,
     bool wifi_ok,
     int battery_pct,
     bool battery_charging,

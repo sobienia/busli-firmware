@@ -15,6 +15,22 @@
 static const char* NTFY_BASE  = "https://ntfy.sh";
 static const int   TIMEOUT_MS = 6000;
 
+// Polls overlap by POLL_OVERLAP_SEC so a message published in the same second as
+// the previous poll (or hidden by small clock skew vs. the server) isn't lost.
+// The overlap returns some messages twice, so recent message IDs are remembered
+// and repeats are dropped. Only touched from the fetch task (core 0).
+static const int POLL_OVERLAP_SEC = 10;
+static String    s_seen_ids[16];
+static int       s_seen_next = 0;
+
+static bool seen_before(const char* id) {
+    if (!id || !*id) return false;
+    for (const String& s : s_seen_ids) if (s == id) return true;
+    s_seen_ids[s_seen_next] = id;
+    s_seen_next = (s_seen_next + 1) % 16;
+    return false;
+}
+
 String pager_generate_topic() {
     char buf[24];
     snprintf(buf, sizeof(buf), "busli-%08lx%08lx",
@@ -61,7 +77,7 @@ bool pager_poll(const String& own_topic, time_t& last_poll_time,
     http.setReuse(false);
 
     String url = String(NTFY_BASE) + "/" + own_topic + "/json?poll=1&since=";
-    url += String((long)(last_poll_time > 0 ? last_poll_time : now));
+    url += String((long)(last_poll_time > 0 ? last_poll_time - POLL_OVERLAP_SEC : now));
 
     if (!http.begin(wc, url)) return false;
     int code = http.GET();
@@ -85,6 +101,7 @@ bool pager_poll(const String& own_topic, time_t& last_poll_time,
         JsonDocument doc;
         if (deserializeJson(doc, line)) continue;
         if (strcmp(doc["event"] | "", "message") != 0) continue;
+        if (seen_before(doc["id"] | "")) continue;
         const char* msg = doc["message"] | (const char*)nullptr;
         if (!msg || !*msg) continue;
 

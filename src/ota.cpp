@@ -75,7 +75,10 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
     WiFiClientSecure wc;
     wc.setInsecure();
     HTTPClient http;
-    http.setTimeout(120000);
+    // setTimeout() takes a uint16_t (max 65535 ms) — it's a per-read timeout, not a
+    // total. The overall stall guard is OTA_STALL_MS in the download loop below.
+    http.setTimeout(30000);
+    http.setConnectTimeout(15000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
     http_lock_take();
@@ -106,38 +109,65 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
     }
 
     WiFiClient* stream = http.getStreamPtr();
-    uint8_t buf[1024];
-    int written = 0;
-    int last_reported_pct = -1;
-    uint32_t deadline = millis() + 120000UL;
+    if (!stream) {
+        Update.abort();
+        http.end(); http_lock_give();
+        Serial.println("[OTA] No stream");
+        return false;
+    }
+
+    // Abort if no data arrives for this long. Resets on every chunk, so a slow
+    // but steady connection can take as long as it needs.
+    const uint32_t OTA_STALL_MS = 30000;
+    uint8_t  buf[1024];
+    int      written = 0;
+    int      last_reported_pct = -1;
+    int      last_logged_kb    = 0;
+    uint32_t last_data_ms = millis();
+    bool     write_failed = false;
 
     if (progress_cb) progress_cb(0);
 
-    while (written < total && millis() < deadline) {
+    while (written < total && millis() - last_data_ms < OTA_STALL_MS) {
         int av = stream->available();
-        if (av > 0) {
-            int n = stream->readBytes(buf, min(av, (int)sizeof(buf)));
-            Update.write(buf, n);
-            written += n;
-            int pct = written * 100 / total;
-            if (progress_cb && pct != last_reported_pct) {
-                last_reported_pct = pct;
-                progress_cb(pct);
-            }
-            if (written % 65536 == 0)
-                Serial.printf("[OTA] %d / %d bytes (%d%%)\n", written, total, pct);
-        } else {
+        if (av <= 0) {
+            if (!stream->connected()) break;
             delay(1);
+            continue;
+        }
+        int n = stream->readBytes(buf, min(av, (int)sizeof(buf)));
+        if (n <= 0) continue;
+        if (Update.write(buf, n) != (size_t)n) {
+            Serial.printf("[OTA] Update.write failed: %s\n", Update.errorString());
+            write_failed = true;
+            break;
+        }
+        written     += n;
+        last_data_ms = millis();
+        int pct = (int)((int64_t)written * 100 / total);
+        if (progress_cb && pct != last_reported_pct) {
+            last_reported_pct = pct;
+            progress_cb(pct);
+        }
+        if (written / 65536 != last_logged_kb) {
+            last_logged_kb = written / 65536;
+            Serial.printf("[OTA] %d / %d bytes (%d%%)\n", written, total, pct);
         }
     }
 
     http.end();
     http_lock_give();
 
-    if (!Update.end(true)) {
+    // Never finalize a partial image — Update.end(true) would try to boot it.
+    if (write_failed || written < total) {
+        Serial.printf("[OTA] Download incomplete (%d / %d bytes) — aborting\n", written, total);
+        Update.abort();
+        return false;
+    }
+    if (!Update.end()) {
         Serial.printf("[OTA] Update.end failed: %s\n", Update.errorString());
         return false;
     }
     Serial.printf("[OTA] Flash complete (%d bytes written)\n", written);
-    return written >= total;
+    return true;
 }

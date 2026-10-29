@@ -14,7 +14,7 @@ static String url_encode(const String& s) {
     out.reserve(s.length() * 3);
     for (size_t i = 0; i < s.length(); i++) {
         char c = s[i];
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+        if (isalnum((uint8_t)c) || c == '-' || c == '_' || c == '.' || c == '~') {
             out += c;
         } else {
             char hex[4];
@@ -233,6 +233,8 @@ bool commute_fetch(const String& from_station, const String& to_station, Commute
                     buf_len += got;
                 }
                 rem -= got;
+            } else if (!stream.connected() && !stream.available()) {
+                break;   // server closed early — don't spin until the deadline
             } else { delay(1); }
         }
     }
