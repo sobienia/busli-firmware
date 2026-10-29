@@ -50,6 +50,7 @@
 #define NVS_KEY_NIGHT       "night"
 #define NVS_KEY_WX_PAGE     "wx_page"
 #define NVS_KEY_WX_LOCS     "wx_locs"
+#define NVS_KEY_INFO_PAGE   "info_page"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -67,10 +68,14 @@ static bool       s_web_enabled  = false;  // serving on the normal Wi-Fi too
 // until the next reboot. Wrong codes are limited per code.
 static const uint32_t PAIR_CODE_TTL_MS  = 120000;
 static const int      PAIR_MAX_ATTEMPTS = 5;
-static String   s_session_token;              // "" = no browser paired yet
-static String   s_pair_code;                  // "" = no code showing
+// Paired browsers (phone, laptop, …): the oldest is replaced when all are in use
+static const int SESSION_SLOTS = 4;
+static String   s_sessions[SESSION_SLOTS];
+static int      s_session_next = 0;
+static String   s_pair_code;                  // "" = no code active
 static uint32_t s_pair_started_ms = 0;
 static int      s_pair_attempts   = 0;
+static bool     s_pair_on_screen  = false;    // code shown as text via the callback
 static void   (*s_pair_cb)(const char* code) = nullptr;
 
 static String random_hex(int bytes) {
@@ -83,10 +88,18 @@ static String random_hex(int bytes) {
     return s;
 }
 
+// Forget the active code; if it's shown as text on screen, close that.
 static void pair_code_clear() {
     if (s_pair_code.isEmpty()) return;
     s_pair_code = "";
-    if (s_pair_cb) s_pair_cb(nullptr);
+    if (s_pair_cb && s_pair_on_screen) s_pair_cb(nullptr);
+    s_pair_on_screen = false;
+}
+
+static void pair_code_new() {
+    s_pair_code       = String(100000 + esp_random() % 900000);
+    s_pair_started_ms = millis();
+    s_pair_attempts   = 0;
 }
 
 static bool from_setup_hotspot() {
@@ -96,8 +109,10 @@ static bool from_setup_hotspot() {
 
 static bool authorized() {
     if (from_setup_hotspot()) return true;
-    if (s_session_token.isEmpty()) return false;
-    return s_server.header("Cookie").indexOf("busli_s=" + s_session_token) >= 0;
+    String cookie = s_server.header("Cookie");
+    for (const String& t : s_sessions)
+        if (t.length() && cookie.indexOf("busli_s=" + t) >= 0) return true;
+    return false;
 }
 
 static void send_forbidden() {
@@ -283,6 +298,14 @@ bool config_load_weather_page() {
     return on;
 }
 
+bool config_load_info_page() {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    bool on = prefs.getBool(NVS_KEY_INFO_PAGE, true);
+    prefs.end();
+    return on;
+}
+
 void config_load_weather_locations(WeatherLocations& out) {
     out = WeatherLocations();
     Preferences prefs;
@@ -322,16 +345,18 @@ void config_load_night(NightConfig& out) {
     if (json.isEmpty()) return;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return;
-    out.start_min  = constrain(doc["s"] | out.start_min, 0, 1439);
-    out.end_min    = constrain(doc["e"] | out.end_min,   0, 1439);
-    out.screen_off = doc["o"] | false;
+    out.start_min = constrain(doc["s"] | out.start_min, 0, 1439);
+    out.end_min   = constrain(doc["e"] | out.end_min,   0, 1439);
+    // "m" = mode (v1.7.2+); older firmware stored only "o" (true = screen off)
+    out.mode = doc["m"].isNull() ? ((doc["o"] | false) ? NIGHT_OFF : NIGHT_DIM)
+                                 : constrain((int)doc["m"], (int)NIGHT_DIM, (int)NIGHT_CLOCK);
 }
 
 static void config_save_night(const NightConfig& cfg) {
     JsonDocument doc;
     doc["s"] = cfg.start_min;
     doc["e"] = cfg.end_min;
-    doc["o"] = cfg.screen_off;
+    doc["m"] = cfg.mode;
     String json;
     serializeJson(doc, json);
     Preferences prefs;
@@ -851,24 +876,38 @@ static String build_page(String ssids[], String passes[], String users[],
     }
     h += F("</div>");
 
+    // ── Device info page ─────────────────────────────────────────────────────
+    h += "<h2>Device info page</h2><div class='card'>"
+         "<label style='display:flex;align-items:center;gap:10px;cursor:pointer;color:#ddd'>"
+         "<input type='checkbox' name='info_page' value='1' style='width:auto'"
+         + String(config_load_info_page() ? " checked" : "") + "><span>Show the device info page</span></label>"
+         "<p class='hint' style='margin-top:6px'>Firmware, Wi-Fi signal, address, battery, uptime "
+         "and whether each data source is working &mdash; handy when something doesn't update.</p></div>";
+
     // ── Night mode section ───────────────────────────────────────────────────
     h += F("<h2>Night mode</h2><div class='card'>"
-           "<p class='hint' style='margin:0 0 8px'>During these hours the screen is dimmed or "
-           "switched off, and departures refresh less often to save power. "
+           "<p class='hint' style='margin:0 0 8px'>During these hours the screen is dimmed, "
+           "switched off or shows a clock, and departures refresh less often to save power. "
            "Set both times equal to disable.</p>"
            "<div style='display:flex;gap:12px'>");
     h += "<div style='flex:1'><label>From</label><input type='time' name='nt_s' value='"
          + hhmm(night.start_min) + "'></div>"
          "<div style='flex:1'><label>Until</label><input type='time' name='nt_e' value='"
          + hhmm(night.end_min) + "'></div></div>";
-    h += "<label style='display:flex;align-items:center;gap:10px;margin-top:12px;color:#ddd'>"
-         "<input type='radio' name='nt_o' value='0' style='width:auto'"
-         + String(night.screen_off ? "" : " checked") + "> Dim the screen</label>"
-         "<label style='display:flex;align-items:center;gap:10px;color:#ddd'>"
-         "<input type='radio' name='nt_o' value='1' style='width:auto'"
-         + String(night.screen_off ? " checked" : "") + "> Turn the screen off "
-         "<span class='hint' style='margin:0'>(touch or any button wakes it for "
-         + String(WAKE_ON_TOUCH_SEC) + "&nbsp;s)</span></label>";
+    {
+        const char* labels[] = { "Dim the screen", "Turn the screen off", "Show a large dim clock" };
+        for (int m = NIGHT_DIM; m <= NIGHT_CLOCK; m++) {
+            h += "<label style='display:flex;align-items:center;gap:10px;color:#ddd";
+            if (m == NIGHT_DIM) h += ";margin-top:12px";
+            h += "'><input type='radio' name='nt_m' value='" + String(m) + "' style='width:auto'";
+            if (night.mode == m) h += " checked";
+            h += "> ";
+            h += labels[m];
+            h += "</label>";
+        }
+        h += "<p class='hint' style='margin-top:6px'>Screen off / clock: touch or any button shows "
+             "the normal pages for " + String(WAKE_ON_TOUCH_SEC) + "&nbsp;s.</p>";
+    }
     h += F("</div>");
 
     // ── Updates section ──────────────────────────────────────────────────────
@@ -1032,10 +1071,9 @@ static const char PAGE_HEAD[] PROGMEM =
 
 // Pairing page for the normal-Wi-Fi settings: shows a code on the device screen
 static void send_pair_page(const char* error) {
-    if (s_pair_code.isEmpty() || millis() - s_pair_started_ms > PAIR_CODE_TTL_MS) {
-        s_pair_code = String(100000 + esp_random() % 900000);
-        s_pair_started_ms = millis();
-        s_pair_attempts   = 0;
+    if (s_pair_code.isEmpty() || millis() - s_pair_started_ms > PAIR_CODE_TTL_MS || !s_pair_on_screen) {
+        if (s_pair_code.isEmpty() || millis() - s_pair_started_ms > PAIR_CODE_TTL_MS) pair_code_new();
+        s_pair_on_screen = true;
         if (s_pair_cb) s_pair_cb(s_pair_code.c_str());
         Serial.println("[Web] Pairing code shown on screen");
     }
@@ -1054,10 +1092,19 @@ static void handle_pair() {
     String code = s_server.arg("code"); code.trim();
     bool expired = s_pair_code.isEmpty() || millis() - s_pair_started_ms > PAIR_CODE_TTL_MS;
     if (!expired && code == s_pair_code) {
-        s_session_token = random_hex(16);
-        pair_code_clear();
+        String token = random_hex(16);
+        s_sessions[s_session_next] = token;
+        s_session_next = (s_session_next + 1) % SESSION_SLOTS;
+        // The code stays valid until it expires: phone scanners often open the
+        // link once in the background for a preview, and that must not use it up
+        // before the real visit. The screen closes the code/QR right away though.
+        if (s_pair_cb) s_pair_cb(nullptr);
+        s_pair_on_screen = false;
         Serial.println("[Web] Browser paired");
-        s_server.sendHeader("Set-Cookie", "busli_s=" + s_session_token + "; Path=/; HttpOnly; SameSite=Strict");
+        // SameSite=Lax, not Strict: Strict cookies aren't sent when the page is
+        // opened from another app (the camera's QR scanner), so the browser would
+        // look unpaired. Lax still blocks other websites from posting to /save.
+        s_server.sendHeader("Set-Cookie", "busli_s=" + token + "; Path=/; HttpOnly; SameSite=Lax");
         s_server.sendHeader("Location", "/", true);
         s_server.send(303, "text/plain", "");
         return;
@@ -1204,13 +1251,14 @@ static void handle_save() {
     NightConfig new_night;
     new_night.start_min  = parse_hhmm(s_server.arg("nt_s"), new_night.start_min);
     new_night.end_min    = parse_hhmm(s_server.arg("nt_e"), new_night.end_min);
-    new_night.screen_off = s_server.arg("nt_o") == "1";
+    new_night.mode = constrain(s_server.arg("nt_m").toInt(), (int)NIGHT_DIM, (int)NIGHT_CLOCK);
     config_save_night(new_night);
 
     {
         Preferences prefs;
         prefs.begin(NVS_NAMESPACE, false);
         prefs.putBool(NVS_KEY_WX_PAGE, s_server.arg("wx_page") == "1");
+        prefs.putBool(NVS_KEY_INFO_PAGE, s_server.arg("info_page") == "1");
         prefs.end();
     }
     {
@@ -1433,6 +1481,7 @@ static void ensure_routes() {
     routes_added = true;
     s_server.on("/",            HTTP_GET,  handle_root);
     s_server.on("/pair",        HTTP_POST, handle_pair);
+    s_server.on("/pair",        HTTP_GET,  handle_pair);   // QR link: /pair?code=…
     s_server.on("/save",        HTTP_POST, handle_save);
     s_server.on("/stations",    HTTP_GET,  handle_stations);
     s_server.on("/pager_test",  HTTP_GET,  handle_pager_test);
@@ -1459,6 +1508,14 @@ static void finish_save_and_restart() {
 
 void config_web_set_pairing_callback(void (*cb)(const char* code)) { s_pair_cb = cb; }
 
+String config_web_pair_url() {
+    if (!s_web_enabled || WiFi.status() != WL_CONNECTED) return "";
+    // A fresh one-time code, only ever shown inside the QR code on screen
+    pair_code_new();
+    s_pair_on_screen = false;
+    return "http://" + WiFi.localIP().toString() + "/pair?code=" + s_pair_code;
+}
+
 void config_web_begin() {
     ensure_routes();
     s_web_enabled = true;
@@ -1475,7 +1532,7 @@ void config_web_poll() {
     if (s_saved) finish_save_and_restart();
 }
 
-void config_portal_run(uint32_t timeoutMs) {
+void config_portal_run(uint32_t timeoutMs, bool (*should_cancel)()) {
     Serial.println("[Portal] Starting config portal...");
     display_show_status("Configure device");
     pair_code_clear();
@@ -1504,19 +1561,20 @@ void config_portal_run(uint32_t timeoutMs) {
 
     ensure_routes();
 
-    // Show connection instructions on screen — two centered lines
-    char portal_msg[120];
-    snprintf(portal_msg, sizeof(portal_msg),
-             "Connect to: %s\nThen open: %s\nFirmware %s",
-             PORTAL_SSID, ip.toString().c_str(), FIRMWARE_VERSION);
-    display_show_status(portal_msg);
+    // QR codes: one joins the hotspot, one opens the page (phones usually open
+    // it by themselves after joining, thanks to the captive-portal DNS)
+    String url = "http://" + ip.toString() + "/";
+    display_show_setup_qr(PORTAL_SSID, url.c_str());
 
     uint32_t start = millis();
     while (!s_saved) {
         s_dns.processNextRequest();
         s_server.handleClient();
-        if (timeoutMs > 0 && millis() - start > timeoutMs) {
-            Serial.println("[Portal] Timeout — returning to normal boot");
+        bool timed_out = timeoutMs > 0 && millis() - start > timeoutMs;
+        bool cancelled = !timed_out && should_cancel && should_cancel();
+        if (timed_out || cancelled) {
+            Serial.println(cancelled ? "[Portal] Cancelled — back to normal"
+                                     : "[Portal] Timeout — returning to normal boot");
             s_dns.stop();
             WiFi.softAPdisconnect(true);   // back to STA-only; an existing link stays up
             if (sta_online) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);

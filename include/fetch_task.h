@@ -16,6 +16,18 @@ struct StopCache {
     bool   ever_fetched = false;
 };
 
+// Health of each data source, for the device info page
+enum DataSource {
+    SRC_DEPARTURES, SRC_WEATHER, SRC_COMMUTE, SRC_STOCKS, SRC_PARCEL, SRC_PAGER,
+    SRC_COUNT
+};
+struct SourceStatus {
+    bool   used      = false;  // attempted at least once (= configured)
+    time_t last_ok   = 0;
+    time_t last_fail = 0;
+};
+void fetch_task_get_source_status(SourceStatus out[SRC_COUNT]);
+
 // How eagerly to refresh transit data (see TRANSIT_*_SEC in config.h)
 enum FetchPower {
     FETCH_POWER_NORMAL,      // day: visible stop every 30 s

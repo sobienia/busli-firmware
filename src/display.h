@@ -182,6 +182,33 @@ void display_draw_stock_detail(const char* label, int page_idx, int page_count,
 void display_draw_weather(const char* label, int page_idx, int page_count,
                           const WeatherDetail* d, bool not_found, const FooterInfo& footer);
 
+// One "label  value" line on an info page. state: 0 = normal, 1 = good, 2 = problem
+struct InfoRow {
+    String  label;
+    String  value;
+    uint8_t state = 0;
+    InfoRow() {}
+    InfoRow(const String& l, const String& v, uint8_t s = 0) : label(l), value(v), state(s) {}
+};
+
+// Two-column list page (device info). Repaints only when the text changes.
+void display_draw_info(const char* label, int page_idx, int page_count,
+                       const InfoRow* left, int n_left,
+                       const InfoRow* right, int n_right,
+                       const FooterInfo& footer);
+
+// Setup hotspot screen: two QR codes — "1. Join Wi-Fi" (joins the hotspot) and
+// "2. Open settings" (opens the page) — plus the same in words.
+void display_show_setup_qr(const char* ssid, const char* url);
+
+// Settings shortcut: one QR code that opens (and pairs) the settings page on
+// the normal Wi-Fi, with the address in words beside it.
+void display_show_settings_qr(const char* url, const char* hostname, const char* ip);
+
+// Night clock: large dim HH:MM with a small line underneath (e.g. date + temp).
+// Repaints once a minute.
+void display_draw_night_clock(const char* subtitle);
+
 // Boot animation (Matrix-style cascading characters).
 // Start it before the blocking setup steps; update the status text as each
 // phase begins; stop it when the board is ready to appear.

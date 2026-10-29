@@ -75,11 +75,16 @@ struct StocksConfig {
     int    rotate_sec = STOCKS_ROTATE_SEC_DEFAULT;  // sub-page rotation interval
 };
 
-// Night mode: dim or switch off the screen during these hours.
+// Night mode: what the screen does during these hours.
+enum NightMode {
+    NIGHT_DIM   = 0,   // normal pages at night brightness
+    NIGHT_OFF   = 1,   // screen off; touch/button wakes it for WAKE_ON_TOUCH_SEC
+    NIGHT_CLOCK = 2,   // large dim clock; touch/button shows the pages for a while
+};
 struct NightConfig {
-    int  start_min  = NIGHT_START_HOUR * 60;  // minutes after midnight
-    int  end_min    = NIGHT_END_HOUR * 60;    // start == end → night mode off
-    bool screen_off = false;                  // false = dim, true = screen off (touch wakes)
+    int start_min = NIGHT_START_HOUR * 60;  // minutes after midnight
+    int end_min   = NIGHT_END_HOUR * 60;    // start == end → night mode off
+    int mode      = NIGHT_DIM;
 };
 
 // Load night-mode settings (defaults when nothing is saved).
@@ -87,6 +92,9 @@ void config_load_night(NightConfig& out);
 
 // Show the weather page in the page cycle? (default: yes)
 bool config_load_weather_page();
+
+// Show the device info page in the page cycle? (default: yes)
+bool config_load_info_page();
 
 // Weather page locations, in swipe order: the device's own location (unless
 // turned off) followed by up to WEATHER_TOWNS_MAX towns typed in Settings.
@@ -104,10 +112,10 @@ bool config_load_stocks(StocksConfig& out);
 // Persist stock config to NVS (removes the key when no tickers are set).
 void config_save_stocks(const StocksConfig& cfg);
 
-// Run the AP config portal. Blocks until the user saves (then reboots)
-// or until timeoutMs elapses (then returns so normal boot can continue).
-// Pass timeoutMs=0 for no timeout.
-void config_portal_run(uint32_t timeoutMs = 0);
+// Run the AP config portal. Blocks until the user saves (then reboots), until
+// timeoutMs elapses (0 = no timeout), or until should_cancel() returns true
+// (e.g. the screen was touched) — then returns so normal operation continues.
+void config_portal_run(uint32_t timeoutMs = 0, bool (*should_cancel)() = nullptr);
 
 // ── Settings page on the normal Wi-Fi (http://busli.local or the device IP) ──
 // Start serving the settings page on the home network. Call once WiFi is up.
@@ -117,5 +125,10 @@ void config_web_begin();
 void config_web_poll();
 
 // Called with the 6-digit pairing code when a browser asks to pair (show it on
-// screen), and with nullptr when the code is used up or expires (hide it).
+// screen), and with nullptr when the code is used up or expires (hide it) — or
+// when a phone has just paired through the QR link.
 void config_web_set_pairing_callback(void (*cb)(const char* code));
+
+// Link for the settings QR code: opens the page and pairs in one step (the
+// one-time code is part of the link). "" when not connected to Wi-Fi.
+String config_web_pair_url();

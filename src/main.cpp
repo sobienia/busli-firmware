@@ -26,6 +26,7 @@
 #include "weather.h"
 #include "../include/flight_tracker.h"
 #include <esp_wifi.h>
+#include <esp_system.h>
 
 // loop() makes HTTPS calls (pager send, config-portal Check/Test buttons). A TLS
 // handshake needs more stack than the default 8 KB loopTask — overflowing it
@@ -116,7 +117,7 @@ static void setup_stops() {
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 struct PageInfo {
-    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK, STOCKS, WEATHER } type;
+    enum Type { TRANSIT, COMMUTE_HOME, COMMUTE_WORK, STOCKS, WEATHER, DEVICE } type;
     int transit_idx; // only meaningful for TRANSIT pages
 };
 static PageInfo g_pages[12];
@@ -206,6 +207,10 @@ static int        g_battery_warned_at = 101;  // lowest warning level already sh
 // this millis() deadline or until the screen is touched. 0 = no overlay.
 static uint32_t   g_overlay_until_ms = 0;
 
+// A press that already did its job (woke the screen, closed an overlay) is
+// ignored until released, so it doesn't also tap/swipe the page underneath.
+static bool       g_input_swallowed  = false;
+
 // Button debounce state — BOOT button
 static bool     button_was_pressed    = false;
 static uint32_t button_press_start_ms = 0;
@@ -251,11 +256,21 @@ static void setup_pages() {
     if (weather_page && g_num_pages < 12) {
         g_pages[g_num_pages++] = { PageInfo::WEATHER, 0 };
     }
-    Serial.printf("[Pages] %d pages (%d transit, commute %s, stocks %s, weather %s)\n",
+    bool info_page = config_load_info_page();
+    if (info_page && g_num_pages < 12) {
+        g_pages[g_num_pages++] = { PageInfo::DEVICE, 0 };
+    }
+    Serial.printf("[Pages] %d pages (%d transit, commute %s, stocks %s, weather %s, info %s)\n",
                   g_num_pages, g_num_stops,
                   commute_configured() ? "on" : "off",
                   g_stocks_cfg.count > 0 ? "on" : "off",
-                  weather_page ? "on" : "off");
+                  weather_page ? "on" : "off",
+                  info_page ? "on" : "off");
+}
+
+static bool is_commute_page() {
+    PageInfo::Type t = g_pages[g_current_page].type;
+    return t == PageInfo::COMMUTE_HOME || t == PageInfo::COMMUTE_WORK;
 }
 
 // Number of ticker groups on the stocks page (each fits on one screen).
@@ -439,12 +454,31 @@ static void sync_clock() {
                   t.tm_hour, t.tm_min, t.tm_sec);
 }
 
+// Keep whatever was just drawn on screen for duration_ms (touch dismisses it).
+static void hold_overlay(uint32_t duration_ms) {
+    g_overlay_until_ms = millis() + duration_ms;
+    if (g_overlay_until_ms == 0) g_overlay_until_ms = 1;
+}
+
 // Show a message over the current page for duration_ms (touch dismisses it).
 static void show_overlay(const char* msg, uint32_t duration_ms) {
     display_set_screen_on(true);   // also during screen-off night mode
     display_show_status(msg);
-    g_overlay_until_ms = millis() + duration_ms;
-    if (g_overlay_until_ms == 0) g_overlay_until_ms = 1;
+    hold_overlay(duration_ms);
+}
+
+// QR code that opens the settings page already paired (BOOT 1–3 s, or a tap on
+// the Device page). Closes itself once the phone has paired, or after a minute.
+static void show_settings_qr() {
+    String url = config_web_pair_url();
+    if (url.isEmpty()) {
+        show_overlay("Not connected to Wi-Fi\nHold the button 3 s\nfor the setup hotspot", 8000);
+        return;
+    }
+    display_set_screen_on(true);
+    display_show_settings_qr(url.c_str(), WEB_HOSTNAME, WiFi.localIP().toString().c_str());
+    hold_overlay(60000);
+    Serial.println("[Web] Settings QR code shown");
 }
 
 // Settings on the normal Wi-Fi: show the pairing code while a browser waits for it
@@ -462,10 +496,12 @@ static void on_pairing_code(const char* code) {
 
 static bool overlay_active() {
     if (g_overlay_until_ms == 0) return false;
-    if ((int32_t)(millis() - g_overlay_until_ms) >= 0 || touch_is_pressed()) {
+    bool touched = touch_is_pressed();
+    if ((int32_t)(millis() - g_overlay_until_ms) >= 0 || touched) {
         g_overlay_until_ms = 0;
         last_redraw_ms     = 0;   // repaint the page right away
         g_pager_dirty      = true;
+        if (touched) g_input_swallowed = true;   // the closing touch does nothing else
         return false;
     }
     return true;
@@ -474,14 +510,15 @@ static bool overlay_active() {
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  SCREEN POWER — night mode (dim or off) and wake-on-touch                 ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
-// In "screen off" night mode any touch or button wakes the screen for
-// WAKE_ON_TOUCH_SEC (each further interaction extends it). The press that wakes
-// the screen is swallowed, so it doesn't also switch pages or open menus.
+// In the "screen off" and "clock" night modes the normal pages are hidden at
+// night; any touch or button shows them for WAKE_ON_TOUCH_SEC (each further
+// interaction extends it). The press that wakes them is swallowed, so it
+// doesn't also switch pages or open menus.
 
 static NightConfig g_night;
 static bool        g_woken           = false;
 static uint32_t    g_woke_at_ms      = 0;
-static bool        g_input_swallowed = false;
+static bool        g_clock_showing   = false;   // night clock instead of the pages
 
 static bool any_input_down() {
     return touch_is_pressed() ||
@@ -490,36 +527,69 @@ static bool any_input_down() {
            digitalRead(PIN_BTN_THEME)   == LOW;
 }
 
+// Setup hotspot: any touch or button press goes back to normal operation
+static bool portal_cancel_requested() {
+    touch_poll();
+    return any_input_down();
+}
+
+// Run the setup hotspot; afterwards repaint the page, and ignore the press that
+// cancelled it until it's released
+static void run_setup_portal() {
+    config_portal_run(PORTAL_TIMEOUT_MS, portal_cancel_requested);   // reboots on save
+    if (any_input_down()) g_input_swallowed = true;
+    last_redraw_ms = 0;
+    g_pager_dirty  = true;
+    display_invalidate();
+}
+
 // Updates screen power and the fetch rate. Returns true while input must be
 // ignored (from the waking press until it is released, inclusive).
 static bool power_tick() {
-    bool night    = display_is_night();
-    bool off_mode = g_night.screen_off && night;
-    bool input    = any_input_down();
+    bool night     = display_is_night();
+    bool hide_mode = night && g_night.mode != NIGHT_DIM;   // pages hidden unless woken
+    bool input     = any_input_down();
 
-    if (input && off_mode) {
-        if (!display_screen_on()) g_input_swallowed = true;
+    if (input && hide_mode) {
+        bool pages_visible = display_screen_on() && !g_clock_showing;
+        if (!pages_visible) g_input_swallowed = true;
         g_woken      = true;
         g_woke_at_ms = millis();
     }
     if (g_woken && millis() - g_woke_at_ms >= WAKE_ON_TOUCH_SEC * 1000UL) g_woken = false;
 
-    // Overlays (pairing code, warnings) keep the screen on while they show
-    bool want_on = !off_mode || g_woken || g_overlay_until_ms != 0;
+    // Overlays (pairing code, warnings) count as awake while they show
+    bool idle    = hide_mode && !g_woken && g_overlay_until_ms == 0;
+    bool want_on = !(idle && g_night.mode == NIGHT_OFF);
+    bool clock   = idle && g_night.mode == NIGHT_CLOCK;
+
     if (want_on != display_screen_on()) {
         display_set_screen_on(want_on);
         if (want_on) {
             last_redraw_ms = 0;
             g_pager_dirty  = true;
-            fetch_task_force_refresh();   // data was refreshed rarely while off
         }
     }
-    fetch_task_set_power_mode(!want_on ? FETCH_POWER_SCREEN_OFF
-                              : night  ? FETCH_POWER_NIGHT
-                                       : FETCH_POWER_NORMAL);
+    if (clock != g_clock_showing) {
+        g_clock_showing = clock;
+        display_invalidate();
+        last_redraw_ms = 0;
+        g_pager_dirty  = true;
+    }
+    // Pages becoming visible again → their data was refreshed rarely meanwhile
+    static bool was_idle = false;
+    if (was_idle && !idle) fetch_task_force_refresh();
+    was_idle = idle;
+
+    fetch_task_set_power_mode(idle  ? FETCH_POWER_SCREEN_OFF
+                              : night ? FETCH_POWER_NIGHT
+                                      : FETCH_POWER_NORMAL);
 
     bool swallow = g_input_swallowed;
-    if (!input) g_input_swallowed = false;
+    if (!input && swallow) {
+        g_input_swallowed = false;
+        touch_cancel_pending();   // its tap would otherwise arrive ~350 ms later
+    }
     return swallow;
 }
 
@@ -560,6 +630,7 @@ static void update_weather_place() {
         case PageInfo::COMMUTE_HOME: fetch_task_set_weather_place(WEATHER_PLACE_WORK);   break;  // from work
         case PageInfo::STOCKS:       fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
         case PageInfo::WEATHER:      fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
+        case PageInfo::DEVICE:       break;   // footer shows the settings address, not weather
     }
 }
 
@@ -612,23 +683,18 @@ static void check_button() {
         uint32_t held_ms = millis() - button_press_start_ms;
         if (held_ms >= CONFIG_HOLD_MS && config_hint_stage < 2) {
             config_hint_stage = 2;
-            display_show_status("Release to configure");
+            display_show_status("Release for the\nsetup hotspot");
         } else if (held_ms >= CONFIG_HINT_MS && config_hint_stage < 1) {
             config_hint_stage = 1;
-            if (WiFi.status() == WL_CONNECTED) {
-                // Also point to the settings page on the normal Wi-Fi
-                char msg[128];
-                snprintf(msg, sizeof(msg),
-                         "Hold to configure...\n\nOr on this Wi-Fi open\n%s.local\n%s",
-                         WEB_HOSTNAME, WiFi.localIP().toString().c_str());
-                display_show_status(msg);
-            } else {
-                display_show_status("Hold to configure...");
-            }
+            if (WiFi.status() == WL_CONNECTED)
+                display_show_status("Release now: settings QR code\n\nKeep holding:\nsetup hotspot");
+            else
+                display_show_status("Keep holding for the\nsetup hotspot...");
         }
     } else if (!pressed && button_was_pressed) {
         uint32_t held_ms = millis() - button_press_start_ms;
-        if (config_hint_stage > 0) {
+        int stage = config_hint_stage;
+        if (stage > 0) {
             // Prompt covered the screen — repaint whatever was showing
             last_redraw_ms = 0;
             g_pager_dirty  = true;
@@ -636,11 +702,10 @@ static void check_button() {
         config_hint_stage = 0;
         if (held_ms >= CONFIG_HOLD_MS) {
             Serial.println("[Button] 3s hold → config portal");
-            config_portal_run(PORTAL_TIMEOUT_MS);  // reboots on save; returns on timeout
-        } else if (held_ms >= TOUCH_LONG_PRESS_MS) {
-            Serial.println("[Button] Long press → force refresh");
-            if (g_pages[g_current_page].type == PageInfo::STOCKS) fetch_task_force_stocks_refresh();
-            else                                                   fetch_task_force_refresh();
+            run_setup_portal();
+        } else if (stage == 1) {
+            Serial.println("[Button] 1–3 s hold → settings QR code");
+            show_settings_qr();
         } else if (held_ms >= 50) {
             Serial.println("[Button] Short press → prev page");
             switch_page((g_current_page - 1 + g_num_pages) % g_num_pages);
@@ -796,7 +861,7 @@ static void check_touch(TouchGesture gesture) {
                 fetch_task_force_stocks_refresh();
             } else if (g_pages[g_current_page].type == PageInfo::WEATHER) {
                 fetch_task_force_weather_refresh();
-            } else {
+            } else if (is_commute_page()) {
                 // Commute: ask background task to re-fetch on its next iteration
                 fetch_task_force_commute_refresh();
             }
@@ -835,7 +900,7 @@ static void check_touch(TouchGesture gesture) {
                 }
             } else if (g_pages[g_current_page].type == PageInfo::WEATHER) {
                 step_weather_slot(+1);
-            } else {
+            } else if (is_commute_page()) {
                 // Commute: advance to next connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
                                   ? g_commute_home : g_commute_work;
@@ -866,7 +931,7 @@ static void check_touch(TouchGesture gesture) {
                 }
             } else if (g_pages[g_current_page].type == PageInfo::WEATHER) {
                 step_weather_slot(-1);
-            } else {
+            } else if (is_commute_page()) {
                 // Commute: go back to previous connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
                                   ? g_commute_home : g_commute_work;
@@ -879,6 +944,7 @@ static void check_touch(TouchGesture gesture) {
             break;
         case TOUCH_TAP:
             if (g_pages[g_current_page].type == PageInfo::STOCKS) handle_stock_tap();
+            if (g_pages[g_current_page].type == PageInfo::DEVICE) show_settings_qr();
             break;
         default:
             break;
@@ -1100,10 +1166,112 @@ static void format_footer_weather(char* weather_str, size_t weather_len,
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  DEVICE INFO PAGE                                                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+// Everything you'd ask over the phone when helping someone: version, network,
+// battery, why it last restarted, and which data sources work.
+
+static esp_reset_reason_t g_reset_reason = ESP_RST_UNKNOWN;   // captured in setup()
+
+static const char* reset_reason_text(esp_reset_reason_t r, bool& problem) {
+    problem = false;
+    switch (r) {
+        case ESP_RST_POWERON:   return "power on";
+        case ESP_RST_SW:        return "restart (update/save)";
+        case ESP_RST_EXT:       return "reset button";
+        case ESP_RST_DEEPSLEEP: return "wake from sleep";
+        case ESP_RST_PANIC:     problem = true; return "crash (panic)";
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:       problem = true; return "crash (watchdog)";
+        case ESP_RST_BROWNOUT:  problem = true; return "low power (brownout)";
+        default:                return "other";
+    }
+}
+
+// "now", "4m", "2h", "3d" — how long ago t was
+static String ago(time_t t, time_t now) {
+    long s = (long)(now - t);
+    if (s < 60)    return "now";
+    if (s < 3600)  return String(s / 60) + "m";
+    if (s < 86400) return String(s / 3600) + "h";
+    return String(s / 86400) + "d";
+}
+
+static void draw_device_info_page() {
+    time_t now = time(nullptr);
+    InfoRow left[8];
+    int nl = 0;
+
+    String fw = "v" FIRMWARE_VERSION;
+    if (g_ota_remote_version.length() > 0 && g_ota_remote_version != FIRMWARE_VERSION)
+        fw += " (v" + g_ota_remote_version + " ready)";
+    left[nl++] = { "Firmware", fw };
+
+    if (WiFi.status() == WL_CONNECTED) {
+        int rssi = WiFi.RSSI();
+        const char* q = rssi >= -60 ? "good" : rssi >= -72 ? "ok" : "weak";
+        left[nl++] = { "Wi-Fi", WiFi.SSID(), 0 };
+        left[nl++] = { "Signal", String(rssi) + " dBm, " + q, (uint8_t)(rssi < -72 ? 2 : 0) };
+        left[nl++] = { "Address", WiFi.localIP().toString() };
+    } else {
+        left[nl++] = { "Wi-Fi", "not connected", 2 };
+    }
+
+    uint32_t up = millis() / 1000;
+    char upbuf[24];
+    if (up >= 86400) snprintf(upbuf, sizeof(upbuf), "%lud %luh", (unsigned long)(up / 86400), (unsigned long)(up % 86400 / 3600));
+    else             snprintf(upbuf, sizeof(upbuf), "%luh %lum", (unsigned long)(up / 3600), (unsigned long)(up % 3600 / 60));
+    left[nl++] = { "Uptime", upbuf };
+
+    const BatteryStatus& b = battery_status();
+    if (b.pct >= 0) {
+        String bs = String(b.pct) + "%";
+        if (b.charging)            bs += ", charging";
+        else if (b.hours_left >= 0) bs += ", ~" + String((int)lroundf(b.hours_left)) + "h left";
+        left[nl++] = { "Battery", bs, (uint8_t)(!b.charging && b.pct <= 20 ? 2 : 0) };
+    }
+
+    bool problem;
+    const char* rr = reset_reason_text(g_reset_reason, problem);
+    left[nl++] = { "Restart", rr, (uint8_t)(problem ? 2 : 0) };
+    // Free internal RAM (what TLS etc. needs) + free PSRAM (big buffers)
+    char mem[32];
+    snprintf(mem, sizeof(mem), "%uK + %.1fM free",
+             (unsigned)(ESP.getFreeHeap() / 1024), ESP.getFreePsram() / 1048576.0f);
+    left[nl++] = { "Memory", mem };
+
+    // Data sources that are in use: "ok 2m" / "failed 5m" since the last result
+    static const char* NAMES[SRC_COUNT] = { "Departures", "Weather", "Commute", "Stocks", "Parcel", "Pager" };
+    SourceStatus st[SRC_COUNT];
+    fetch_task_get_source_status(st);
+    InfoRow right[SRC_COUNT];
+    int nr = 0;
+    for (int i = 0; i < SRC_COUNT; i++) {
+        if (!st[i].used) continue;
+        bool failing = st[i].last_fail > st[i].last_ok;
+        String v = failing ? "failed " + ago(st[i].last_fail, now)
+                           : "ok " + ago(st[i].last_ok, now);
+        if (failing && st[i].last_ok > 0) v += " (ok " + ago(st[i].last_ok, now) + ")";
+        right[nr++] = { NAMES[i], v, (uint8_t)(failing ? 2 : 1) };
+    }
+
+    String footer_left = String("Tap to configure  -  ") + WEB_HOSTNAME + ".local";
+    FooterInfo f;
+    f.weather_str      = footer_left.c_str();
+    f.uv_str           = "";
+    f.wifi_ok          = WiFi.status() == WL_CONNECTED;
+    f.battery_pct      = g_battery_pct;
+    f.battery_charging = g_battery_charging;
+    display_draw_info("Device", g_current_page, g_num_pages, left, nl, right, nr, f);
+}
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  ARDUINO ENTRY POINTS                                                     ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 void setup() {
+    g_reset_reason = esp_reset_reason();   // shown on the device info page
     setCpuFrequencyMhz(80);   // 80 MHz is the minimum with WiFi; saves ~100 mA vs 240 MHz
     Serial.begin(115200);
     delay(500);
@@ -1139,11 +1307,14 @@ void setup() {
     setup_stops();
 
     if (!connect_wifi()) {
-        // All credentials failed — stop the animation and show a message.
-        // The reconnect loop in loop() will keep retrying every 30 s.
-        // The user can hold the boot button at any time to enter config portal.
+        // No saved network works here (first start, new place): open the setup
+        // hotspot with its QR codes right away. Saving reboots; if nobody sets it
+        // up within PORTAL_TIMEOUT_MS, boot continues offline and loop() keeps
+        // retrying Wi-Fi in the background (the button still opens setup).
         display_boot_animation_stop();
-        display_show_status("No WiFi\nHold boot button to configure");
+        Serial.println("[WiFi] No network — starting setup hotspot");
+        run_setup_portal();
+        display_show_status("No Wi-Fi yet - retrying\nHold the button 3 s\nfor the setup hotspot");
         delay(4000);
         display_invalidate();
     }
@@ -1454,7 +1625,8 @@ void loop() {
             g_parcel_status = new_parcel;
             // No flashing while the screen is off at night — the new status is
             // visible in the footer at the next wake-up
-            if (parcel_changed && g_parcel_pulses > 0 && !g_parcel_pulsing && display_screen_on()) {
+            if (parcel_changed && g_parcel_pulses > 0 && !g_parcel_pulsing &&
+                display_screen_on() && !g_clock_showing) {
                 g_parcel_pulsing   = true;
                 g_parcel_pulse_rem = g_parcel_pulses;
                 g_parcel_pulse_hi  = true;
@@ -1483,12 +1655,26 @@ void loop() {
     // Redraw every second (clock + age counter; commute marquee advances from millis())
     PageInfo& page = g_pages[g_current_page];
     // The weather page's extra data is only fetched while someone can see it
-    fetch_task_set_weather_page(page.type == PageInfo::WEATHER && display_screen_on(), g_wx_slot);
+    fetch_task_set_weather_page(page.type == PageInfo::WEATHER && display_screen_on() &&
+                                !g_clock_showing, g_wx_slot);
     if (config_hint_stage == 0 && !overlay_active() && display_screen_on() &&
         now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
 
-        if (page.type == PageInfo::TRANSIT) {
+        if (g_clock_showing) {
+            // Night clock: date, plus the temperature of the last place shown
+            char sub[40] = "";
+            time_t now_t = time(nullptr);
+            if (now_t > 1700000000) {
+                struct tm t; localtime_r(&now_t, &t);
+                strftime(sub, sizeof(sub), "%a %d %b", &t);
+                if (weather_data.valid) {
+                    size_t len = strlen(sub);
+                    snprintf(sub + len, sizeof(sub) - len, "   %d°C", (int)lroundf(weather_data.temp_c));
+                }
+            }
+            display_draw_night_clock(sub);
+        } else if (page.type == PageInfo::TRANSIT) {
             current_stop_idx = page.transit_idx;
 
             if (g_view == VIEW_BOARD) {
@@ -1608,6 +1794,8 @@ void loop() {
             f.battery_charging = g_battery_charging;
             display_draw_weather(label, g_current_page, g_num_pages,
                                  have ? &wd : nullptr, not_found, f);
+        } else if (page.type == PageInfo::DEVICE) {
+            draw_device_info_page();
         } else {
             // Commute page
             bool is_home = (page.type == PageInfo::COMMUTE_HOME);

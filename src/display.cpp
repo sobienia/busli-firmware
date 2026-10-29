@@ -11,6 +11,7 @@
 #include "../include/matrix_font.h"
 #include <Arduino_GFX_Library.h>
 #include <Preferences.h>
+#include <qrcode.h>   // ESP-IDF QR code generator (esp_qrcode_*)
 
 static const int SMALL_ASCENT  = 15;   // TramliSmall  16px
 static const int LARGE_ASCENT  = 22;   // TramliLarge  24px
@@ -74,6 +75,9 @@ static uint32_t  s_detail_weather       = 0xFFFFFFFF;
 // Weather page: fetch time of the data drawn (-1 = full repaint needed)
 static time_t    s_wx_drawn_fetch       = -1;
 static int       s_wx_minute            = -1;
+// Info page / night clock: fingerprint of what's drawn (0 = repaint)
+static uint32_t  s_info_sig             = 0;
+static int       s_clock_minute         = -1;
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -115,6 +119,10 @@ static String to_latin1(const String& src) {
                 default:   c = '?';    break;
             }
             out += c;
+            i += 2;
+        } else if (b == 0xC2 && i + 1 < src.length()) {
+            // U+0080–U+00BF map 1:1 to Latin-1: ° ² ³ µ « » ±, non-breaking space …
+            out += (char)(uint8_t)src[i + 1];
             i += 2;
         } else if (b >= 0xC0 && b < 0xE0) { out += '?'; i += 2; }
         else if (b >= 0xE0 && b < 0xF0)   { out += '?'; i += 3; }
@@ -359,6 +367,8 @@ void display_invalidate() {
     s_stocks_last_first     = -1;
     s_detail_idx_sig        = -1;
     s_wx_drawn_fetch        = -1;
+    s_info_sig              = 0;
+    s_clock_minute          = -1;
 }
 
 // ── Umbrella icon (12×15) ────────────────────────────────────────────────────
@@ -1524,6 +1534,185 @@ void display_draw_weather(const char* label, int page_idx, int page_count,
 
     FrameBuffered band(fy, FOOTER_H);   // canvas band still holds the static footer
     draw_footer_dynamic(fy, false, f.wifi_ok, age_s, false, 0, 0, d ? nullptr : "");
+}
+
+// ── Device info page ─────────────────────────────────────────────────────────
+
+void display_draw_info(const char* label, int page_idx, int page_count,
+                       const InfoRow* left, int n_left,
+                       const InfoRow* right, int n_right,
+                       const FooterInfo& f) {
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now_t, &tm_now);
+
+    // Repaint only when any text (or the clock minute) changes
+    uint32_t sig = 2166136261u;
+    auto mix = [&](const String& s) { for (char c : s) sig = (sig ^ (uint8_t)c) * 16777619u; };
+    for (int i = 0; i < n_left;  i++) { mix(left[i].value);  sig ^= left[i].state; }
+    for (int i = 0; i < n_right; i++) { mix(right[i].value); sig ^= right[i].state << 3; }
+    sig ^= (uint32_t)(tm_now.tm_hour * 60 + tm_now.tm_min) << 7;
+    sig ^= (uint32_t)(f.battery_pct + 1) << 20;
+    if (sig == 0) sig = 1;
+    if (sig == s_info_sig) return;
+    s_info_sig = sig;
+    s_last_battery_pct      = f.battery_pct;
+    s_last_battery_charging = f.battery_charging;
+
+    FrameBuffered frame;
+    gfx->fillScreen(BLACK);
+    draw_header(label, page_idx, page_count, false, false, f.battery_pct, f.battery_charging);
+
+    const int top = HEADER_H + 6, line_h = 18;
+    auto value_color = [&](uint8_t st) {
+        return st == 1 ? c_row0 : st == 2 ? COLOR_STOCK_DOWN : c_row0;
+    };
+    auto column = [&](const InfoRow* rows, int n, int x, int value_x, int x_max) {
+        for (int i = 0; i < n; i++) {
+            int y = top + i * line_h;
+            draw_text(rows[i].label, x, y, 2, c_dim);
+            draw_text_safe(to_latin1(rows[i].value), value_x, y, 2, value_color(rows[i].state), 0, x_max);
+        }
+    };
+    column(left,  n_left,  PAD, PAD + 78, 250);
+    gfx->drawFastVLine(256, top, line_h * std::max(n_left, n_right) - 4, c_meta);
+    column(right, n_right, 266, 266 + 96, SCREEN_W - PAD);
+
+    int fy = SCREEN_H - FOOTER_H;
+    draw_footer_static(fy, f.weather_str, f.uv_str, false, 0, false, false, false);
+    draw_footer_dynamic(fy, false, f.wifi_ok, 0, false, 0, 0, "");
+}
+
+// ── QR codes ─────────────────────────────────────────────────────────────────
+// Generated with ESP-IDF's qrcode component (built into the framework). Drawn
+// dark-on-white with the standard 4-module quiet zone — most phone scanners
+// can't read inverted (light-on-dark) codes.
+
+static int s_qr_x = 0, s_qr_y = 0, s_qr_scale = 4, s_qr_drawn = 0;
+
+static void qr_draw_cb(esp_qrcode_handle_t qr) {
+    int n = esp_qrcode_get_size(qr);
+    int quiet = 4 * s_qr_scale;
+    s_qr_drawn = n * s_qr_scale + 2 * quiet;
+    gfx->fillRect(s_qr_x, s_qr_y, s_qr_drawn, s_qr_drawn, WHITE);
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+            if (esp_qrcode_get_module(qr, x, y))
+                gfx->fillRect(s_qr_x + quiet + x * s_qr_scale, s_qr_y + quiet + y * s_qr_scale,
+                              s_qr_scale, s_qr_scale, BLACK);
+}
+
+// Draws a QR code with its top-left corner at x,y. Returns its side length in px.
+static int draw_qr(int x, int y, int scale, const char* text) {
+    s_qr_x = x; s_qr_y = y; s_qr_scale = scale; s_qr_drawn = 0;
+    esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+    cfg.display_func       = qr_draw_cb;
+    cfg.max_qrcode_version = 5;               // ≤ 37 modules — fits the screen
+    cfg.qrcode_ecc_level   = ESP_QRCODE_ECC_LOW;
+    if (esp_qrcode_generate(&cfg, text) != ESP_OK) Serial.printf("[QR] failed for '%s'\n", text);
+    return s_qr_drawn;
+}
+
+void display_show_setup_qr(const char* ssid, const char* url) {
+    if (!gfx) return;
+    display_invalidate();
+    FrameBuffered frame;
+    gfx->fillScreen(BLACK);
+
+    String title = "Set up Busli";
+    draw_text(title, (SCREEN_W - text_w(title, 2)) / 2, 4, 2, c_row0);
+
+    // Wi-Fi join code (open network): WIFI:T:nopass;S:<ssid>;;
+    String wifi = String("WIFI:T:nopass;S:") + ssid + ";;";
+    const int scale = 4, top = 26;
+    int s1 = draw_qr(36, top, scale, wifi.c_str());
+    int s2 = draw_qr(SCREEN_W - 36 - s1, top, scale, url);
+    int cap_y = top + std::max(s1, s2) + 6;
+
+    String c1 = "1. Join Wi-Fi", c2 = "2. Open settings";
+    draw_text(c1, 36 + (s1 - text_w(c1, 2)) / 2, cap_y, 2, c_row0);
+    draw_text(c2, SCREEN_W - 36 - s2 + (s2 - text_w(c2, 2)) / 2, cap_y, 2, c_row0);
+
+    String words = String("or join ") + ssid + " and open " + (strstr(url, "//") ? strstr(url, "//") + 2 : url);
+    draw_text_safe(words, (SCREEN_W - text_w(words, 2)) / 2, cap_y + 18, 2, c_dim, 0, SCREEN_W);
+    String cancel = "Touch the screen to cancel";
+    draw_text(cancel, (SCREEN_W - text_w(cancel, 2)) / 2, cap_y + 36, 2, c_meta);
+}
+
+void display_show_settings_qr(const char* url, const char* hostname, const char* ip) {
+    if (!gfx) return;
+    display_invalidate();
+    FrameBuffered frame;
+    gfx->fillScreen(BLACK);
+
+    int side = draw_qr(16, (SCREEN_H - 185) / 2, 5, url);
+    int tx = 16 + side + 20;
+    int ty = (SCREEN_H - 150) / 2;
+    draw_text("Scan to open", tx, ty, 3, c_row0);
+    draw_text("settings", tx, ty + 30, 3, c_row0);
+    draw_text("No code needed", tx, ty + 68, 2, c_dim);
+    draw_text(String("or open ") + hostname + ".local", tx, ty + 98, 2, c_dim);
+    draw_text(String("or ") + ip, tx, ty + 116, 2, c_dim);
+    draw_text("Touch to close", tx, ty + 140, 2, c_meta);
+}
+
+// ── Night clock ──────────────────────────────────────────────────────────────
+// Seven-segment digits drawn as rounded bars: crisp at any size (the fonts top
+// out at 28 px) and calm to look at in the dark.
+
+static void draw_7seg(int x, int y, int w, int h, int t, int digit, uint16_t col) {
+    // Bits: a b c d e f g (top, top-right, bottom-right, bottom, bottom-left, top-left, middle)
+    static const uint8_t SEG[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+    if (digit < 0 || digit > 9) return;
+    uint8_t s  = SEG[digit];
+    int     vl = (h - 3 * t) / 2;   // length of a vertical segment
+    int     r  = t / 2;
+    if (s & 0x01) gfx->fillRoundRect(x + t, y,                  w - 2 * t, t, r, col);  // a
+    if (s & 0x02) gfx->fillRoundRect(x + w - t, y + t,          t, vl, r, col);         // b
+    if (s & 0x04) gfx->fillRoundRect(x + w - t, y + 2 * t + vl, t, vl, r, col);         // c
+    if (s & 0x08) gfx->fillRoundRect(x + t, y + h - t,          w - 2 * t, t, r, col);  // d
+    if (s & 0x10) gfx->fillRoundRect(x, y + 2 * t + vl,         t, vl, r, col);         // e
+    if (s & 0x20) gfx->fillRoundRect(x, y + t,                  t, vl, r, col);         // f
+    if (s & 0x40) gfx->fillRoundRect(x + t, y + t + vl,         w - 2 * t, t, r, col);  // g
+}
+
+void display_draw_night_clock(const char* subtitle) {
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm t;
+    localtime_r(&now_t, &t);
+    int minute = t.tm_hour * 60 + t.tm_min;
+    if (minute == s_clock_minute) return;
+    s_clock_minute = minute;
+
+    FrameBuffered frame;
+    gfx->fillScreen(BLACK);
+
+    // H H : M M — 84×150 digits, 14 px segments; leading hour zero left blank
+    const int dw = 84, dh = 150, th = 14, gap = 16, colon_w = 56;
+    const int total = 4 * dw + 2 * gap + colon_w;
+    int x = (SCREEN_W - total) / 2, y = 14;
+    uint16_t col = c_dim;
+    if (now_t > 1700000000) {
+        if (t.tm_hour >= 10) draw_7seg(x, y, dw, dh, th, t.tm_hour / 10, col);
+        draw_7seg(x + dw + gap, y, dw, dh, th, t.tm_hour % 10, col);
+        int cx = x + 2 * dw + gap + colon_w / 2;
+        gfx->fillRoundRect(cx - th / 2, y + dh / 3 - th / 2,     th, th, th / 2, col);
+        gfx->fillRoundRect(cx - th / 2, y + 2 * dh / 3 - th / 2, th, th, th / 2, col);
+        int mx = x + 2 * dw + gap + colon_w;
+        draw_7seg(mx, y, dw, dh, th, t.tm_min / 10, col);
+        draw_7seg(mx + dw + gap, y, dw, dh, th, t.tm_min % 10, col);
+    }
+
+    if (subtitle && *subtitle) {
+        String s = to_latin1(subtitle);
+        draw_text(s, (SCREEN_W - text_w(s, 2)) / 2, y + dh + 22, 2, c_meta);
+    }
 }
 
 // ── Flight screen ─────────────────────────────────────────────────────────────

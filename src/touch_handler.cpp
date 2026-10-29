@@ -32,6 +32,7 @@ static uint32_t s_last_tap_ms        = 0;
 static bool     s_waiting_double_tap = false;
 
 bool touch_is_pressed()    { return s_touching; }
+void touch_cancel_pending() { s_waiting_double_tap = false; }
 int  touch_last_screen_x() {
     // rotation=3: raw_y maps to the horizontal screen axis (inverted)
     return SCREEN_W - (int)s_last_raw_y * SCREEN_W / 480;

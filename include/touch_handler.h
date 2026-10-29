@@ -20,6 +20,10 @@ void touch_init();
 // Each gesture is returned exactly once per event.
 TouchGesture touch_poll();
 
+// Forget a tap that's waiting to be reported (TOUCH_TAP arrives ~350 ms after
+// the finger lifts). Call when a touch was consumed, e.g. to wake the screen.
+void touch_cancel_pending();
+
 // Raw state — call touch_poll() first to update.
 // Use these inside blocking prompt loops to detect finger-up and tap position.
 bool touch_is_pressed();       // true while screen is being touched

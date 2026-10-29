@@ -100,6 +100,16 @@ static StockChart    s_chart;                // guarded by s_mutex
 static int           s_chart_idx     = -1;   // ticker s_chart belongs to
 static time_t        s_chart_time    = 0;
 
+// Per-source health for the device info page (guarded by s_mutex)
+static SourceStatus  s_status[SRC_COUNT];
+
+static void note_result(DataSource src, bool ok) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_status[src].used = true;
+    (ok ? s_status[src].last_ok : s_status[src].last_fail) = time(nullptr);
+    xSemaphoreGive(s_mutex);
+}
+
 // Lets the UI cut the loop's idle wait short for user-triggered work
 static TaskHandle_t  s_task = nullptr;
 static void wake_task() { if (s_task) xTaskNotifyGive(s_task); }
@@ -109,6 +119,7 @@ static void do_fetch(int idx) {
     http_lock_take();
     bool ok = api_fetch_departures(s_stops[idx], fresh, 6);
     http_lock_give();
+    note_result(SRC_DEPARTURES, ok);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (ok) {
@@ -159,6 +170,7 @@ static bool do_fetch_weather(int place) {
     http_lock_take();
     bool ok = weather_fetch(lat, lon, wd);
     http_lock_give();
+    note_result(SRC_WEATHER, ok);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     pw.last_attempt = time(nullptr);
     if (ok) { pw.wx = wd; pw.ok = true; }
@@ -244,6 +256,7 @@ static void do_fetch_commute() {
     // home commute = work→home; work commute = home→work
     http_lock_take(); commute_fetch(s_work_station, s_home_station, home); http_lock_give();
     http_lock_take(); commute_fetch(s_home_station, s_work_station, work); http_lock_give();
+    note_result(SRC_COMMUTE, home.valid || work.valid);
     time_t now = time(nullptr);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (home.valid) {
@@ -268,6 +281,7 @@ static void do_poll_pager() {
     http_lock_take();
     bool ok = pager_poll(s_pager_cfg.topic, s_pager_last_poll, msgs);
     http_lock_give();
+    note_result(SRC_PAGER, ok);
     if (!ok || msgs.empty()) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (auto& m : msgs) {
@@ -287,6 +301,7 @@ static void do_fetch_parcel() {
     http_lock_take();
     bool ok = parcel_fetch(s_parcel_tracking.c_str(), new_status);
     http_lock_give();
+    note_result(SRC_PARCEL, ok);
     if (!ok) return;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -328,6 +343,7 @@ static void do_fetch_stock(int i) {
     http_lock_take();
     StockFetchResult r = stocks_fetch_quote(symbol, q);
     http_lock_give();
+    note_result(SRC_STOCKS, r != STOCK_FETCH_ERROR);   // unknown symbol isn't an outage
 
     time_t now = time(nullptr);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -668,6 +684,12 @@ void fetch_task_init_flights(const FlightEntry* entries, int count) {
     flight_tracker_init(entries, count);
     s_flight_count = count;
     for (int i = 0; i < count; i++) s_flight_last_fetch[i] = 0; // trigger immediate fetch
+}
+
+void fetch_task_get_source_status(SourceStatus out[SRC_COUNT]) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < SRC_COUNT; i++) out[i] = s_status[i];
+    xSemaphoreGive(s_mutex);
 }
 
 void fetch_task_set_power_mode(FetchPower mode) {
