@@ -14,6 +14,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/fetch_task.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include "../include/http_lock.h"
 #include "../include/ota.h"
@@ -364,7 +365,7 @@ static void do_poll_pager() {
         s_pager_queue_tail = next;
     }
     xSemaphoreGive(s_mutex);
-    Serial.printf("[Pager] %d new message(s)\n", (int)msgs.size());
+    Log.printf("[Pager] %d new message(s)\n", (int)msgs.size());
 }
 
 static void do_fetch_parcel() {
@@ -389,7 +390,7 @@ static void do_fetch_parcel() {
     xSemaphoreGive(s_mutex);
 
     if (changed)
-        Serial.printf("[Parcel] Status changed → '%s'\n", new_status.c_str());
+        Log.printf("[Parcel] Status changed → '%s'\n", new_status.c_str());
 }
 
 // The price batch is due when its interval has passed and either the market is
@@ -577,11 +578,11 @@ static void snapshot_save() {
     xSemaphoreGive(s_mutex);
 
     File f = LittleFS.open(SNAPSHOT_FILE, "w");
-    if (!f) { Serial.println("[Snapshot] can't write"); return; }
+    if (!f) { Log.println("[Snapshot] can't write"); return; }
     size_t bytes = serializeJson(doc, f);
     f.close();
     s_snapshot_saved = now;
-    Serial.printf("[Snapshot] saved %u bytes\n", (unsigned)bytes);
+    Log.printf("[Snapshot] saved %u bytes\n", (unsigned)bytes);
 }
 
 static void snapshot_load() {
@@ -591,7 +592,7 @@ static void snapshot_load() {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
-    if (err) { Serial.printf("[Snapshot] unreadable (%s)\n", err.c_str()); return; }
+    if (err) { Log.printf("[Snapshot] unreadable (%s)\n", err.c_str()); return; }
 
     time_t now = time(nullptr), saved = doc["t"] | 0L;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -661,7 +662,7 @@ static void snapshot_load() {
     }
     xSemaphoreGive(s_mutex);
     s_snapshot_age = (now > 1700000000 && saved > 0) ? now - saved : -1;
-    Serial.printf("[Snapshot] loaded (%ld s old)\n", (long)s_snapshot_age);
+    Log.printf("[Snapshot] loaded (%ld s old)\n", (long)s_snapshot_age);
 }
 
 // ── Slow lane ────────────────────────────────────────────────────────────────
@@ -752,7 +753,7 @@ static void fetch_task_loop(void* /*param*/) {
         }
     }
     s_startup_done = true;
-    Serial.println("[Fetch] Startup batch done");
+    Log.println("[Fetch] Startup batch done");
     snapshot_save();
 
     time_t last_commute_fetch = time(nullptr);
@@ -900,7 +901,7 @@ static void fetch_task_loop(void* /*param*/) {
         if (now - last_ntp_sync >= NTP_RESYNC_SEC) {
             configTzTime(POSIX_TZ, "pool.ntp.org", "time.nist.gov");
             last_ntp_sync = time(nullptr);
-            Serial.println("[NTP] Daily resync triggered");
+            Log.println("[NTP] Daily resync triggered");
         }
 
         // Idle until the next round — or earlier when the UI asks for something
@@ -1043,7 +1044,7 @@ void fetch_task_config_done() {
     // Remembered data first, so the pages can show it before anything is fetched.
     // The first mount formats the partition (a few seconds, once ever).
     s_fs_ok = LittleFS.begin(true);
-    if (!s_fs_ok) Serial.println("[Snapshot] LittleFS not available");
+    if (!s_fs_ok) Log.println("[Snapshot] LittleFS not available");
     snapshot_load();
     s_config_done = true;
 }
@@ -1074,7 +1075,7 @@ void fetch_task_get_source_status(SourceStatus out[SRC_COUNT]) {
 void fetch_task_set_power_mode(FetchPower mode) {
     if (mode != s_power) {
         s_power = mode;
-        Serial.printf("[Fetch] Power mode %d\n", (int)mode);
+        Log.printf("[Fetch] Power mode %d\n", (int)mode);
     }
 }
 

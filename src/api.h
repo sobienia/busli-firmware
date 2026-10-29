@@ -28,3 +28,13 @@ bool api_fetch_departures(
     std::vector<Departure>& out_departures,
     int max_results
 );
+
+// The parsing step on its own (also used by the tests in test/): departures in
+// a stationboard response that match the stop's filters and leave after `now`.
+bool api_parse_departures(
+    const char* json, size_t json_len,
+    const StopConfig& stop,
+    std::vector<Departure>& out_departures,
+    int max_results,
+    time_t now
+);

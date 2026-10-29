@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "api.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -98,11 +99,12 @@ static bool matches_line(const String& number, const String& category, const Sto
 
 // Parse JSON body and extract matching departures.
 // Takes const char* so ArduinoJson copies strings — caller may free buf immediately after.
-static bool process_json_body(
+bool api_parse_departures(
     const char* json, size_t json_len,
     const StopConfig& stop,
     std::vector<Departure>& out_departures,
-    int max_results
+    int max_results,
+    time_t now
 ) {
     JsonDocument filter;
     filter["stationboard"][0]["number"]                         = true;
@@ -117,16 +119,15 @@ static bool process_json_body(
     DeserializationError err = deserializeJson(doc, json, json_len,
                                                DeserializationOption::Filter(filter));
     if (err) {
-        Serial.print("[API] JSON error: ");
-        Serial.println(err.c_str());
+        Log.print("[API] JSON error: ");
+        Log.println(err.c_str());
         return false;
     }
-    Serial.println("[API] JSON OK");
+    Log.println("[API] JSON OK");
 
     std::vector<Departure> results;
     JsonArray board = doc["stationboard"];
 
-    time_t now = time(nullptr);
     int dbg_noparse = 0, dbg_past = 0, dbg_filt = 0;
 
     bool logged_sample = false;
@@ -138,7 +139,7 @@ static bool process_json_body(
         // Log the first entry so the serial monitor shows what the API actually returns.
         // Useful when a line filter produces zero results.
         if (!logged_sample) {
-            Serial.printf("[API] sample: category='%s' number='%s' to='%s'\n",
+            Log.printf("[API] sample: category='%s' number='%s' to='%s'\n",
                           category.c_str(), number.c_str(), dest.c_str());
             logged_sample = true;
         }
@@ -187,7 +188,7 @@ static bool process_json_body(
     }
 
     out_departures = results;
-    Serial.printf("[API] Got %d departures (filt=%d noparse=%d past=%d)\n",
+    Log.printf("[API] Got %d departures (filt=%d noparse=%d past=%d)\n",
                   (int)results.size(), dbg_filt, dbg_noparse, dbg_past);
     return true;
 }
@@ -222,29 +223,29 @@ bool api_fetch_departures(
            "&fields[]=stationboard/stop/platform"
            "&fields[]=stationboard/stop/prognosis/platform";
 
-    Serial.print("[API] Fetching: ");
-    Serial.println(url);
+    Log.print("[API] Fetching: ");
+    Log.println(url);
 
     HTTPClient http;
     http.setTimeout(API_TIMEOUT_MS);
     http.setReuse(false);
 
     if (!http.begin(url)) {
-        Serial.println("[API] http.begin() failed");
+        Log.println("[API] http.begin() failed");
         return false;
     }
 
     int code = http.GET();
     if (code != 200) {
-        Serial.printf("[API] HTTP error: %d", code);
-        if (code < 0) Serial.printf(" (%s)", http.errorToString(code).c_str());
-        Serial.println();
+        Log.printf("[API] HTTP error: %d", code);
+        if (code < 0) Log.printf(" (%s)", http.errorToString(code).c_str());
+        Log.println();
         http.end();
         return false;
     }
 
     int content_len = http.getSize();
-    Serial.printf("[API] Body: ~%d bytes\n", content_len);
+    Log.printf("[API] Body: ~%d bytes\n", content_len);
 
     if (content_len < 0) {
         // Chunked transfer encoding — decode directly into a PSRAM buffer.
@@ -256,7 +257,7 @@ bool api_fetch_departures(
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!buf) {
             http.end();
-            Serial.println("[API] PSRAM alloc failed");
+            Log.println("[API] PSRAM alloc failed");
             return false;
         }
         int buf_len = 0;
@@ -309,10 +310,11 @@ bool api_fetch_departures(
         buf[buf_len] = '\0';
 
         http.end();
-        Serial.printf("[API] chunked: %d bytes\n", buf_len);
+        Log.printf("[API] chunked: %d bytes\n", buf_len);
 
         bool ok = (buf_len > 0) &&
-                  process_json_body((const char*)buf, buf_len, stop, out_departures, max_results);
+                  api_parse_departures((const char*)buf, buf_len, stop, out_departures, max_results,
+                                       time(nullptr));
         heap_caps_free(buf);
         return ok;
     }
@@ -324,7 +326,7 @@ bool api_fetch_departures(
     char* buf = (char*)heap_caps_malloc(alloc_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) {
         http.end();
-        Serial.println("[API] PSRAM alloc failed (content-length path)");
+        Log.println("[API] PSRAM alloc failed (content-length path)");
         return false;
     }
     int buf_len = 0;
@@ -346,10 +348,11 @@ bool api_fetch_departures(
     }
     buf[buf_len] = '\0';
     http.end();
-    Serial.printf("[API] content-length: %d bytes\n", buf_len);
+    Log.printf("[API] content-length: %d bytes\n", buf_len);
 
     bool ok = (buf_len > 0) &&
-              process_json_body((const char*)buf, buf_len, stop, out_departures, max_results);
+              api_parse_departures((const char*)buf, buf_len, stop, out_departures, max_results,
+                                   time(nullptr));
     heap_caps_free(buf);
     return ok;
 }

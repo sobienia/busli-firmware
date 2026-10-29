@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/battery.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include <Wire.h>
 #define XPOWERS_CHIP_SY6970
@@ -73,13 +74,13 @@ static float estimate_hours(time_t now, float pct_now) {
 
 bool battery_init() {
     if (!s_pmu.begin(Wire, SY6970_SLAVE_ADDRESS, TOUCH_SDA_PIN, TOUCH_SCL_PIN)) {
-        Serial.println("[PMU] SY6970 not found — no battery indicator");
+        Log.println("[PMU] SY6970 not found — no battery indicator");
         return false;
     }
     s_ok = true;
     s_pmu.enableCharge();
     s_pmu.enableMeasure();  // continuous ADC so getBattVoltage() returns real data
-    Serial.println("[PMU] SY6970 OK");
+    Log.println("[PMU] SY6970 OK");
     return true;
 }
 
@@ -112,7 +113,7 @@ void battery_update() {
         s_status.hours_left = -1;
     }
 
-    Serial.printf("[Batt] %umV (smoothed %.0f) → %d%%%s%s\n", mv, s_mv_smooth, s_status.pct,
+    Log.printf("[Batt] %umV (smoothed %.0f) → %d%%%s%s\n", mv, s_mv_smooth, s_status.pct,
                   charging ? " (charging)" : "",
                   s_status.hours_left >= 0 ? (String(" ~") + String(s_status.hours_left, 1) + "h").c_str() : "");
 }

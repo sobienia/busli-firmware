@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "weather.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -89,10 +90,34 @@ bool weather_fetch_detail(float lat, float lon, WeatherDetail& out) {
     int code = http.GET();
     String body = (code == 200) ? http.getString() : "";
     http.end();
-    if (code != 200) { Serial.printf("[Weather] detail HTTP %d\n", code); return false; }
+    if (code != 200) { Log.printf("[Weather] detail HTTP %d\n", code); return false; }
 
+    WeatherDetail d;
+    if (!weather_parse_detail(body, d)) { Log.println("[Weather] detail JSON error"); return false; }
+    d.fetched = time(nullptr);
+
+    // Air quality + pollen — separate API; the page works without it
+    char aq_url[320];
+    snprintf(aq_url, sizeof(aq_url),
+        "http://air-quality-api.open-meteo.com/v1/air-quality?latitude=%.3f&longitude=%.3f"
+        "&current=european_aqi,alder_pollen,birch_pollen,grass_pollen,"
+        "mugwort_pollen,olive_pollen,ragweed_pollen",
+        (double)lat, (double)lon);
+    HTTPClient aq;
+    aq.setTimeout(WEATHER_TIMEOUT_MS);
+    aq.setReuse(false);
+    if (aq.begin(aq_url) && aq.GET() == 200) weather_parse_air(aq.getString(), d);
+    aq.end();
+
+    Log.printf("[Weather] detail: %.1fC code=%d %d hours, AQI %d\n",
+                  d.temp_c, d.weather_code, d.hours, d.aqi);
+    out = d;
+    return true;
+}
+
+bool weather_parse_detail(const String& body, WeatherDetail& out) {
     JsonDocument doc;
-    if (deserializeJson(doc, body)) { Serial.println("[Weather] detail JSON error"); return false; }
+    if (deserializeJson(doc, body) || doc["current"].isNull()) return false;
 
     WeatherDetail d;
     d.temp_c        = doc["current"]["temperature_2m"] | 0.0f;
@@ -116,35 +141,20 @@ bool weather_fetch_detail(float lat, float lon, WeatherDetail& out) {
         d.hour_rain_prob[i] = hP[i] | 0;
     }
     for (float& p : d.pollen) p = -1;
-    d.fetched = time(nullptr);
-    d.valid   = true;
-
-    // Air quality + pollen — separate API; the page works without it
-    char aq_url[320];
-    snprintf(aq_url, sizeof(aq_url),
-        "http://air-quality-api.open-meteo.com/v1/air-quality?latitude=%.3f&longitude=%.3f"
-        "&current=european_aqi,alder_pollen,birch_pollen,grass_pollen,"
-        "mugwort_pollen,olive_pollen,ragweed_pollen",
-        (double)lat, (double)lon);
-    HTTPClient aq;
-    aq.setTimeout(WEATHER_TIMEOUT_MS);
-    aq.setReuse(false);
-    if (aq.begin(aq_url) && aq.GET() == 200) {
-        JsonDocument adoc;
-        if (!deserializeJson(adoc, aq.getString())) {
-            JsonObject c = adoc["current"];
-            d.aqi = c["european_aqi"].isNull() ? -1 : (int)c["european_aqi"];
-            const char* keys[POLLEN_COUNT] = { "alder_pollen", "birch_pollen", "grass_pollen",
-                                               "mugwort_pollen", "olive_pollen", "ragweed_pollen" };
-            for (int i = 0; i < POLLEN_COUNT; i++)
-                d.pollen[i] = c[keys[i]].isNull() ? -1.0f : c[keys[i]].as<float>();
-        }
-    }
-    aq.end();
-
-    Serial.printf("[Weather] detail: %.1fC code=%d %d hours, AQI %d\n",
-                  d.temp_c, d.weather_code, d.hours, d.aqi);
+    d.valid = true;
     out = d;
+    return true;
+}
+
+bool weather_parse_air(const String& body, WeatherDetail& d) {
+    JsonDocument adoc;
+    if (deserializeJson(adoc, body) || adoc["current"].isNull()) return false;
+    JsonObject c = adoc["current"];
+    d.aqi = c["european_aqi"].isNull() ? -1 : (int)c["european_aqi"];
+    const char* keys[POLLEN_COUNT] = { "alder_pollen", "birch_pollen", "grass_pollen",
+                                       "mugwort_pollen", "olive_pollen", "ragweed_pollen" };
+    for (int i = 0; i < POLLEN_COUNT; i++)
+        d.pollen[i] = c[keys[i]].isNull() ? -1.0f : c[keys[i]].as<float>();
     return true;
 }
 
@@ -165,33 +175,36 @@ bool weather_fetch(float lat, float lon, WeatherData& out) {
         "&forecast_days=1",
         (double)lat, (double)lon, RAIN_SLOTS);
 
-    Serial.print("[Weather] Fetching: ");
-    Serial.println(url);
+    Log.print("[Weather] Fetching: ");
+    Log.println(url);
 
     HTTPClient http;
     http.setTimeout(WEATHER_TIMEOUT_MS);
     http.setReuse(false);
 
     if (!http.begin(url)) {
-        Serial.println("[Weather] http.begin() failed");
+        Log.println("[Weather] http.begin() failed");
         return false;
     }
 
     int code = http.GET();
     if (code != 200) {
-        Serial.printf("[Weather] HTTP error: %d\n", code);
+        Log.printf("[Weather] HTTP error: %d\n", code);
         http.end();
         return false;
     }
 
     String body = http.getString();
     http.end();
-    Serial.printf("[Weather] Body: %d bytes\n", body.length());
+    Log.printf("[Weather] Body: %d bytes\n", body.length());
+    return weather_parse(body, time(nullptr), out);
+}
 
+bool weather_parse(const String& body, time_t now, WeatherData& out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, body);
-    if (err) {
-        Serial.printf("[Weather] JSON error: %s\n", err.c_str());
+    if (err || doc["current"].isNull()) {
+        Log.printf("[Weather] JSON error: %s\n", err ? err.c_str() : "no current data");
         return false;
     }
 
@@ -214,7 +227,6 @@ bool weather_fetch(float lat, float lon, WeatherData& out) {
     // Short-term rain: is it raining now, and when does it start / stop?
     JsonArray times = doc["minutely_15"]["time"];
     JsonArray mm    = doc["minutely_15"]["precipitation"];
-    time_t now      = time(nullptr);
     out.raining_now = (doc["current"]["precipitation"] | 0.0f) >= RAIN_ALERT_MM;
     out.rain_start  = 0;
     out.rain_end    = 0;
@@ -231,7 +243,7 @@ bool weather_fetch(float lat, float lon, WeatherData& out) {
     }
     out.valid = true;
 
-    Serial.printf("[Weather] cur=%.1f max=%.1f UV%d/%d rain=%s snow=%s clear=%s (code=%d prob=%d%%)"
+    Log.printf("[Weather] cur=%.1f max=%.1f UV%d/%d rain=%s snow=%s clear=%s (code=%d prob=%d%%)"
                   " now=%s start=%ld end=%ld\n",
         out.temp_c, out.temp_max_c, out.uv_index, out.uv_index_max,
         out.rain_today ? "y" : "n", out.snow_today ? "y" : "n",

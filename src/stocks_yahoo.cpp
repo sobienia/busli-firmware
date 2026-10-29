@@ -16,6 +16,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/stocks.h"
+#include "../include/stocks_yahoo.h"
+#include "../include/devlog.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
@@ -76,6 +78,9 @@ static int yahoo_get(const String& url, String& body) {
     return -1;
 }
 
+static StockFetchResult parse_chart_doc(const String& body, const String& symbol, JsonDocument& doc);
+static void fill_quote(JsonDocument& doc, StockQuote& out);
+
 // GET the chart endpoint at the given resolution ("15m", "5m") and parse the
 // fields we use into doc. Shared by the details fetch and the detail chart.
 static StockFetchResult fetch_chart_doc(const String& symbol, const char* interval,
@@ -84,14 +89,18 @@ static StockFetchResult fetch_chart_doc(const String& symbol, const char* interv
     String body;   // ~3 KB (15m) / ~8 KB (5m), String is fine here
     int code = yahoo_get(url, body);
     if (code == 404) {
-        Serial.printf("[Stocks] %s: not found\n", symbol.c_str());
+        Log.printf("[Stocks] %s: not found\n", symbol.c_str());
         return STOCK_FETCH_NOT_FOUND;
     }
     if (code != 200) {
-        Serial.printf("[Stocks] %s: HTTP %d\n", symbol.c_str(), code);
+        Log.printf("[Stocks] %s: HTTP %d\n", symbol.c_str(), code);
         return STOCK_FETCH_ERROR;
     }
+    return parse_chart_doc(body, symbol, doc);
+}
 
+// Parse a chart response into doc (only the fields we use)
+static StockFetchResult parse_chart_doc(const String& body, const String& symbol, JsonDocument& doc) {
     // Only keep the fields we need — keeps the JSON document small.
     JsonDocument filter;
     JsonObject fm = filter["chart"]["result"][0]["meta"].to<JsonObject>();
@@ -105,14 +114,14 @@ static StockFetchResult fetch_chart_doc(const String& symbol, const char* interv
 
     DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
     if (err) {
-        Serial.printf("[Stocks] %s: JSON error: %s\n", symbol.c_str(), err.c_str());
+        Log.printf("[Stocks] %s: JSON error: %s\n", symbol.c_str(), err.c_str());
         return STOCK_FETCH_ERROR;
     }
     if (String(doc["chart"]["error"]["code"] | "") == "Not Found") return STOCK_FETCH_NOT_FOUND;
 
     JsonObject meta = doc["chart"]["result"][0]["meta"];
     if (meta.isNull() || !meta["regularMarketPrice"].is<float>()) {
-        Serial.printf("[Stocks] %s: no price in response\n", symbol.c_str());
+        Log.printf("[Stocks] %s: no price in response\n", symbol.c_str());
         return STOCK_FETCH_ERROR;
     }
     return STOCK_FETCH_OK;
@@ -144,7 +153,22 @@ StockFetchResult stocks_fetch_quote(const String& symbol, StockQuote& out) {
     JsonDocument doc;
     StockFetchResult r = fetch_chart_doc(symbol, "15m", doc);
     if (r != STOCK_FETCH_OK) return r;
+    fill_quote(doc, out);
+    out.detail_time = time(nullptr);
+    Log.printf("[Stocks] %s: %.2f %s (%+.2f%%)\n",
+                  symbol.c_str(), out.price, out.currency.c_str(), out.change_pct);
+    return STOCK_FETCH_OK;
+}
 
+StockFetchResult stocks_yahoo_parse_quote(const String& body, const String& symbol, StockQuote& out) {
+    JsonDocument doc;
+    StockFetchResult r = parse_chart_doc(body, symbol, doc);
+    if (r == STOCK_FETCH_OK) fill_quote(doc, out);
+    return r;
+}
+
+// Quote fields from a parsed chart response (prices in pounds for London pence)
+static void fill_quote(JsonDocument& doc, StockQuote& out) {
     JsonObject meta   = doc["chart"]["result"][0]["meta"];
     JsonObject quote  = doc["chart"]["result"][0]["indicators"]["quote"][0];
     String currency   = meta["currency"] | "";
@@ -170,11 +194,6 @@ StockFetchResult stocks_fetch_quote(const String& symbol, StockQuote& out) {
     out.spark_n = downsample(quote["close"], scale, prev > 0 ? prev : price,
                              out.spark, STOCK_SPARK_POINTS);
     out.price_scale = scale;
-    out.detail_time = time(nullptr);
-
-    Serial.printf("[Stocks] %s: %.2f %s (%+.2f%%)\n",
-                  symbol.c_str(), out.price, out.currency.c_str(), out.change_pct);
-    return STOCK_FETCH_OK;
 }
 
 // ── Batch: many tickers per request ──────────────────────────────────────────
@@ -187,6 +206,34 @@ static const int BATCH_SIZE = 10;
 
 static bool needs_scale(const StockQuote& q) {
     return q.price_scale == 0 && q.symbol.endsWith(".L");
+}
+
+int stocks_yahoo_parse_spark(const String& body, StockQuote quotes[], int start, int end, bool found[]) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return -1;
+    int got = 0;
+    for (int i = start; i < end; i++) {
+        StockQuote& q = quotes[i];
+        JsonObject o = doc[q.symbol];
+        if (o.isNull() || needs_scale(q)) continue;
+        float scale = q.price_scale > 0 ? q.price_scale : 1.0f;
+        JsonArray closes = o["close"];
+        float prev = o["chartPreviousClose"] | 0.0f;
+        if (prev <= 0) prev = o["previousClose"] | 0.0f;
+        prev *= scale;
+        // Current price = latest bar's close (skipping empty bars)
+        float price = 0;
+        for (int k = (int)closes.size() - 1; k >= 0; k--)
+            if (!closes[k].isNull()) { price = closes[k].as<float>() * scale; break; }
+        if (price <= 0) continue;
+        q.price      = price;
+        q.prev_close = prev;
+        q.change_pct = (prev > 0) ? (price - prev) / prev * 100.0f : 0.0f;
+        q.spark_n    = downsample(closes, scale, prev > 0 ? prev : price, q.spark, STOCK_SPARK_POINTS);
+        found[i] = true;
+        got++;
+    }
+    return got;
 }
 
 StockFetchResult stocks_fetch_batch(StockQuote quotes[], int n, bool found[]) {
@@ -206,35 +253,14 @@ StockFetchResult stocks_fetch_batch(StockQuote quotes[], int n, bool found[]) {
         String body;
         int code = yahoo_get("https://query1.finance.yahoo.com/v8/finance/spark?range=1d&interval=15m&symbols="
                              + syms, body);
-        if (code != 200) { Serial.printf("[Stocks] batch HTTP %d\n", code); continue; }
-        JsonDocument doc;
-        if (deserializeJson(doc, body)) { Serial.println("[Stocks] batch JSON error"); continue; }
-
-        for (int i = start; i < end; i++) {
-            StockQuote& q = quotes[i];
-            JsonObject o = doc[q.symbol];
-            if (o.isNull() || needs_scale(q)) continue;
-            float scale = q.price_scale > 0 ? q.price_scale : 1.0f;
-            JsonArray closes = o["close"];
-            float prev = o["chartPreviousClose"] | 0.0f;
-            if (prev <= 0) prev = o["previousClose"] | 0.0f;
-            prev *= scale;
-            // Current price = latest bar's close (skipping empty bars)
-            float price = 0;
-            for (int k = (int)closes.size() - 1; k >= 0; k--)
-                if (!closes[k].isNull()) { price = closes[k].as<float>() * scale; break; }
-            if (price <= 0) continue;
-            q.price      = price;
-            q.prev_close = prev;
-            q.change_pct = (prev > 0) ? (price - prev) / prev * 100.0f : 0.0f;
-            q.spark_n    = downsample(closes, scale, prev > 0 ? prev : price, q.spark, STOCK_SPARK_POINTS);
-            found[i] = true;
-            any_ok   = true;
-        }
+        if (code != 200) { Log.printf("[Stocks] batch HTTP %d\n", code); continue; }
+        int got = stocks_yahoo_parse_spark(body, quotes, start, end, found);
+        if (got < 0) { Log.println("[Stocks] batch JSON error"); continue; }
+        any_ok |= got > 0;
     }
     int got = 0;
     for (int i = 0; i < n; i++) got += found[i];
-    Serial.printf("[Stocks] batch: %d of %d tickers\n", got, n);
+    Log.printf("[Stocks] batch: %d of %d tickers\n", got, n);
     return any_ok ? STOCK_FETCH_OK : STOCK_FETCH_ERROR;
 }
 
@@ -250,6 +276,6 @@ StockFetchResult stocks_fetch_chart(const String& symbol, StockChart& out) {
     out.prev_close  = prev;
     out.n = downsample(doc["chart"]["result"][0]["indicators"]["quote"][0]["close"], scale,
                        prev > 0 ? prev : price, out.pts, STOCK_CHART_POINTS);
-    Serial.printf("[Stocks] %s: detail chart %d points\n", symbol.c_str(), out.n);
+    Log.printf("[Stocks] %s: detail chart %d points\n", symbol.c_str(), out.n);
     return STOCK_FETCH_OK;
 }

@@ -29,3 +29,8 @@ struct DailyQuote {
 // Returns true if at least one of the two temperatures was read.
 bool water_fetch(WaterTemps& out);
 bool quote_fetch(DailyQuote& out);
+
+// The parsing steps on their own (also used by the tests in test/)
+float water_parse_lake(const String& body);    // NAN if missing
+float water_parse_river(const String& body);   // NAN if missing
+bool  quote_parse(const String& body, DailyQuote& out);

@@ -12,6 +12,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/ota.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include "../include/http_lock.h"
 #include "../include/ca_certs.h"
@@ -19,6 +20,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <Preferences.h>
+#include <esp_ota_ops.h>
 
 volatile bool g_ota_pending = false;
 String        g_ota_url;
@@ -37,9 +40,9 @@ static bool is_newer(const char* a, const char* b) {
 bool ota_check(String& out_url) {
     if (strlen(OTA_VERSION_URL) == 0) return false;
 
-    Serial.printf("[OTA] Checking for updates (current: %s)\n", FIRMWARE_VERSION);
+    Log.printf("[OTA] Checking for updates (current: %s)\n", FIRMWARE_VERSION);
     if (time(nullptr) < 1700000000) {   // certificate dates can't be checked yet
-        Serial.println("[OTA] Clock not synced — skipping check");
+        Log.println("[OTA] Clock not synced — skipping check");
         return false;
     }
 
@@ -52,7 +55,7 @@ bool ota_check(String& out_url) {
     http_lock_take();
     if (!http.begin(wc, OTA_VERSION_URL)) {
         http_lock_give();
-        Serial.println("[OTA] version check: http.begin failed");
+        Log.println("[OTA] version check: http.begin failed");
         return false;
     }
     int code = http.GET();
@@ -60,26 +63,30 @@ bool ota_check(String& out_url) {
     http.end();
     http_lock_give();
 
-    if (code != 200) { Serial.printf("[OTA] HTTP %d\n", code); return false; }
+    if (code != 200) { Log.printf("[OTA] HTTP %d\n", code); return false; }
 
     JsonDocument doc;
-    if (deserializeJson(doc, body)) { Serial.println("[OTA] JSON parse error"); return false; }
+    if (deserializeJson(doc, body)) { Log.println("[OTA] JSON parse error"); return false; }
 
     const char* remote_ver = doc["version"] | "";
     const char* url        = doc["url"]     | "";
 
-    Serial.printf("[OTA] Remote: %s  Current: %s\n", remote_ver, FIRMWARE_VERSION);
+    Log.printf("[OTA] Remote: %s  Current: %s\n", remote_ver, FIRMWARE_VERSION);
 
     if (strlen(url) == 0 || !is_newer(remote_ver, FIRMWARE_VERSION)) return false;
+    if (ota_skipped_version() == remote_ver) {
+        Log.printf("[OTA] v%s failed on this device before — not offering it again\n", remote_ver);
+        return false;
+    }
 
     out_url              = url;
     g_ota_remote_version = remote_ver;
-    Serial.printf("[OTA] Update available: %s -> %s\n", FIRMWARE_VERSION, remote_ver);
+    Log.printf("[OTA] Update available: %s -> %s\n", FIRMWARE_VERSION, remote_ver);
     return true;
 }
 
 bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
-    Serial.printf("[OTA] Downloading firmware: %s\n", url.c_str());
+    Log.printf("[OTA] Downloading firmware: %s\n", url.c_str());
 
     WiFiClientSecure wc;
     wc.setCACert(OTA_ROOT_CAS);
@@ -93,27 +100,27 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
     http_lock_take();
     if (!http.begin(wc, url)) {
         http_lock_give();
-        Serial.println("[OTA] download http.begin failed");
+        Log.println("[OTA] download http.begin failed");
         return false;
     }
     int code = http.GET();
     if (code != 200) {
         http.end(); http_lock_give();
-        Serial.printf("[OTA] download HTTP %d\n", code);
+        Log.printf("[OTA] download HTTP %d\n", code);
         return false;
     }
 
     int total = http.getSize();
-    Serial.printf("[OTA] Firmware: %d bytes\n", total);
+    Log.printf("[OTA] Firmware: %d bytes\n", total);
     if (total <= 0) {
         http.end(); http_lock_give();
-        Serial.println("[OTA] No content-length — cannot stream");
+        Log.println("[OTA] No content-length — cannot stream");
         return false;
     }
 
     if (!Update.begin(total)) {
         http.end(); http_lock_give();
-        Serial.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
+        Log.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
         return false;
     }
 
@@ -121,7 +128,7 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
     if (!stream) {
         Update.abort();
         http.end(); http_lock_give();
-        Serial.println("[OTA] No stream");
+        Log.println("[OTA] No stream");
         return false;
     }
 
@@ -147,7 +154,7 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
         int n = stream->readBytes(buf, min(av, (int)sizeof(buf)));
         if (n <= 0) continue;
         if (Update.write(buf, n) != (size_t)n) {
-            Serial.printf("[OTA] Update.write failed: %s\n", Update.errorString());
+            Log.printf("[OTA] Update.write failed: %s\n", Update.errorString());
             write_failed = true;
             break;
         }
@@ -160,7 +167,7 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
         }
         if (written / 65536 != last_logged_kb) {
             last_logged_kb = written / 65536;
-            Serial.printf("[OTA] %d / %d bytes (%d%%)\n", written, total, pct);
+            Log.printf("[OTA] %d / %d bytes (%d%%)\n", written, total, pct);
         }
     }
 
@@ -169,14 +176,96 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
 
     // Never finalize a partial image — Update.end(true) would try to boot it.
     if (write_failed || written < total) {
-        Serial.printf("[OTA] Download incomplete (%d / %d bytes) — aborting\n", written, total);
+        Log.printf("[OTA] Download incomplete (%d / %d bytes) — aborting\n", written, total);
         Update.abort();
         return false;
     }
     if (!Update.end()) {
-        Serial.printf("[OTA] Update.end failed: %s\n", Update.errorString());
+        Log.printf("[OTA] Update.end failed: %s\n", Update.errorString());
         return false;
     }
-    Serial.printf("[OTA] Flash complete (%d bytes written)\n", written);
+    Log.printf("[OTA] Flash complete (%d bytes written)\n", written);
     return true;
 }
+
+// ── Safety net (see ota.h) ───────────────────────────────────────────────────
+// The bootloader is built with rollback support: a freshly installed app starts
+// as "pending verify", and if it restarts in that state for any reason the
+// previous app is booted instead. NVS "ota": "trial" = version on trial,
+// "skip" = version that failed.
+
+static const uint32_t OTA_TRIAL_MIN_MS = 60000;    // runs this long with data → good
+static const uint32_t OTA_TRIAL_MAX_MS = 300000;   // decide by now at the latest
+static bool s_trial = false;
+
+// Arduino core hook: don't confirm a new app automatically at startup
+extern "C" bool verifyRollbackLater() { return true; }
+
+static bool running_pending() {
+    esp_ota_img_states_t st;
+    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK &&
+           st == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+static String nvs_get(const char* key) {
+    Preferences p;
+    p.begin("ota", true);
+    String v = p.isKey(key) ? p.getString(key, "") : "";
+    p.end();
+    return v;
+}
+
+static void nvs_put(const char* key, const String& v) {
+    Preferences p;
+    p.begin("ota", false);
+    if (v.isEmpty()) p.remove(key); else p.putString(key, v);
+    p.end();
+}
+
+static void confirm(const char* why) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    s_trial = false;
+    nvs_put("trial", "");
+    Log.printf("[OTA] v%s confirmed (%s)\n", FIRMWARE_VERSION, why);
+}
+
+// A planned restart during the trial (settings saved, …) means it was working
+static void on_shutdown() {
+    if (s_trial && running_pending()) esp_ota_mark_app_valid_cancel_rollback();
+}
+
+String ota_boot_check() {
+    String trial = nvs_get("trial");
+    if (running_pending()) {
+        s_trial = true;
+        if (trial != FIRMWARE_VERSION) nvs_put("trial", FIRMWARE_VERSION);
+        esp_register_shutdown_handler(on_shutdown);
+        Log.printf("[OTA] v%s is new — on trial until it has worked for a minute\n", FIRMWARE_VERSION);
+        return "";
+    }
+    if (trial.isEmpty() || trial == FIRMWARE_VERSION) {
+        if (!trial.isEmpty()) nvs_put("trial", "");
+        return "";
+    }
+    // Another version was on trial, but this one is running: it was rolled back
+    nvs_put("trial", "");
+    nvs_put("skip", trial);
+    Log.printf("[OTA] Update to v%s failed — back on v%s\n", trial.c_str(), FIRMWARE_VERSION);
+    return trial;
+}
+
+bool ota_on_trial() { return s_trial; }
+
+void ota_trial_tick(bool data_ok, bool wifi_ok) {
+    if (!s_trial) return;
+    uint32_t up = millis();
+    if (up >= OTA_TRIAL_MIN_MS && data_ok) { confirm("data loaded"); return; }
+    if (up < OTA_TRIAL_MAX_MS) return;
+    if (!wifi_ok) { confirm("ran without Wi-Fi, no crash"); return; }
+    Log.printf("[OTA] v%s loaded no data in %lu s although online — rolling back\n",
+               FIRMWARE_VERSION, (unsigned long)(OTA_TRIAL_MAX_MS / 1000));
+    delay(200);   // let the log line out
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+}
+
+String ota_skipped_version() { return nvs_get("skip"); }

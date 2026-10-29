@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/commute.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -62,7 +63,7 @@ static time_t parse_iso8601_cm(const String& iso) {
     return epoch - off;
 }
 
-static bool parse_connections(const char* json, size_t json_len, CommuteData& out) {
+bool commute_parse(const char* json, size_t json_len, time_t now, CommuteData& out) {
     JsonDocument filter;
     filter["connections"][0]["sections"][0]["journey"]["name"]              = true;
     filter["connections"][0]["sections"][0]["journey"]["category"]          = true;
@@ -76,11 +77,10 @@ static bool parse_connections(const char* json, size_t json_len, CommuteData& ou
     DeserializationError err = deserializeJson(doc, json, json_len,
                                                DeserializationOption::Filter(filter));
     if (err) {
-        Serial.printf("[Commute] JSON error: %s\n", err.c_str());
+        Log.printf("[Commute] JSON error: %s\n", err.c_str());
         return false;
     }
 
-    time_t now = time(nullptr);
     int n_conns = 0;
 
     for (JsonObject conn : doc["connections"].as<JsonArray>()) {
@@ -132,9 +132,9 @@ static bool parse_connections(const char* json, size_t json_len, CommuteData& ou
     }
 
     out.connection_count = n_conns;
-    out.fetch_time       = time(nullptr);
+    out.fetch_time       = now;
     out.valid            = (n_conns > 0);
-    Serial.printf("[Commute] Parsed %d connections\n", n_conns);
+    Log.printf("[Commute] Parsed %d connections\n", n_conns);
     return out.valid;
 }
 
@@ -157,32 +157,32 @@ bool commute_fetch(const String& from_station, const String& to_station, Commute
            "&fields[]=connections/sections/arrival/station/name"
            "&fields[]=connections/sections/arrival/arrival";
 
-    Serial.print("[Commute] Fetching: ");
-    Serial.println(url);
+    Log.print("[Commute] Fetching: ");
+    Log.println(url);
 
     HTTPClient http;
     http.setTimeout(API_TIMEOUT_MS);
     http.setReuse(false);
     if (!http.begin(url)) {
-        Serial.println("[Commute] http.begin() failed");
+        Log.println("[Commute] http.begin() failed");
         return false;
     }
 
     int code = http.GET();
     if (code != 200) {
-        Serial.printf("[Commute] HTTP error: %d\n", code);
+        Log.printf("[Commute] HTTP error: %d\n", code);
         http.end();
         return false;
     }
 
     int content_len = http.getSize();
-    Serial.printf("[Commute] Body: ~%d bytes\n", content_len);
+    Log.printf("[Commute] Body: ~%d bytes\n", content_len);
 
     const int MAX_BODY = 150000;
     char* buf = (char*)heap_caps_malloc(MAX_BODY + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) {
         http.end();
-        Serial.println("[Commute] PSRAM alloc failed");
+        Log.println("[Commute] PSRAM alloc failed");
         return false;
     }
     int buf_len = 0;
@@ -249,8 +249,8 @@ bool commute_fetch(const String& from_station, const String& to_station, Commute
     buf[buf_len] = '\0';
     http.end();
 
-    Serial.printf("[Commute] Read %d bytes\n", buf_len);
-    bool ok = (buf_len > 0) && parse_connections(buf, buf_len, out);
+    Log.printf("[Commute] Read %d bytes\n", buf_len);
+    bool ok = (buf_len > 0) && commute_parse(buf, buf_len, time(nullptr), out);
     heap_caps_free(buf);
     return ok;
 }

@@ -34,3 +34,7 @@ struct CommuteData {
 bool commute_fetch(const String& from_station,
                    const String& to_station,
                    CommuteData& out);
+
+// The parsing step on its own (also used by the tests in test/): connections in
+// a /v1/connections response that leave after now - 1 min.
+bool commute_parse(const char* json, size_t json_len, time_t now, CommuteData& out);

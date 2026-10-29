@@ -12,6 +12,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/touch_handler.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include <Wire.h>
 #include <TouchLib.h>
@@ -46,7 +47,7 @@ int  touch_last_screen_y() {
 void touch_init() {
     Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
     bool ok = s_touch.init();
-    Serial.printf("[Touch] init() = %s (SDA=%d SCL=%d addr=0x%02X)\n",
+    Log.printf("[Touch] init() = %s (SDA=%d SCL=%d addr=0x%02X)\n",
                   ok ? "OK" : "FAIL",
                   TOUCH_SDA_PIN, TOUCH_SCL_PIN, TOUCH_I2C_ADDR);
 }

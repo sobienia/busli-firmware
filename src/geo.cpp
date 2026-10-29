@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/geo.h"
+#include "../include/devlog.h"
 #include "../include/http_lock.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -42,7 +43,8 @@ static String cache_key(const String& name, char prefix = 's') {
 static bool cache_get(const String& station, GeoPlace& out, char prefix = 's') {
     Preferences prefs;
     prefs.begin(NVS_NS, true);
-    String json = prefs.getString(cache_key(station, prefix).c_str(), "");
+    String key  = cache_key(station, prefix);
+    String json = prefs.isKey(key.c_str()) ? prefs.getString(key.c_str(), "") : "";
     prefs.end();
     if (json.isEmpty()) return false;
     JsonDocument doc;
@@ -78,7 +80,7 @@ static bool fetch_coordinates(const String& station, GeoPlace& out) {
     String body = (code == 200) ? http.getString() : "";
     http.end();
     http_lock_give();
-    if (code != 200) { Serial.printf("[Geo] locations HTTP %d\n", code); return false; }
+    if (code != 200) { Log.printf("[Geo] locations HTTP %d\n", code); return false; }
 
     JsonDocument doc;
     if (deserializeJson(doc, body)) return false;
@@ -105,7 +107,7 @@ static bool fetch_town(float lat, float lon, String& out_city) {
     String body = (code == 200) ? http.getString() : "";
     http.end();
     http_lock_give();
-    if (code != 200) { Serial.printf("[Geo] nominatim HTTP %d\n", code); return false; }
+    if (code != 200) { Log.printf("[Geo] nominatim HTTP %d\n", code); return false; }
 
     JsonDocument filter;
     filter["address"]["city"] = true;
@@ -136,19 +138,19 @@ bool geo_resolve_city(const String& name, GeoPlace& out) {
     String body = (code == 200) ? http.getString() : "";
     http.end();
     http_lock_give();
-    if (code != 200) { Serial.printf("[Geo] geocoding HTTP %d\n", code); return false; }
+    if (code != 200) { Log.printf("[Geo] geocoding HTTP %d\n", code); return false; }
 
     JsonDocument doc;
     if (deserializeJson(doc, body)) return false;
     JsonObject r = doc["results"][0];
-    if (r.isNull()) { Serial.printf("[Geo] town '%s' not found\n", q.c_str()); return false; }
+    if (r.isNull()) { Log.printf("[Geo] town '%s' not found\n", q.c_str()); return false; }
     GeoPlace p;
     p.lat   = r["latitude"]  | 0.0f;
     p.lon   = r["longitude"] | 0.0f;
     p.city  = q;               // show it the way the user wrote it
     p.valid = true;
     cache_put(q, p, 'c');
-    Serial.printf("[Geo] town %s → %.4f,%.4f\n", q.c_str(), p.lat, p.lon);
+    Log.printf("[Geo] town %s → %.4f,%.4f\n", q.c_str(), p.lat, p.lon);
     out = p;
     return true;
 }
@@ -159,7 +161,7 @@ static const char* HERE_KEY = "here";
 bool geo_here_cached(GeoPlace& out, bool& stale) {
     Preferences prefs;
     prefs.begin(NVS_NS, true);
-    String json = prefs.getString(HERE_KEY, "");
+    String json = prefs.isKey(HERE_KEY) ? prefs.getString(HERE_KEY, "") : "";
     prefs.end();
     if (json.isEmpty()) return false;
     JsonDocument doc;
@@ -198,7 +200,7 @@ bool geo_resolve_here(GeoPlace& out) {
     String body = (code == 200) ? http.getString() : "";
     http.end();
     http_lock_give();
-    if (code != 200) { Serial.printf("[Geo] ip-api HTTP %d\n", code); return false; }
+    if (code != 200) { Log.printf("[Geo] ip-api HTTP %d\n", code); return false; }
 
     JsonDocument doc;
     if (deserializeJson(doc, body) || String(doc["status"] | "") != "success") return false;
@@ -209,7 +211,7 @@ bool geo_resolve_here(GeoPlace& out) {
     // "Zürich", not ip-api's English "Zurich"); ip-api's name is the fallback
     if (!fetch_town(out.lat, out.lon, out.city)) out.city = String(doc["city"] | "");
     here_cache_put(out);
-    Serial.printf("[Geo] here → %.4f,%.4f '%s'\n", out.lat, out.lon, out.city.c_str());
+    Log.printf("[Geo] here → %.4f,%.4f '%s'\n", out.lat, out.lon, out.city.c_str());
     return true;
 }
 
@@ -228,7 +230,7 @@ bool geo_resolve_station(const String& station, GeoPlace& out) {
     }
     if (town_ok) cache_put(station, p);   // fallback name isn't cached → retried next boot
 
-    Serial.printf("[Geo] %s → %.4f,%.4f '%s'%s\n", station.c_str(), p.lat, p.lon,
+    Log.printf("[Geo] %s → %.4f,%.4f '%s'%s\n", station.c_str(), p.lat, p.lon,
                   p.city.c_str(), town_ok ? "" : " (fallback name)");
     out = p;
     return true;

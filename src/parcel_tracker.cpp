@@ -9,6 +9,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/parcel_tracker.h"
+#include "../include/devlog.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
@@ -124,13 +125,13 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         http.collectHeaders(collect, 5);
 
         if (!begin_https(http, wc, base + "/user", "")) {
-            Serial.println("[Parcel] Step1 begin failed");
+            Log.println("[Parcel] Step1 begin failed");
             return false;
         }
 
         int code = http.GET();
         if (code != 200) {
-            Serial.printf("[Parcel] Step1 HTTP %d\n", code);
+            Log.printf("[Parcel] Step1 HTTP %d\n", code);
             http.end(); return false;
         }
 
@@ -144,9 +145,9 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         String body = http.getString();
         http.end();
 
-        Serial.printf("[Parcel] Step1 cookie='%s' csrf='%s'\n",
+        Log.printf("[Parcel] Step1 cookie='%s' csrf='%s'\n",
                       cookie.c_str(), csrf.c_str());
-        Serial.printf("[Parcel] Step1 body: %.280s\n", body.c_str());
+        Log.printf("[Parcel] Step1 body: %.280s\n", body.c_str());
 
         if (!body.isEmpty()) {
             JsonDocument doc;
@@ -158,9 +159,9 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
             }
         }
         if (user_id.isEmpty())
-            Serial.println("[Parcel] Step1 no userId — cookie-only");
+            Log.println("[Parcel] Step1 no userId — cookie-only");
         else
-            Serial.printf("[Parcel] Step1 userId='%s'\n", user_id.c_str());
+            Log.printf("[Parcel] Step1 userId='%s'\n", user_id.c_str());
     }
 
     // ── Step 2: POST /history?userId=… → hash ─────────────────────────────
@@ -174,7 +175,7 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         String url = base + "/history";
         if (!user_id.isEmpty()) url += "?userId=" + url_encode(user_id);
         if (!begin_https(http, wc, url, cookie, csrf)) {
-            Serial.println("[Parcel] Step2 begin failed"); return false;
+            Log.println("[Parcel] Step2 begin failed"); return false;
         }
         http.addHeader("Content-Type", "application/json;charset=UTF-8");
 
@@ -186,15 +187,15 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         String body = http.getString();
         http.end();
 
-        Serial.printf("[Parcel] Step2 HTTP %d body: %.200s\n", code, body.c_str());
+        Log.printf("[Parcel] Step2 HTTP %d body: %.200s\n", code, body.c_str());
         if (code != 200 && code != 201) return false;
 
         JsonDocument doc;
-        if (deserializeJson(doc, body)) { Serial.println("[Parcel] Step2 JSON error"); return false; }
+        if (deserializeJson(doc, body)) { Log.println("[Parcel] Step2 JSON error"); return false; }
         const char* h = doc["hash"] | (const char*)nullptr;
         if (!h && doc.is<JsonArray>() && doc.size() > 0)
             h = doc[0]["hash"] | (const char*)nullptr;
-        if (!h || !*h) { Serial.println("[Parcel] Step2 no hash"); return false; }
+        if (!h || !*h) { Log.println("[Parcel] Step2 no hash"); return false; }
         hash = h;
     }
 
@@ -207,22 +208,22 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         String url = base + "/history/not-included/" + hash;
         if (!user_id.isEmpty()) url += "?userId=" + url_encode(user_id);
         if (!begin_https(http, wc, url, cookie, csrf)) {
-            Serial.println("[Parcel] Step3 begin failed"); return false;
+            Log.println("[Parcel] Step3 begin failed"); return false;
         }
 
         int code = http.GET();
         String body = http.getString();
         http.end();
 
-        Serial.printf("[Parcel] Step3 HTTP %d body: %.200s\n", code, body.c_str());
+        Log.printf("[Parcel] Step3 HTTP %d body: %.200s\n", code, body.c_str());
         if (code != 200) return false;
 
         JsonDocument doc;
-        if (deserializeJson(doc, body)) { Serial.println("[Parcel] Step3 JSON error"); return false; }
+        if (deserializeJson(doc, body)) { Log.println("[Parcel] Step3 JSON error"); return false; }
         const char* id = doc["identity"] | (const char*)nullptr;
         if (!id && doc.is<JsonArray>() && doc.size() > 0)
             id = doc[0]["identity"] | (const char*)nullptr;
-        if (!id || !*id) { Serial.println("[Parcel] Step3 no identity"); return false; }
+        if (!id || !*id) { Log.println("[Parcel] Step3 no identity"); return false; }
         identity = id;
     }
 
@@ -253,14 +254,14 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
             code = http.GET();
             body = http.getString();
             http.end();
-            Serial.printf("[Parcel] Step4 %s → HTTP %d\n", path, code);
+            Log.printf("[Parcel] Step4 %s → HTTP %d\n", path, code);
             if (code == 200) break;
         }
-        Serial.printf("[Parcel] Step4 body: %.280s\n", body.c_str());
+        Log.printf("[Parcel] Step4 body: %.280s\n", body.c_str());
         if (code != 200) return false;
 
         JsonDocument doc;
-        if (deserializeJson(doc, body)) { Serial.println("[Parcel] Step4 JSON error"); return false; }
+        if (deserializeJson(doc, body)) { Log.println("[Parcel] Step4 JSON error"); return false; }
 
         // Don't rely on list order — pick the newest event (by timestamp) that
         // carries a delivery status. Timestamps are ISO local time
@@ -282,7 +283,7 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
                     if (d && *d) status = classify_desc(String(d));
                 }
                 String ts = String(ev["timestamp"] | "").substring(0, 19);
-                Serial.printf("[Parcel] event %s at %s → %s\n",
+                Log.printf("[Parcel] event %s at %s → %s\n",
                               code_str ? code_str : "-", ts.c_str(),
                               status.isEmpty() ? "(info only)" : status.c_str());
                 if (status.isEmpty()) continue;
@@ -296,12 +297,12 @@ bool parcel_fetch(const char* tracking_number, String& out_status) {
         else if (doc["events"].is<JsonArray>()) walk_events(doc["events"].as<JsonArray>());
 
         if (latest_status.isEmpty()) {
-            Serial.println("[Parcel] No events parsed — defaulting Shipped");
+            Log.println("[Parcel] No events parsed — defaulting Shipped");
             out_status = "Shipped";
             return true;
         }
         out_status = latest_status;
-        Serial.printf("[Parcel] Final status='%s'\n", out_status.c_str());
+        Log.printf("[Parcel] Final status='%s'\n", out_status.c_str());
         return true;
     }
 }

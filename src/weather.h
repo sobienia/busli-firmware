@@ -54,6 +54,12 @@ struct WeatherDetail {
 // Returns true if the forecast part succeeded; air quality is best effort.
 bool weather_fetch_detail(float lat, float lon, WeatherDetail& out);
 
+// The parsing steps on their own (also used by the tests in test/).
+// now = the time the rain alert is computed for.
+bool weather_parse(const String& body, time_t now, WeatherData& out);
+bool weather_parse_detail(const String& body, WeatherDetail& out);
+bool weather_parse_air(const String& body, WeatherDetail& d);   // fills aqi + pollen
+
 // Words for the page
 const char* weather_condition_text(int wmo_code);   // "Partly cloudy"
 const char* weather_aqi_text(int aqi);              // "Good", "Fair", … "" if unknown

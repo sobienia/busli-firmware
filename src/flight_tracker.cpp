@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/flight_tracker.h"
+#include "../include/devlog.h"
 #include "../include/http_lock.h"
 #include "../include/airports.h"
 #include <WiFiClientSecure.h>
@@ -125,7 +126,7 @@ static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes
                               const char* stop_after = nullptr) {
     *out_buf = nullptr;
     char* buf = (char*)heap_caps_malloc(max_bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) { Serial.println("[Flight] PSRAM alloc failed"); return 0; }
+    if (!buf) { Log.println("[Flight] PSRAM alloc failed"); return 0; }
 
     WiFiClient*  s          = http.getStreamPtr();
     int          clen       = http.getSize();
@@ -228,7 +229,7 @@ static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes
         }
     }
 
-    Serial.printf("[Flight] read %u bytes in %lu ms (%s, content-length %d)\n",
+    Log.printf("[Flight] read %u bytes in %lu ms (%s, content-length %d)\n",
                   (unsigned)total, (unsigned long)(millis() - start_ms),
                   stopped ? "found early" : complete ? "complete" : "TRUNCATED", clen);
     buf[total] = '\0';
@@ -279,18 +280,18 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
         // callsign filter is ignored server-side; include it for logging clarity only
         url += "callsign=" + url_encode(cs);
     }
-    Serial.printf("[Flight] states URL: %s\n", url.c_str());
+    Log.printf("[Flight] states URL: %s\n", url.c_str());
 
     WiFiClientSecure wc; wc.setInsecure();
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT * (have_icao ? 1 : 3));  // extra time for large scan
     http_lock_take();
-    if (!http.begin(wc, url)) { Serial.println("[Flight] http.begin failed"); http_lock_give(); return false; }
+    if (!http.begin(wc, url)) { Log.println("[Flight] http.begin failed"); http_lock_give(); return false; }
     if (s_opensky_user.length() > 0)
         http.setAuthorization(s_opensky_user.c_str(), s_opensky_pass.c_str());
 
     int code = http.GET();
-    Serial.printf("[Flight] HTTP %d\n", code);
+    Log.printf("[Flight] HTTP %d\n", code);
     if (code != 200) { http.end(); http_lock_give(); return false; }
 
     // ── Path A: icao24-filtered — small response, parse normally ─────────────
@@ -298,26 +299,26 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
         String body = http.getString();
         http.end();
         http_lock_give();
-        Serial.printf("[Flight] icao24 body %u bytes: %s\n",
+        Log.printf("[Flight] icao24 body %u bytes: %s\n",
                       (unsigned)body.length(), body.c_str());
 
         JsonDocument doc;
         if (deserializeJson(doc, body) != DeserializationError::Ok) {
-            Serial.println("[Flight] JSON error"); return false;
+            Log.println("[Flight] JSON error"); return false;
         }
         JsonVariant sv = doc["states"];
         if (sv.isNull()) {
-            Serial.println("[Flight] states=null (not airborne)"); return false;
+            Log.println("[Flight] states=null (not airborne)"); return false;
         }
         JsonArray st = sv.as<JsonArray>()[0].as<JsonArray>();
         if (!parse_state_entry(st, fi, icao24_out)) return false;
-        Serial.printf("[Flight] live: %s alt=%.0fft spd=%.0fkm/h gnd=%d\n",
+        Log.printf("[Flight] live: %s alt=%.0fft spd=%.0fkm/h gnd=%d\n",
                       callsign.c_str(), fi.alt_ft, fi.speed_kmh, fi.on_ground);
         return true;
     }
 
     // ── Path B: no icao24 — full global dump, PSRAM buffer, substring scan ───
-    Serial.println("[Flight] no icao24 cached — scanning full global state dump");
+    Log.println("[Flight] no icao24 cached — scanning full global state dump");
     // Search for the quoted padded callsign: ["icao24hex","THA970  ","country",...
     // The download stops as soon as that entry has arrived.
     char needle[12];
@@ -328,7 +329,7 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
     http_lock_give();
     if (!buf) return false;
 
-    Serial.printf("[Flight] global body %u bytes\n", (unsigned)total);
+    Log.printf("[Flight] global body %u bytes\n", (unsigned)total);
 
     bool result = false;
     char* hit = strstr(buf, needle);
@@ -340,7 +341,7 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
     }
 
     if (!hit) {
-        Serial.printf("[Flight] '%s' not found in %u byte response (not airborne?)\n",
+        Log.printf("[Flight] '%s' not found in %u byte response (not airborne?)\n",
                       cs.c_str(), (unsigned)total);
     } else {
         // Walk back to the [ that opens this state array entry
@@ -354,7 +355,7 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
         if (icao_end && (icao_end - icao_start) <= 8) {
             String found_icao(icao_start, icao_end - icao_start);
             found_icao.trim();
-            Serial.printf("[Flight] found '%s' → icao24=%s\n", cs.c_str(), found_icao.c_str());
+            Log.printf("[Flight] found '%s' → icao24=%s\n", cs.c_str(), found_icao.c_str());
 
             // Find end of this state entry and parse just that slice
             char* entry_end = strchr(hit, ']');
@@ -371,11 +372,11 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
                         if (parse_state_entry(st, fi, icao24_out)) {
                             icao24_out = found_icao;  // override with directly extracted value
                             result = true;
-                            Serial.printf("[Flight] live: %s alt=%.0fft spd=%.0fkm/h gnd=%d\n",
+                            Log.printf("[Flight] live: %s alt=%.0fft spd=%.0fkm/h gnd=%d\n",
                                           callsign.c_str(), fi.alt_ft, fi.speed_kmh, fi.on_ground);
                         }
                     } else {
-                        Serial.println("[Flight] mini-JSON parse error");
+                        Log.println("[Flight] mini-JSON parse error");
                     }
                     free(mini);
                 }
@@ -397,7 +398,7 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
 
 static bool fetch_takeoff_time(const String& icao24, time_t& out) {
     String url = "https://opensky-network.org/api/tracks/all?icao24=" + icao24 + "&time=0";
-    Serial.printf("[Flight] track URL: %s\n", url.c_str());
+    Log.printf("[Flight] track URL: %s\n", url.c_str());
 
     WiFiClientSecure wc; wc.setInsecure();
     HTTPClient http;
@@ -409,7 +410,7 @@ static bool fetch_takeoff_time(const String& icao24, time_t& out) {
     int code = http.GET();
     if (code != 200) {
         http.end(); http_lock_give();
-        Serial.printf("[Flight] track HTTP %d\n", code);
+        Log.printf("[Flight] track HTTP %d\n", code);
         return false;
     }
     char* buf = nullptr;
@@ -441,10 +442,10 @@ static bool fetch_takeoff_time(const String& icao24, time_t& out) {
     }
     free(buf);
 
-    if (takeoff <= 0) { Serial.println("[Flight] track: no takeoff time"); return false; }
+    if (takeoff <= 0) { Log.println("[Flight] track: no takeoff time"); return false; }
     out = takeoff;
     struct tm t; localtime_r(&out, &t);
-    Serial.printf("[Flight] takeoff %02d:%02d local (epoch %ld)\n", t.tm_hour, t.tm_min, (long)out);
+    Log.printf("[Flight] takeoff %02d:%02d local (epoch %ld)\n", t.tm_hour, t.tm_min, (long)out);
     return true;
 }
 
@@ -485,7 +486,7 @@ static void update_eta(FlightInfo& fi) {
     if (!fi.airborne || !fi.has_position || fi.speed_kmh < 150.0f) return;
     const AirportCoord* dest = find_airport(fi.arr_icao);
     if (!dest) {
-        Serial.printf("[Flight] ETA: arrival airport '%s' unknown\n", fi.arr_icao.c_str());
+        Log.printf("[Flight] ETA: arrival airport '%s' unknown\n", fi.arr_icao.c_str());
         return;
     }
     float km  = distance_km(fi.lat, fi.lon, dest->lat, dest->lon);
@@ -493,7 +494,7 @@ static void update_eta(FlightInfo& fi) {
     fi.arr_time      = time(nullptr) + (time_t)(km / fi.speed_kmh * 3600.0f + app);
     fi.arr_estimated = true;
     struct tm t; localtime_r(&fi.arr_time, &t);
-    Serial.printf("[Flight] ETA %s: %.0f km at %.0f km/h → %02d:%02d local\n",
+    Log.printf("[Flight] ETA %s: %.0f km at %.0f km/h → %02d:%02d local\n",
                   dest->iata, km, fi.speed_kmh, t.tm_hour, t.tm_min);
 }
 
@@ -513,7 +514,8 @@ static String icao_cache_key(const FlightEntry& e) {
 static String icao_cache_get(const FlightEntry& e) {
     Preferences prefs;
     prefs.begin("flight", true);
-    String v = prefs.getString(icao_cache_key(e).c_str(), "");
+    String key = icao_cache_key(e);
+    String v   = prefs.isKey(key.c_str()) ? prefs.getString(key.c_str(), "") : "";
     prefs.end();
     return v;
 }
@@ -610,7 +612,7 @@ static void do_refresh(int slot) {
         if (live && fi.on_ground && fi.dep_actual && fi.arr_estimated && fi.arr_time > now)
             fi.arr_time = now;
     } else {
-        Serial.printf("[Flight] %s: outside search window — skipping live lookup\n",
+        Log.printf("[Flight] %s: outside search window — skipping live lookup\n",
                       s_entries[slot].callsign.c_str());
     }
 

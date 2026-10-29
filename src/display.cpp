@@ -6,6 +6,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "display.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include "../include/tramli_fonts.h"
 #include "../include/matrix_font.h"
@@ -285,7 +286,7 @@ void display_init() {
     ledcSetup(BL_PWM_CHANNEL, BL_PWM_FREQ, BL_PWM_RESOLUTION);
     ledcAttachPin(BOARD_TFT_BL, BL_PWM_CHANNEL);
     display_set_brightness(DAY_BRIGHTNESS);
-    Serial.println("[Display] Initialized (rotation=3, ips=true)");
+    Log.println("[Display] Initialized (rotation=3, ips=true)");
 }
 
 void display_set_brightness(uint8_t percent) {
@@ -445,14 +446,22 @@ static void draw_bus_icon(int x, int y, uint16_t color) {
 // ── Day / night brightness ───────────────────────────────────────────────────
 // Day and night each have their own level, cycled by the brightness button and
 // saved separately — adjusting at night no longer changes the daytime level.
-static const uint8_t DAY_LEVELS[]   = { 100, 80, 60, 40, 20 };
-static const uint8_t NIGHT_LEVELS[] = { 30, 20, 15, 10, 5 };
+// With a light sensor, the cycle starts with "auto" (level 0): the backlight
+// follows the room light — at night never brighter than the top night level.
+static const uint8_t AUTO = 0;
+static const uint8_t DAY_LEVELS[]   = { AUTO, 100, 80, 60, 40, 20 };
+static const uint8_t NIGHT_LEVELS[] = { AUTO, 30, 20, 15, 10, 5 };
 static uint8_t s_day_brightness    = DAY_BRIGHTNESS;
 static uint8_t s_night_brightness  = NIGHT_BRIGHTNESS;
 static bool    s_last_night_state  = false;  // last known night/day, to detect transitions
 static bool    s_screen_on         = true;
 static int     s_night_start_min   = NIGHT_START_HOUR * 60;  // minutes after midnight
 static int     s_night_end_min     = NIGHT_END_HOUR * 60;
+static bool    s_have_sensor       = false;
+static bool    s_saved_day = false, s_saved_night = false;   // levels came from NVS
+static float   s_auto_pct          = -1;     // smoothed automatic level; -1 = no reading yet
+static int     s_auto_applied      = -1;     // last automatic level sent to the backlight
+static bool    s_auto_paused       = false;  // an alert flash owns the backlight
 
 bool display_is_night() {
     time_t now = time(nullptr);
@@ -471,10 +480,22 @@ void display_set_night_schedule(int start_min, int end_min) {
     s_last_night_state = !display_is_night();  // force re-apply on next draw
 }
 
+// Backlight level for the current day/night state, resolving "auto"
+static uint8_t current_level() {
+    bool night = display_is_night();
+    uint8_t level = night ? s_night_brightness : s_day_brightness;
+    if (level != AUTO) return level;
+    float p = (s_auto_pct >= 0) ? s_auto_pct : (night ? NIGHT_BRIGHTNESS : DAY_BRIGHTNESS);
+    if (night && p > NIGHT_LEVELS[1]) p = NIGHT_LEVELS[1];
+    return (uint8_t)lroundf(p);
+}
+
 // Re-apply the level for the current day/night state (after a pulse, wake, …)
 void display_restore_brightness() {
     if (!s_screen_on) return;
-    display_set_brightness(display_is_night() ? s_night_brightness : s_day_brightness);
+    uint8_t level = current_level();
+    s_auto_applied = level;
+    display_set_brightness(level);
 }
 
 // Called once per second from every draw function. Switches level only at the
@@ -484,42 +505,99 @@ static void apply_night_brightness() {
     if (night != s_last_night_state) {
         s_last_night_state = night;
         display_restore_brightness();
-        Serial.printf("[Display] Auto brightness: %s mode\n", night ? "night" : "day");
+        Log.printf("[Display] Auto brightness: %s mode\n", night ? "night" : "day");
     }
 }
 
 void display_init_brightness() {
     Preferences prefs;
     prefs.begin("tramli", true);
+    s_saved_day   = prefs.isKey("bright_day");
+    s_saved_night = prefs.isKey("bright_night");
     int d = prefs.getInt("bright_day",   DAY_BRIGHTNESS);
     int n = prefs.getInt("bright_night", NIGHT_BRIGHTNESS);
     prefs.end();
-    if (d >= 5 && d <= 100) s_day_brightness   = (uint8_t)d;
-    if (n >= 5 && n <= 100) s_night_brightness = (uint8_t)n;
+    if (d >= 0 && d <= 100) s_day_brightness   = (uint8_t)d;
+    if (n >= 0 && n <= 100) s_night_brightness = (uint8_t)n;
+    // "auto" needs the sensor — known after display_enable_auto_brightness()
+    if (s_day_brightness   == AUTO) s_day_brightness   = DAY_BRIGHTNESS;
+    if (s_night_brightness == AUTO) s_night_brightness = NIGHT_BRIGHTNESS;
     s_last_night_state = display_is_night();
     display_restore_brightness();
-    Serial.printf("[Display] Brightness loaded: day %d%%, night %d%% (%s)\n",
+    Log.printf("[Display] Brightness loaded: day %d%%, night %d%% (%s)\n",
                   s_day_brightness, s_night_brightness, s_last_night_state ? "night" : "day");
 }
 
-// Next level in the cycle (wraps); unknown levels jump to the first entry
-static uint8_t next_level(const uint8_t* levels, int n, uint8_t cur) {
-    for (int i = 0; i < n; i++)
-        if (levels[i] == cur) return levels[(i + 1) % n];
-    return levels[0];
+void display_enable_auto_brightness() {
+    s_have_sensor = true;
+    // Saved "auto", or never adjusted → automatic. The first start with this
+    // feature switches both to auto once (levels picked before had no "auto"
+    // to choose); later choices with the button stick.
+    Preferences prefs;
+    prefs.begin("tramli", false);
+    if (!prefs.isKey("auto_intro")) {
+        prefs.putInt("bright_day", AUTO);
+        prefs.putInt("bright_night", AUTO);
+        prefs.putBool("auto_intro", true);
+    }
+    if (!s_saved_day   || prefs.getInt("bright_day",   -1) == AUTO) s_day_brightness   = AUTO;
+    if (!s_saved_night || prefs.getInt("bright_night", -1) == AUTO) s_night_brightness = AUTO;
+    prefs.end();
+    Log.printf("[Display] Light sensor: day %s, night %s\n",
+               s_day_brightness == AUTO ? "auto" : String(s_day_brightness).c_str(),
+               s_night_brightness == AUTO ? "auto" : String(s_night_brightness).c_str());
 }
 
-void display_step_brightness() {
+bool display_auto_brightness() {
+    return (display_is_night() ? s_night_brightness : s_day_brightness) == AUTO;
+}
+
+void display_pause_auto_brightness(bool paused) { s_auto_paused = paused; }
+
+// Room light → backlight, on a log scale (the eye's response). The sensor sits
+// behind the glass and sees only a fraction of the light, so its "lux" is far
+// below the room's: measured 0.05 under a lamp in the evening, ~70 with a phone
+// flashlight on it. Mapped from AMB_DARK (and below: 8 %) to AMB_BRIGHT (100 %):
+// lamp-lit room ~43 %, daylight indoors ~75 %. Smoothed, so a passing shadow
+// doesn't flicker the screen.
+static const float AMB_DARK   = 0.002f;
+static const float AMB_BRIGHT = 10.0f;
+
+void display_set_ambient_light(float lux) {
+    if (lux < 0) return;
+    float pos = (log10f(fmaxf(lux, AMB_DARK)) - log10f(AMB_DARK)) /
+                (log10f(AMB_BRIGHT) - log10f(AMB_DARK));
+    float target = 8.0f + 92.0f * fminf(pos, 1.0f);
+    s_auto_pct = (s_auto_pct < 0) ? target : s_auto_pct + (target - s_auto_pct) * 0.3f;
+    if (!s_screen_on || s_auto_paused || !display_auto_brightness()) return;
+    int level = current_level();
+    if (abs(level - s_auto_applied) < 2) return;   // ignore tiny changes
+    s_auto_applied = level;
+    display_set_brightness(level);
+}
+
+// Next level in the cycle (wraps); unknown levels jump to the first entry.
+// Without a sensor, "auto" is skipped.
+static uint8_t next_level(const uint8_t* levels, int n, uint8_t cur) {
+    int start = s_have_sensor ? 0 : 1;
+    for (int i = start; i < n; i++)
+        if (levels[i] == cur) return levels[i + 1 < n ? i + 1 : start];
+    return levels[start];
+}
+
+uint8_t display_step_brightness() {
     bool night = display_is_night();
     uint8_t& level = night ? s_night_brightness : s_day_brightness;
     level = night ? next_level(NIGHT_LEVELS, sizeof(NIGHT_LEVELS), level)
                   : next_level(DAY_LEVELS,   sizeof(DAY_LEVELS),   level);
-    display_set_brightness(level);
+    display_restore_brightness();
     Preferences prefs;
     prefs.begin("tramli", false);
     prefs.putInt(night ? "bright_night" : "bright_day", level);
     prefs.end();
-    Serial.printf("[Display] %s brightness → %d%%\n", night ? "Night" : "Day", level);
+    Log.printf("[Display] %s brightness → %s\n", night ? "Night" : "Day",
+               level == AUTO ? "auto" : (String(level) + "%").c_str());
+    return level;
 }
 
 void display_set_screen_on(bool on) {
@@ -533,7 +611,7 @@ void display_set_screen_on(bool on) {
         display_set_brightness(0);
         gfx->displayOff();           // panel sleep: backlight off alone still powers the driver
     }
-    Serial.printf("[Display] Screen %s\n", on ? "on" : "off");
+    Log.printf("[Display] Screen %s\n", on ? "on" : "off");
 }
 
 bool display_screen_on() { return s_screen_on; }
@@ -1695,7 +1773,7 @@ static int draw_qr(int x, int y, int scale, const char* text) {
     cfg.display_func       = qr_draw_cb;
     cfg.max_qrcode_version = 5;               // ≤ 37 modules — fits the screen
     cfg.qrcode_ecc_level   = ESP_QRCODE_ECC_LOW;
-    if (esp_qrcode_generate(&cfg, text) != ESP_OK) Serial.printf("[QR] failed for '%s'\n", text);
+    if (esp_qrcode_generate(&cfg, text) != ESP_OK) Log.printf("[QR] failed for '%s'\n", text);
     return s_qr_drawn;
 }
 

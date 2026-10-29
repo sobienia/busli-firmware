@@ -86,7 +86,7 @@ StockFetchResult stocks_fetch_batch(StockQuote quotes[], int n, bool found[]);
 
 // ── Generic helpers (stocks.cpp) ─────────────────────────────────────────────
 
-// Ticker without exchange suffix for display: "NESN.SW" → "NESN".
+// Ticker without exchange suffix for display: "NESN.SW" → "NESN", "CHFEUR=X" → "CHFEUR".
 String stocks_display_symbol(const String& symbol);
 
 // True on weekdays between STOCKS_OPEN_HOUR and STOCKS_CLOSE_HOUR local time.

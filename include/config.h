@@ -192,7 +192,7 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.7.4"
+#define FIRMWARE_VERSION        "1.7.5"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 

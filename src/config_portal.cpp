@@ -18,12 +18,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/config_portal.h"
+#include "../include/devlog.h"
 #include "../include/config.h"
 #include "../include/pager.h"
 #include "../include/swiss_stops.h"
 #include "../include/stocks.h"
 #include "../include/http_lock.h"
 #include "../include/geo.h"
+#include "../include/web_tools.h"
 #include "display.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -123,11 +125,18 @@ static void send_forbidden() {
 
 // ── NVS helpers ───────────────────────────────────────────────────────────────
 
-int config_load_wifi(String ssids[], String passes[], String users[]) {
+// A setting stored as JSON, "" if it was never saved (checked first: reading a
+// missing string logs an error)
+static String nvs_json(const char* key) {
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_WIFI, "");
+    String json = prefs.isKey(key) ? prefs.getString(key, "") : "";
     prefs.end();
+    return json;
+}
+
+int config_load_wifi(String ssids[], String passes[], String users[]) {
+    String json = nvs_json(NVS_KEY_WIFI);
     if (json.isEmpty()) return 0;
 
     JsonDocument doc;
@@ -145,10 +154,7 @@ int config_load_wifi(String ssids[], String passes[], String users[]) {
 }
 
 int config_load_stops(StopEntry entries[]) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_STOPS, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_STOPS);
     if (json.isEmpty()) return 0;
 
     JsonDocument doc;
@@ -167,10 +173,7 @@ int config_load_stops(StopEntry entries[]) {
 }
 
 bool config_load_countdown(String& label, String& target_str, int& icon) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_COUNTDOWN, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_COUNTDOWN);
     if (json.isEmpty()) return false;
 
     JsonDocument doc;
@@ -182,10 +185,7 @@ bool config_load_countdown(String& label, String& target_str, int& icon) {
 }
 
 int config_load_flights(FlightEntry entries[]) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_FLIGHTS, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_FLIGHTS);
     if (json.isEmpty()) return 0;
 
     JsonDocument doc;
@@ -209,10 +209,7 @@ int config_load_flights(FlightEntry entries[]) {
 }
 
 bool config_load_opensky(String& user, String& pass) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_OPENSKY, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_OPENSKY);
     if (json.isEmpty()) return false;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return false;
@@ -230,10 +227,7 @@ bool config_load_ota_enabled() {
 }
 
 bool config_load_parcel(String& out_tracking, int& out_pulses) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_PARCEL, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_PARCEL);
     if (json.isEmpty()) return false;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return false;
@@ -243,10 +237,7 @@ bool config_load_parcel(String& out_tracking, int& out_pulses) {
 }
 
 bool config_load_pager(PagerConfig& out) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_PAGER, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_PAGER);
 
     bool needs_save = false;
     if (!json.isEmpty()) {
@@ -310,10 +301,7 @@ bool config_load_today_page() {
 
 void config_load_kiosk(KioskConfig& out) {
     out = KioskConfig();
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_KIOSK, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_KIOSK);
     if (json.isEmpty()) return;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return;
@@ -343,10 +331,7 @@ bool config_load_info_page() {
 
 void config_load_weather_locations(WeatherLocations& out) {
     out = WeatherLocations();
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_WX_LOCS, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_WX_LOCS);
     if (json.isEmpty()) return;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return;
@@ -373,10 +358,7 @@ static void config_save_weather_locations(const WeatherLocations& w) {
 
 void config_load_night(NightConfig& out) {
     out = NightConfig();
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_NIGHT, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_NIGHT);
     if (json.isEmpty()) return;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return;
@@ -415,10 +397,7 @@ static int parse_hhmm(const String& s, int fallback) {
 }
 
 bool config_load_stocks(StocksConfig& out) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_STOCKS, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_STOCKS);
     out.count = 0;
     if (json.isEmpty()) return false;
     JsonDocument doc;
@@ -451,10 +430,7 @@ void config_save_stocks(const StocksConfig& cfg) {
 }
 
 bool config_load_commute(CommuteConfig& out) {
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, true);
-    String json = prefs.getString(NVS_KEY_COMMUTE, "");
-    prefs.end();
+    String json = nvs_json(NVS_KEY_COMMUTE);
     if (json.isEmpty()) return false;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return false;
@@ -573,7 +549,7 @@ static void save_to_nvs(String ssids[], String passes[], String users[], int n_w
 
     prefs.end();
 
-    Serial.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS, OTA=%s parcel=%s\n",
+    Log.printf("[Portal] Saved %d WiFi, %d stops, %d flights to NVS, OTA=%s parcel=%s\n",
                   n_wifi, n_stops, n_flights, ota_enabled ? "on" : "off",
                   parcel_tracking.isEmpty() ? "off" : parcel_tracking.c_str());
 }
@@ -982,8 +958,9 @@ static String build_page(String ssids[], String passes[], String users[],
 
     h += F("<button type='submit'>&#128190;&nbsp; Save &amp; Reboot</button>"
            "</form>"
-           "<p style='text-align:center;margin-top:20px'>"
-           "<a href='/update' style='color:#999;font-size:13px'>&#9652; Firmware update</a>"
+           "<p style='text-align:center;margin-top:20px'>");
+    h += web_tools_links();
+    h += F("<a href='/update' style='color:#999;font-size:13px'>&#9652; Firmware update</a>"
            "</p>"
            "<script>"
            "var _t;"
@@ -1135,7 +1112,7 @@ static void send_pair_page(const char* error) {
         if (s_pair_code.isEmpty() || millis() - s_pair_started_ms > PAIR_CODE_TTL_MS) pair_code_new();
         s_pair_on_screen = true;
         if (s_pair_cb) s_pair_cb(s_pair_code.c_str());
-        Serial.println("[Web] Pairing code shown on screen");
+        Log.println("[Web] Pairing code shown on screen");
     }
     String h = FPSTR(PAGE_HEAD);
     h += F("<h1>Busli settings</h1>"
@@ -1160,7 +1137,7 @@ static void handle_pair() {
         // before the real visit. The screen closes the code/QR right away though.
         if (s_pair_cb) s_pair_cb(nullptr);
         s_pair_on_screen = false;
-        Serial.println("[Web] Browser paired");
+        Log.println("[Web] Browser paired");
         // SameSite=Lax, not Strict: Strict cookies aren't sent when the page is
         // opened from another app (the camera's QR scanner), so the browser would
         // look unpaired. Lax still blocks other websites from posting to /save.
@@ -1397,17 +1374,17 @@ static void handle_update_upload() {
     if (!authorized()) return;   // never flash anything from an unpaired browser
     HTTPUpload& up = s_server.upload();
     if (up.status == UPLOAD_FILE_START) {
-        Serial.printf("[OTA] Upload start: %s\n", up.filename.c_str());
+        Log.printf("[OTA] Upload start: %s\n", up.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN))
-            Serial.println("[OTA] Update.begin failed");
+            Log.println("[OTA] Update.begin failed");
     } else if (up.status == UPLOAD_FILE_WRITE) {
         if (Update.write(up.buf, up.currentSize) != up.currentSize)
-            Serial.println("[OTA] Write error");
+            Log.println("[OTA] Write error");
     } else if (up.status == UPLOAD_FILE_END) {
         if (Update.end(true))
-            Serial.printf("[OTA] Flash complete: %u bytes\n", up.totalSize);
+            Log.printf("[OTA] Flash complete: %u bytes\n", up.totalSize);
         else
-            Serial.println("[OTA] Update.end failed");
+            Log.println("[OTA] Update.end failed");
     }
 }
 
@@ -1448,7 +1425,7 @@ static void handle_pager_test() {
 static void handle_stock_check() {
     if (!authorized()) { send_forbidden(); return; }
     String sym = s_server.arg("s"); sym.trim(); sym.toUpperCase();
-    Serial.printf("[Portal] Stock check '%s' — STA status %d, IP %s\n", sym.c_str(),
+    Log.printf("[Portal] Stock check '%s' — STA status %d, IP %s\n", sym.c_str(),
                   (int)WiFi.status(), WiFi.localIP().toString().c_str());
     JsonDocument doc;
     if (sym.isEmpty()) {
@@ -1621,6 +1598,7 @@ static void ensure_routes() {
     s_server.on("/remote",      HTTP_GET,  handle_remote_page);
     s_server.on("/api/state",   HTTP_GET,  handle_api_state);
     s_server.on("/api/cmd",     HTTP_POST, handle_api_cmd);
+    web_tools_register(s_server, authorized);   // /log, /backup, /restore
     s_server.on("/update",      HTTP_GET,  handle_update_page);
     s_server.on("/update",      HTTP_POST, handle_update_finish, handle_update_upload);
     s_server.onNotFound(handle_not_found);
@@ -1654,7 +1632,7 @@ void config_web_begin() {
     ensure_routes();
     s_web_enabled = true;
     if (MDNS.begin(WEB_HOSTNAME)) MDNS.addService("http", "tcp", 80);
-    Serial.printf("[Web] Settings at http://%s.local or http://%s\n",
+    Log.printf("[Web] Settings at http://%s.local or http://%s\n",
                   WEB_HOSTNAME, WiFi.localIP().toString().c_str());
 }
 
@@ -1667,7 +1645,7 @@ void config_web_poll() {
 }
 
 void config_portal_run(uint32_t timeoutMs, bool (*should_cancel)()) {
-    Serial.println("[Portal] Starting config portal...");
+    Log.println("[Portal] Starting config portal...");
     display_show_status("Configure device");
     pair_code_clear();
 
@@ -1685,10 +1663,10 @@ void config_portal_run(uint32_t timeoutMs, bool (*should_cancel)()) {
     }
     WiFi.softAP(PORTAL_SSID);
     delay(200);
-    Serial.printf("[Portal] Internet via STA: %s\n", sta_online ? "yes" : "no");
+    Log.printf("[Portal] Internet via STA: %s\n", sta_online ? "yes" : "no");
 
     IPAddress ip = WiFi.softAPIP();
-    Serial.printf("[Portal] AP '%s' up at %s\n", PORTAL_SSID, ip.toString().c_str());
+    Log.printf("[Portal] AP '%s' up at %s\n", PORTAL_SSID, ip.toString().c_str());
 
     // Captive-portal DNS: redirect every hostname to 192.168.4.1
     s_dns.start(53, "*", ip);
@@ -1707,7 +1685,7 @@ void config_portal_run(uint32_t timeoutMs, bool (*should_cancel)()) {
         bool timed_out = timeoutMs > 0 && millis() - start > timeoutMs;
         bool cancelled = !timed_out && should_cancel && should_cancel();
         if (timed_out || cancelled) {
-            Serial.println(cancelled ? "[Portal] Cancelled — back to normal"
+            Log.println(cancelled ? "[Portal] Cancelled — back to normal"
                                      : "[Portal] Timeout — returning to normal boot");
             s_dns.stop();
             WiFi.softAPdisconnect(true);   // back to STA-only; an existing link stays up

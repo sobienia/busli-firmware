@@ -41,9 +41,19 @@ void display_set_theme(uint16_t row0, uint16_t rows, uint16_t dim, uint16_t meta
 void display_set_flipped(bool flipped);
 
 // Step through brightness levels for the current mode (wraps), saved per mode:
-//   day   100 → 80 → 60 → 40 → 20
-//   night  30 → 20 → 15 → 10 → 5
-void display_step_brightness();
+//   day   (auto) → 100 → 80 → 60 → 40 → 20
+//   night (auto) →  30 → 20 → 15 → 10 → 5
+// "auto" only with a light sensor. Returns the new level (0 = auto).
+uint8_t display_step_brightness();
+
+// Light sensor present: offer "auto", and use it unless a level was chosen
+void display_enable_auto_brightness();
+// Current mode (day/night) follows the room light
+bool display_auto_brightness();
+// Room light in lux, about once a second — adjusts the backlight in auto mode
+void display_set_ambient_light(float lux);
+// An alert flash drives the backlight meanwhile (no automatic changes)
+void display_pause_auto_brightness(bool paused);
 
 // Night hours as minutes after midnight (start == end disables night mode).
 // Defaults to NIGHT_START_HOUR..NIGHT_END_HOUR until set.

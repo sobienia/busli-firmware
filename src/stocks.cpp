@@ -9,6 +9,7 @@
 #include "../include/config.h"
 
 String stocks_display_symbol(const String& symbol) {
+    if (symbol.endsWith("=X")) return symbol.substring(0, symbol.length() - 2);   // currency pair
     int dot = symbol.lastIndexOf('.');
     return (dot > 0) ? symbol.substring(0, dot) : symbol;
 }

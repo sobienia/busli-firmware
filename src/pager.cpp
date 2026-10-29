@@ -7,6 +7,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/pager.h"
+#include "../include/devlog.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
@@ -57,7 +58,7 @@ bool pager_publish(const String& to_topic, const String& sender_name,
         http.addHeader("Content-Type", "text/plain;charset=UTF-8");
         int code = http.POST(body);
         http.end();
-        Serial.printf("[Pager] Publish to %s: HTTP %d (attempt %d)\n",
+        Log.printf("[Pager] Publish to %s: HTTP %d (attempt %d)\n",
                       to_topic.c_str(), code, attempt + 1);
         if (code == 200) return true;
     }
