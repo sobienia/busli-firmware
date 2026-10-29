@@ -9,6 +9,8 @@ enum TouchGesture {
     TOUCH_SWIPE_DOWN,
     TOUCH_LONG_PRESS,
     TOUCH_DOUBLE_TAP,
+    TOUCH_TAP,          // single tap — reported once the double-tap window has passed;
+                        // touch_last_screen_x/y() give where it was
 };
 
 // Call once in setup() after display_init() — starts I2C and initialises the IC.

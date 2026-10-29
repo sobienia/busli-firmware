@@ -8,8 +8,6 @@
 #include <Preferences.h>
 #include <time.h>
 #include <Wire.h>
-#define XPOWERS_CHIP_SY6970
-#include <XPowersLib.h>
 
 #include "../include/config.h"
 #include "../include/secrets.h"
@@ -21,6 +19,7 @@
 #include "../include/commute.h"
 #include "../include/pager.h"
 #include "../include/stocks.h"
+#include "../include/battery.h"
 
 #include "display.h"
 #include "api.h"
@@ -129,7 +128,9 @@ static int      g_current_page = 0;
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 static int      current_stop_idx  = 0;
-static bool     large_font_mode   = false;
+static bool     large_font_mode   = false;   // persisted in NVS ("large_font")
+static uint32_t g_page_save_at_ms = 0;       // millis() when the current page should be saved; 0 = nothing pending
+static const uint32_t PAGE_SAVE_DELAY_MS = 10000;
 static uint32_t last_redraw_ms    = 0;
 static time_t   g_countdown_target = 0;
 static int      g_countdown_icon   = 0;
@@ -151,9 +152,11 @@ static StocksConfig g_stocks_cfg;
 static StockQuote   g_stock_quotes[STOCKS_MAX];
 static int          g_stock_sub_page  = 0;   // which group of tickers is on screen
 static uint32_t     g_stock_rotate_ms = 0;   // millis() of the last sub-page change
+static int          g_stock_detail    = -1;  // ticker shown in the detail view; -1 = list
 
 // Weather — display-side cache; populated from background task via fetch_task_get_weather()
 static WeatherData weather_data    = {};
+static String      g_weather_city;        // town of the place the weather is for
 static uint32_t    g_setup_done_ms = 0;  // set at end of setup(); used to detect "still loading"
 
 // Pager — display-side state
@@ -181,12 +184,15 @@ static int      g_parcel_pulse_rem = 0;  // remaining flash cycles
 static uint32_t g_parcel_pulse_ms  = 0;  // millis() when current half-cycle started
 static bool     g_parcel_pulse_hi  = false; // true = currently at 100% brightness
 
-// Battery — read via SY6970 PMU on the I2C bus shared with touch (SDA=5 SCL=6)
-static XPowersPPM pmu;
-static bool       s_pmu_ok          = false;
+// Battery — cached from battery_status() once a minute (see update_battery())
 static int        g_battery_pct     = -1;
 static bool       g_battery_charging = false;
 static uint32_t   last_battery_ms   = 0;
+static int        g_battery_warned_at = 101;  // lowest warning level already shown
+
+// Full-screen message overlay (low battery warning, …): page redraws pause until
+// this millis() deadline or until the screen is touched. 0 = no overlay.
+static uint32_t   g_overlay_until_ms = 0;
 
 // Button debounce state — BOOT button
 static bool     button_was_pressed    = false;
@@ -247,6 +253,34 @@ static void set_stock_sub_page(int idx) {
     last_redraw_ms    = 0;   // force immediate redraw
 }
 
+// Detail view: tap a ticker to open it, swipe up/down for the next/previous one,
+// tap again (or swipe left/right to another page) to go back.
+// idx -1 closes it; the list returns at the sub-page that holds the ticker.
+static void set_stock_detail(int idx) {
+    int count = g_stocks_cfg.count;
+    if (idx >= 0 && count > 0) idx = ((idx % count) + count) % count;
+    else idx = -1;
+    if (idx < 0 && g_stock_detail >= 0) {
+        int per_page = stocks_per_page(g_stocks_cfg.layout, count);
+        g_stock_sub_page  = g_stock_detail / per_page;
+        g_stock_rotate_ms = millis();
+    }
+    g_stock_detail = idx;
+    fetch_task_request_stock_chart(idx);
+    last_redraw_ms = 0;
+    display_invalidate();
+    Serial.printf("[Stocks] Detail view → %d\n", idx);
+}
+
+// Portfolio tap: open the tapped ticker's details, or close the details
+static void handle_stock_tap() {
+    if (g_stock_detail >= 0) { set_stock_detail(-1); return; }
+    int per_page = stocks_per_page(g_stocks_cfg.layout, g_stocks_cfg.count);
+    int cell = display_stock_cell_at(touch_last_screen_x(), touch_last_screen_y(), per_page);
+    int idx  = (cell >= 0) ? g_stock_sub_page * per_page + cell : -1;
+    if (idx >= 0 && idx < g_stocks_cfg.count) set_stock_detail(idx);
+}
+
 // Set initial page based on time: morning → work commute, afternoon/evening → home commute.
 static void set_initial_page() {
     time_t now_t = time(nullptr);
@@ -263,9 +297,16 @@ static void set_initial_page() {
 // ║  WIFI — try NVS credentials first, fall back to secrets.h                 ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-static bool try_connect(const String& ssid, const String& pass,
-                        const String& user = "", uint32_t timeout_ms = 8000) {
-    if (ssid.isEmpty()) return false;
+// Saved networks (NVS) followed by the secrets.h fallback. Returns the count.
+static const int MAX_WIFI_CREDS = 4;
+static int load_wifi_creds(String ssids[], String passes[], String users[]) {
+    int n = config_load_wifi(ssids, passes, users);   // up to 3
+    ssids[n] = WIFI_SSID; passes[n] = WIFI_PASSWORD; users[n] = "";
+    return n + 1;
+}
+
+// Start connecting to one network without waiting. user != "" → WPA2-Enterprise.
+static void start_connect(const String& ssid, const String& pass, const String& user) {
     if (user.length() > 0) {
         Serial.printf("[WiFi] Trying enterprise '%s' user='%s'...\n", ssid.c_str(), user.c_str());
         esp_wifi_sta_wpa2_ent_set_identity((uint8_t*)user.c_str(), user.length());
@@ -277,6 +318,13 @@ static bool try_connect(const String& ssid, const String& pass,
         Serial.printf("[WiFi] Trying '%s'...\n", ssid.c_str());
         WiFi.begin(ssid.c_str(), pass.c_str());
     }
+}
+
+// Blocking connect, used at boot only (the boot animation is running meanwhile)
+static bool try_connect(const String& ssid, const String& pass,
+                        const String& user = "", uint32_t timeout_ms = 8000) {
+    if (ssid.isEmpty()) return false;
+    start_connect(ssid, pass, user);
     uint32_t t = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t < timeout_ms) {
         delay(300);
@@ -294,19 +342,62 @@ static bool try_connect(const String& ssid, const String& pass,
 
 static bool connect_wifi() {
     WiFi.mode(WIFI_STA);
-
-    // Try NVS-stored networks first
-    String ssids[3], passes[3], users[3];
-    int n = config_load_wifi(ssids, passes, users);
-    for (int i = 0; i < n; i++) {
+    String ssids[MAX_WIFI_CREDS], passes[MAX_WIFI_CREDS], users[MAX_WIFI_CREDS];
+    int n = load_wifi_creds(ssids, passes, users);
+    for (int i = 0; i < n; i++)
         if (try_connect(ssids[i], passes[i], users[i])) return true;
-    }
-
-    // Fall back to hardcoded secrets.h credential
-    if (try_connect(WIFI_SSID, WIFI_PASSWORD)) return true;
-
     Serial.println("[WiFi] All credentials failed");
     return false;
+}
+
+// ── Reconnect without freezing the UI ────────────────────────────────────────
+// When the link drops, saved networks are tried one at a time: start an attempt,
+// return to loop(), check back on later iterations, move on after
+// WIFI_ATTEMPT_MS. A full round is retried every WIFI_RETRY_MS.
+static const uint32_t WIFI_RETRY_MS   = 30000;
+static const uint32_t WIFI_ATTEMPT_MS = 10000;
+static String   g_wifi_ssids[MAX_WIFI_CREDS], g_wifi_passes[MAX_WIFI_CREDS], g_wifi_users[MAX_WIFI_CREDS];
+static int      g_wifi_n         = 0;
+static int      g_wifi_try       = -1;   // index being tried; -1 = idle
+static uint32_t g_wifi_try_ms    = 0;
+static uint32_t g_wifi_round_ms  = 0;
+static bool     g_web_started    = false;
+
+static void wifi_end_attempt() {
+    if (g_wifi_try >= 0 && g_wifi_users[g_wifi_try].length() > 0) esp_wifi_sta_wpa2_ent_disable();
+}
+
+static void wifi_reconnect_tick() {
+    uint32_t now = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+        if (g_wifi_try >= 0) {
+            wifi_end_attempt();
+            g_wifi_try = -1;
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+            configTzTime(POSIX_TZ, "pool.ntp.org", "time.nist.gov");
+            Serial.printf("[WiFi] Reconnected, IP: %s\n", WiFi.localIP().toString().c_str());
+        }
+        if (!g_web_started) { config_web_begin(); g_web_started = true; }
+        return;
+    }
+    if (g_wifi_try < 0) {
+        if (now - g_wifi_round_ms < WIFI_RETRY_MS) return;
+        g_wifi_round_ms = now;
+        g_wifi_n = load_wifi_creds(g_wifi_ssids, g_wifi_passes, g_wifi_users);
+        Serial.println("[WiFi] Disconnected — reconnecting in the background");
+        WiFi.disconnect();
+        g_wifi_try = 0;
+    } else if (now - g_wifi_try_ms < WIFI_ATTEMPT_MS) {
+        return;                               // current attempt still running
+    } else {
+        wifi_end_attempt();
+        WiFi.disconnect();
+        if (++g_wifi_try >= g_wifi_n) { g_wifi_try = -1; g_wifi_round_ms = now; return; }
+    }
+    while (g_wifi_try < g_wifi_n && g_wifi_ssids[g_wifi_try].isEmpty()) g_wifi_try++;
+    if (g_wifi_try >= g_wifi_n) { g_wifi_try = -1; return; }
+    g_wifi_try_ms = now;
+    start_connect(g_wifi_ssids[g_wifi_try], g_wifi_passes[g_wifi_try], g_wifi_users[g_wifi_try]);
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -330,17 +421,127 @@ static void sync_clock() {
                   t.tm_hour, t.tm_min, t.tm_sec);
 }
 
+// Show a message over the current page for duration_ms (touch dismisses it).
+static void show_overlay(const char* msg, uint32_t duration_ms) {
+    display_set_screen_on(true);   // also during screen-off night mode
+    display_show_status(msg);
+    g_overlay_until_ms = millis() + duration_ms;
+    if (g_overlay_until_ms == 0) g_overlay_until_ms = 1;
+}
+
+// Settings on the normal Wi-Fi: show the pairing code while a browser waits for it
+static void on_pairing_code(const char* code) {
+    if (code) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Settings code\n%s\nEnter it in your browser", code);
+        show_overlay(msg, 120000);
+    } else if (g_overlay_until_ms != 0) {
+        g_overlay_until_ms = 0;
+        last_redraw_ms     = 0;
+        g_pager_dirty      = true;
+    }
+}
+
+static bool overlay_active() {
+    if (g_overlay_until_ms == 0) return false;
+    if ((int32_t)(millis() - g_overlay_until_ms) >= 0 || touch_is_pressed()) {
+        g_overlay_until_ms = 0;
+        last_redraw_ms     = 0;   // repaint the page right away
+        g_pager_dirty      = true;
+        return false;
+    }
+    return true;
+}
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║  SCREEN POWER — night mode (dim or off) and wake-on-touch                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+// In "screen off" night mode any touch or button wakes the screen for
+// WAKE_ON_TOUCH_SEC (each further interaction extends it). The press that wakes
+// the screen is swallowed, so it doesn't also switch pages or open menus.
+
+static NightConfig g_night;
+static bool        g_woken           = false;
+static uint32_t    g_woke_at_ms      = 0;
+static bool        g_input_swallowed = false;
+
+static bool any_input_down() {
+    return touch_is_pressed() ||
+           digitalRead(PIN_BOOT_BUTTON) == LOW ||
+           digitalRead(PIN_BTN_BRIGHT)  == LOW ||
+           digitalRead(PIN_BTN_THEME)   == LOW;
+}
+
+// Updates screen power and the fetch rate. Returns true while input must be
+// ignored (from the waking press until it is released, inclusive).
+static bool power_tick() {
+    bool night    = display_is_night();
+    bool off_mode = g_night.screen_off && night;
+    bool input    = any_input_down();
+
+    if (input && off_mode) {
+        if (!display_screen_on()) g_input_swallowed = true;
+        g_woken      = true;
+        g_woke_at_ms = millis();
+    }
+    if (g_woken && millis() - g_woke_at_ms >= WAKE_ON_TOUCH_SEC * 1000UL) g_woken = false;
+
+    // Overlays (pairing code, warnings) keep the screen on while they show
+    bool want_on = !off_mode || g_woken || g_overlay_until_ms != 0;
+    if (want_on != display_screen_on()) {
+        display_set_screen_on(want_on);
+        if (want_on) {
+            last_redraw_ms = 0;
+            g_pager_dirty  = true;
+            fetch_task_force_refresh();   // data was refreshed rarely while off
+        }
+    }
+    fetch_task_set_power_mode(!want_on ? FETCH_POWER_SCREEN_OFF
+                              : night  ? FETCH_POWER_NIGHT
+                                       : FETCH_POWER_NORMAL);
+
+    bool swallow = g_input_swallowed;
+    if (!input) g_input_swallowed = false;
+    return swallow;
+}
+
 static void update_battery() {
-    if (!s_pmu_ok) { g_battery_pct = -1; g_battery_charging = false; return; }
-    uint16_t mv = pmu.getBattVoltage();
-    // getBattVoltage() returns 0 when the ADC hasn't produced a reading yet
-    if (mv == 0) { g_battery_pct = -1; g_battery_charging = false; return; }
-    g_battery_charging = pmu.isCharging();
-    int pct = (int)((mv - 3200) * 100 / (4200 - 3200));
-    if (pct < 0)   pct = 0;
-    if (pct > 100) pct = 100;
-    g_battery_pct = pct;
-    Serial.printf("[Batt] %umV → %d%%%s\n", mv, pct, g_battery_charging ? " (charging)" : "");
+    battery_update();
+    const BatteryStatus& b = battery_status();
+    g_battery_pct      = b.pct;
+    g_battery_charging = b.charging;
+    display_set_battery_estimate(b.hours_left);
+
+    // Low-battery warning, once per level while unplugged. Not while the screen
+    // is off at night — it shows at the next wake-up instead of lighting the room.
+    if (b.pct < 0 || b.charging) { g_battery_warned_at = 101; return; }
+    if (!display_screen_on()) return;
+    for (int level : BATTERY_WARN_LEVELS) {
+        if (b.pct <= level && g_battery_warned_at > level) {
+            g_battery_warned_at = level;
+            char msg[64];
+            if (b.hours_left >= 0)
+                snprintf(msg, sizeof(msg), "Battery low: %d%%\nAbout %.0f h left\nPlease charge",
+                         b.pct, b.hours_left < 1 ? 1.0f : b.hours_left);
+            else
+                snprintf(msg, sizeof(msg), "Battery low: %d%%\nPlease charge", b.pct);
+            show_overlay(msg, BATTERY_WARN_SHOW_MS);
+            Serial.printf("[Batt] Low-battery warning at %d%%\n", b.pct);
+            break;
+        }
+    }
+}
+
+// The footer weather follows the page: a transit stop's own location, the
+// commute station you're leaving from, or (portfolio) the device's own location.
+static void update_weather_place() {
+    const PageInfo& p = g_pages[g_current_page];
+    switch (p.type) {
+        case PageInfo::TRANSIT:      fetch_task_set_weather_place(p.transit_idx);        break;
+        case PageInfo::COMMUTE_WORK: fetch_task_set_weather_place(WEATHER_PLACE_HOME);   break;  // from home
+        case PageInfo::COMMUTE_HOME: fetch_task_set_weather_place(WEATHER_PLACE_WORK);   break;  // from work
+        case PageInfo::STOCKS:       fetch_task_set_weather_place(WEATHER_PLACE_HERE);   break;
+    }
 }
 
 static void switch_page(int new_page) {
@@ -349,19 +550,27 @@ static void switch_page(int new_page) {
     g_view             = VIEW_BOARD;
     g_stock_sub_page   = 0;
     g_stock_rotate_ms  = millis();
+    if (g_stock_detail >= 0) { g_stock_detail = -1; fetch_task_request_stock_chart(-1); }
     last_redraw_ms     = 0;   // force immediate redraw
     PageInfo& p = g_pages[new_page];
     if (p.type == PageInfo::TRANSIT) {
         current_stop_idx = p.transit_idx;
         fetch_task_set_active_stop(current_stop_idx);
     }
-    {
-        Preferences prefs;
-        prefs.begin("tramli", false);
-        prefs.putInt("page", new_page);
-        prefs.end();
-    }
+    update_weather_place();
+    // Remember the page once the user settles on it (not on every swipe —
+    // each NVS write wears flash). Saved by save_page_tick().
+    g_page_save_at_ms = millis() + PAGE_SAVE_DELAY_MS;
     display_invalidate();
+}
+
+static void save_page_tick() {
+    if (g_page_save_at_ms == 0 || (int32_t)(millis() - g_page_save_at_ms) < 0) return;
+    g_page_save_at_ms = 0;
+    Preferences prefs;
+    prefs.begin("tramli", false);
+    if (prefs.getInt("page", -1) != g_current_page) prefs.putInt("page", g_current_page);
+    prefs.end();
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -387,7 +596,16 @@ static void check_button() {
             display_show_status("Release to configure");
         } else if (held_ms >= CONFIG_HINT_MS && config_hint_stage < 1) {
             config_hint_stage = 1;
-            display_show_status("Hold to configure...");
+            if (WiFi.status() == WL_CONNECTED) {
+                // Also point to the settings page on the normal Wi-Fi
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                         "Hold to configure...\n\nOr on this Wi-Fi open\n%s.local\n%s",
+                         WEB_HOSTNAME, WiFi.localIP().toString().c_str());
+                display_show_status(msg);
+            } else {
+                display_show_status("Hold to configure...");
+            }
         }
     } else if (!pressed && button_was_pressed) {
         uint32_t held_ms = millis() - button_press_start_ms;
@@ -534,10 +752,9 @@ static void check_btn_theme() {
     s_btn_theme_was_pressed = pressed;
 }
 
-static void check_touch() {
-    // Always poll (handle_pager_touch reads the press state it updates), but while
-    // the pager is open its own tap handling owns the screen — ignore gestures.
-    TouchGesture gesture = touch_poll();
+// gesture comes from touch_poll() in loop(). While the pager is open its own
+// tap handling owns the screen, so gestures are ignored here.
+static void check_touch(TouchGesture gesture) {
     if (g_pager_state != PAGER_OFF) return;
     switch (gesture) {
         case TOUCH_SWIPE_LEFT:
@@ -564,8 +781,17 @@ static void check_touch() {
             }
             break;
         case TOUCH_DOUBLE_TAP:
+            // Font size only applies to the departure board; on the portfolio a
+            // quick double tap is just an impatient tap
+            if (g_pages[g_current_page].type == PageInfo::STOCKS) { handle_stock_tap(); break; }
             Serial.println("[Touch] Double tap → toggle font size");
             large_font_mode = !large_font_mode;
+            {
+                Preferences prefs;
+                prefs.begin("tramli", false);
+                prefs.putBool("large_font", large_font_mode);
+                prefs.end();
+            }
             display_invalidate();
             break;
         case TOUCH_SWIPE_DOWN:
@@ -580,8 +806,12 @@ static void check_touch() {
                     if (nv != g_view) { g_view = nv; display_invalidate(); }
                 }
             } else if (g_pages[g_current_page].type == PageInfo::STOCKS) {
-                set_stock_sub_page(g_stock_sub_page + 1);
-                Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
+                if (g_stock_detail >= 0) {
+                    set_stock_detail(g_stock_detail + 1);       // next ticker's details
+                } else {
+                    set_stock_sub_page(g_stock_sub_page + 1);
+                    Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
+                }
             } else {
                 // Commute: advance to next connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
@@ -605,8 +835,12 @@ static void check_touch() {
                     if (nv != g_view) { g_view = nv; display_invalidate(); }
                 }
             } else if (g_pages[g_current_page].type == PageInfo::STOCKS) {
-                set_stock_sub_page(g_stock_sub_page - 1);
-                Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
+                if (g_stock_detail >= 0) {
+                    set_stock_detail(g_stock_detail - 1);       // previous ticker's details
+                } else {
+                    set_stock_sub_page(g_stock_sub_page - 1);
+                    Serial.printf("[Touch] Stocks → sub-page %d\n", g_stock_sub_page);
+                }
             } else {
                 // Commute: go back to previous connection
                 CommuteData& cd = (g_pages[g_current_page].type == PageInfo::COMMUTE_HOME)
@@ -617,6 +851,9 @@ static void check_touch() {
                     display_invalidate();
                 }
             }
+            break;
+        case TOUCH_TAP:
+            if (g_pages[g_current_page].type == PageInfo::STOCKS) handle_stock_tap();
             break;
         default:
             break;
@@ -791,12 +1028,15 @@ static void parcel_pulse_tick() {
         // finished one full pulse (hi→lo)
         if (--g_parcel_pulse_rem <= 0) {
             g_parcel_pulsing = false;
-            display_invalidate();  // triggers apply_night_brightness() on next draw
+            display_restore_brightness();  // back to the day/night level (was stuck at 15%)
         }
     }
 }
 
-// Footer text shared by all pages: "12C/18C" and "UV2/4" (+ " | <parcel_prefix><status>").
+// Footer text shared by all pages:
+//   weather_str  "Zürich 10C/11C"  (town of the stop on screen + now/max temperature)
+//   uv_str       a rain alert when rain is coming or falling, otherwise "UV3/4";
+//                plus " | <parcel_prefix><status>" while a parcel is tracked
 // Shows "No weather" once the first fetch is clearly overdue.
 static void format_footer_weather(char* weather_str, size_t weather_len,
                                   char* uv_str, size_t uv_len,
@@ -804,16 +1044,30 @@ static void format_footer_weather(char* weather_str, size_t weather_len,
     weather_str[0] = '\0';
     uv_str[0]      = '\0';
     if (weather_data.valid) {
-        snprintf(weather_str, weather_len, "%dC/%dC",
+        snprintf(weather_str, weather_len, "%s%s%dC/%dC",
+                 g_weather_city.c_str(), g_weather_city.isEmpty() ? "" : " ",
                  (int)roundf(weather_data.temp_c),
                  (int)roundf(weather_data.temp_max_c));
-        if (g_parcel_status.length() > 0)
-            snprintf(uv_str, uv_len, "UV%d/%d | %s%s",
-                     weather_data.uv_index, weather_data.uv_index_max,
-                     parcel_prefix, g_parcel_status.c_str());
-        else
-            snprintf(uv_str, uv_len, "UV%d/%d",
+
+        // Rain alert replaces UV (which doesn't matter while it rains)
+        char info[24];
+        struct tm t;
+        if (weather_data.raining_now && weather_data.rain_end > 0) {
+            localtime_r(&weather_data.rain_end, &t);
+            snprintf(info, sizeof(info), "Rain until %02d:%02d", t.tm_hour, t.tm_min);
+        } else if (weather_data.raining_now) {
+            snprintf(info, sizeof(info), "Raining");
+        } else if (weather_data.rain_start > 0) {
+            localtime_r(&weather_data.rain_start, &t);
+            snprintf(info, sizeof(info), "Rain from %02d:%02d", t.tm_hour, t.tm_min);
+        } else {
+            snprintf(info, sizeof(info), "UV%d/%d",
                      weather_data.uv_index, weather_data.uv_index_max);
+        }
+        if (g_parcel_status.length() > 0)
+            snprintf(uv_str, uv_len, "%s | %s%s", info, parcel_prefix, g_parcel_status.c_str());
+        else
+            snprintf(uv_str, uv_len, "%s", info);
     } else if (g_setup_done_ms > 0 && millis() - g_setup_done_ms > 90000) {
         strncpy(weather_str, "No weather", weather_len - 1);
         weather_str[weather_len - 1] = '\0';
@@ -839,27 +1093,22 @@ void setup() {
     pinMode(PIN_BTN_THEME,   INPUT_PULLUP);
 
     display_init();
+    config_load_night(g_night);
+    display_set_night_schedule(g_night.start_min, g_night.end_min);
     display_init_brightness();
+    config_web_set_pairing_callback(on_pairing_code);
     load_theme();
     {
         Preferences prefs;
         prefs.begin("tramli", true);
         g_display_flipped = prefs.getBool("flipped", false);
+        large_font_mode   = prefs.getBool("large_font", false);
         prefs.end();
         if (g_display_flipped) display_set_flipped(true);
     }
     Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
     touch_init();
-    {
-        if (!pmu.begin(Wire, SY6970_SLAVE_ADDRESS, TOUCH_SDA_PIN, TOUCH_SCL_PIN)) {
-            Serial.println("[PMU] SY6970 not found — no battery indicator");
-        } else {
-            s_pmu_ok = true;
-            pmu.enableCharge();
-            pmu.enableMeasure();  // start continuous ADC so getBattVoltage() returns real data
-            Serial.println("[PMU] SY6970 OK");
-        }
-    }
+    battery_init();
     display_boot_animation_start();
 
     setup_stops();
@@ -915,6 +1164,7 @@ void setup() {
 
     setup_pages();
     set_initial_page();
+    update_weather_place();   // before the fetch task's first weather request
 
     http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);
@@ -955,6 +1205,7 @@ void setup() {
                 fetch_task_set_active_stop(current_stop_idx);
             }
             Serial.printf("[Page] Restored page %d from NVS\n", saved);
+            update_weather_place();
         }
     }
 
@@ -978,11 +1229,20 @@ void setup() {
 }
 
 void loop() {
-    check_button();
-    check_btn_bright();
-    check_btn_zoom();
-    check_btn_theme();
-    check_touch();
+    // Touch is polled once per loop; power_tick() may swallow the press that
+    // wakes the screen so it doesn't also act as a tap/swipe/button press.
+    TouchGesture gesture = touch_poll();
+    bool swallow_input   = power_tick();
+    if (!swallow_input) {
+        check_button();
+        check_btn_bright();
+        check_btn_zoom();
+        check_btn_theme();
+        check_touch(gesture);
+    }
+    save_page_tick();
+    wifi_reconnect_tick();
+    config_web_poll();
 
     uint32_t now_ms = millis();
 
@@ -1081,8 +1341,8 @@ void loop() {
             }
         }
 
-        handle_pager_touch();
-        if (g_pager_dirty) {
+        if (!swallow_input) handle_pager_touch();
+        if (g_pager_dirty && display_screen_on() && !overlay_active()) {
             g_pager_dirty = false;
             switch (g_pager_state) {
                 case PAGER_ACTIVITIES: {
@@ -1161,7 +1421,9 @@ void loop() {
         bool   parcel_changed = false;
         if (fetch_task_get_parcel(new_parcel, parcel_changed)) {
             g_parcel_status = new_parcel;
-            if (parcel_changed && g_parcel_pulses > 0 && !g_parcel_pulsing) {
+            // No flashing while the screen is off at night — the new status is
+            // visible in the footer at the next wake-up
+            if (parcel_changed && g_parcel_pulses > 0 && !g_parcel_pulsing && display_screen_on()) {
                 g_parcel_pulsing   = true;
                 g_parcel_pulse_rem = g_parcel_pulses;
                 g_parcel_pulse_hi  = true;
@@ -1172,7 +1434,7 @@ void loop() {
     }
 
     // Pull latest weather + commute from background cache once per second
-    fetch_task_get_weather(weather_data);
+    fetch_task_get_weather(weather_data, g_weather_city);
     if (commute_configured()) {
         CommuteData new_home, new_work;
         if (fetch_task_get_commute(new_home, new_work)) {
@@ -1189,7 +1451,8 @@ void loop() {
 
     // Redraw every second (clock + age counter; commute marquee advances from millis())
     PageInfo& page = g_pages[g_current_page];
-    if (config_hint_stage == 0 && now_ms - last_redraw_ms >= 1000) {
+    if (config_hint_stage == 0 && !overlay_active() && display_screen_on() &&
+        now_ms - last_redraw_ms >= 1000) {
         last_redraw_ms = now_ms;
 
         if (page.type == PageInfo::TRANSIT) {
@@ -1205,8 +1468,8 @@ void loop() {
                 time_t now_t  = time(nullptr);
                 int    age_s  = (fetch_time > 0) ? (int)(now_t - fetch_time) : 0;
 
-                char weather_str[20];
-                char uv_str[32];
+                char weather_str[40];
+                char uv_str[56];
                 format_footer_weather(weather_str, sizeof(weather_str),
                                       uv_str, sizeof(uv_str), "Package: ");
 
@@ -1242,42 +1505,67 @@ void loop() {
             int count    = fetch_task_get_stocks(g_stock_quotes);
             int per_page = stocks_per_page(g_stocks_cfg.layout, count);
             int n_sub    = stock_sub_page_count();
+            bool market_open = stocks_market_open(time(nullptr));
 
-            // Auto-rotate through ticker groups (swipe up/down resets the timer)
-            if (n_sub > 1 && now_ms - g_stock_rotate_ms >= (uint32_t)g_stocks_cfg.rotate_sec * 1000)
-                set_stock_sub_page(g_stock_sub_page + 1);
-            if (g_stock_sub_page >= n_sub) g_stock_sub_page = 0;
-
-            char label[32] = "Portfolio";
-            if (n_sub > 1)
-                snprintf(label, sizeof(label), "Portfolio %d/%d", g_stock_sub_page + 1, n_sub);
-            if (!stocks_market_open(time(nullptr)))
-                strncat(label, " - closed", sizeof(label) - strlen(label) - 1);
-
-            // Footer age = time since the newest quote arrived
-            time_t newest = 0;
-            for (int i = 0; i < count; i++) newest = std::max(newest, g_stock_quotes[i].fetch_time);
-            int age_s = (newest > 0) ? (int)(time(nullptr) - newest) : 0;
-
-            char weather_str[20];
-            char uv_str[32];
+            char weather_str[40];
+            char uv_str[56];
             format_footer_weather(weather_str, sizeof(weather_str), uv_str, sizeof(uv_str), "");
-            display_draw_stocks(label, g_current_page, g_num_pages,
-                                g_stock_quotes, count,
-                                g_stock_sub_page * per_page, per_page, age_s,
-                                WiFi.status() == WL_CONNECTED, g_battery_pct, g_battery_charging,
-                                weather_str, uv_str,
-                                weather_data.valid && weather_data.rain_today,
-                                weather_data.valid ? weather_data.precip_prob_pct : 0,
-                                weather_data.valid && weather_data.snow_today,
-                                weather_data.valid && weather_data.clear_today);
+
+            if (g_stock_detail >= count) set_stock_detail(-1);   // ticker list shrank
+            if (g_stock_detail >= 0) {
+                // Detail view of one ticker (no auto-rotation)
+                const StockQuote& q = g_stock_quotes[g_stock_detail];
+                char label[40];
+                snprintf(label, sizeof(label), "%s  %d/%d",
+                         stocks_display_symbol(q.symbol).c_str(), g_stock_detail + 1, count);
+                StockChart chart;
+                bool have_chart = fetch_task_get_stock_chart(g_stock_detail, chart);
+                int age_s = (q.fetch_time > 0) ? (int)(time(nullptr) - q.fetch_time) : 0;
+
+                FooterInfo f;
+                f.weather_str = weather_str;
+                f.uv_str      = uv_str;
+                f.rain_today  = weather_data.valid && weather_data.rain_today;
+                f.rain_pct    = weather_data.valid ? weather_data.precip_prob_pct : 0;
+                f.snow_today  = weather_data.valid && weather_data.snow_today;
+                f.clear_today = weather_data.valid && weather_data.clear_today;
+                f.wifi_ok     = WiFi.status() == WL_CONNECTED;
+                f.battery_pct = g_battery_pct;
+                f.battery_charging = g_battery_charging;
+                display_draw_stock_detail(label, g_current_page, g_num_pages, q,
+                                          have_chart ? &chart : nullptr, market_open, age_s, f);
+            } else {
+                // Auto-rotate through ticker groups (swipe up/down resets the timer)
+                if (n_sub > 1 && now_ms - g_stock_rotate_ms >= (uint32_t)g_stocks_cfg.rotate_sec * 1000)
+                    set_stock_sub_page(g_stock_sub_page + 1);
+                if (g_stock_sub_page >= n_sub) g_stock_sub_page = 0;
+
+                char label[32] = "Portfolio";
+                if (n_sub > 1)
+                    snprintf(label, sizeof(label), "Portfolio %d/%d", g_stock_sub_page + 1, n_sub);
+
+                // Footer age = time since the newest quote arrived
+                time_t newest = 0;
+                for (int i = 0; i < count; i++) newest = std::max(newest, g_stock_quotes[i].fetch_time);
+                int age_s = (newest > 0) ? (int)(time(nullptr) - newest) : 0;
+
+                display_draw_stocks(label, g_current_page, g_num_pages,
+                                    g_stock_quotes, count,
+                                    g_stock_sub_page * per_page, per_page, market_open, age_s,
+                                    WiFi.status() == WL_CONNECTED, g_battery_pct, g_battery_charging,
+                                    weather_str, uv_str,
+                                    weather_data.valid && weather_data.rain_today,
+                                    weather_data.valid ? weather_data.precip_prob_pct : 0,
+                                    weather_data.valid && weather_data.snow_today,
+                                    weather_data.valid && weather_data.clear_today);
+            }
         } else {
             // Commute page
             bool is_home = (page.type == PageInfo::COMMUTE_HOME);
             CommuteData& cd = is_home ? g_commute_home : g_commute_work;
             const char* label = is_home ? "Work -> Home" : "Home -> Work";
-            char weather_str[20];
-            char uv_str[32];
+            char weather_str[40];
+            char uv_str[56];
             format_footer_weather(weather_str, sizeof(weather_str), uv_str, sizeof(uv_str), "");
             display_draw_commute(label, g_current_page, g_num_pages,
                                  cd, g_commute_conn_idx,
@@ -1287,21 +1575,6 @@ void loop() {
                                  weather_data.valid ? weather_data.precip_prob_pct : 0,
                                  weather_data.valid && weather_data.snow_today,
                                  weather_data.valid && weather_data.clear_today);
-        }
-    }
-
-    // Reconnect WiFi if dropped — 30s interval avoids AUTH_LEAVE floods
-    static uint32_t last_wifi_check = 0;
-    if (now_ms - last_wifi_check > 30000) {
-        last_wifi_check = now_ms;
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[WiFi] Disconnected — reconnecting...");
-            WiFi.disconnect();
-            delay(100);
-            if (connect_wifi()) {
-                esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-                configTzTime(POSIX_TZ, "pool.ntp.org", "time.nist.gov");
-            }
         }
     }
 

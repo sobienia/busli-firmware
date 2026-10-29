@@ -14,7 +14,8 @@
 struct Departure {
     String line;        // e.g. "80", "2"
     String destination; // e.g. "Triemlispital"
-    int    minutes;     // minutes until departure (0 = now)
+    time_t dep_time;    // actual (prognosis) departure, UTC epoch — minutes are
+                        // computed at draw time so the board counts down live
     int    delay;       // delay in minutes (0 = on time)
 };
 
@@ -36,9 +37,27 @@ void display_set_theme(uint16_t row0, uint16_t rows, uint16_t dim, uint16_t meta
 // next draw call does a full repaint in the new orientation.
 void display_set_flipped(bool flipped);
 
-// Step through day-brightness levels: 100→90→80→70→60→50→100 (wraps).
-// Night mode is unaffected — it still overrides to NIGHT_BRIGHTNESS automatically.
+// Step through brightness levels for the current mode (wraps), saved per mode:
+//   day   100 → 80 → 60 → 40 → 20
+//   night  30 → 20 → 15 → 10 → 5
 void display_step_brightness();
+
+// Night hours as minutes after midnight (start == end disables night mode).
+// Defaults to NIGHT_START_HOUR..NIGHT_END_HOUR until set.
+void display_set_night_schedule(int start_min, int end_min);
+bool display_is_night();
+
+// Re-apply the day/night brightness level (e.g. after an alert pulse).
+void display_restore_brightness();
+
+// Screen power for the screen-off night mode: off = backlight off + panel sleep.
+// Turning it on forces a full repaint on the next draw.
+void display_set_screen_on(bool on);
+bool display_screen_on();
+
+// Estimated battery runtime in hours (-1 = unknown). When the battery is low the
+// header shows it next to the percentage, e.g. "18% ~2h".
+void display_set_battery_estimate(float hours_left);
 
 // Show a centered message (used during boot, errors)
 void display_show_status(const char* message);
@@ -101,9 +120,10 @@ void display_draw_commute(
 );
 
 // Draw the stock ticker page (one sub-page of up to per_page tickers).
-// label:    header text, e.g. "Portfolio 1/2" or "Portfolio - closed"
-// quotes:   all configured tickers; first = index of the first one on this sub-page
-// per_page: 5 → large font, one column; 10 → small font, two columns of 5
+// label:       header text, e.g. "Portfolio 1/2"
+// quotes:      all configured tickers; first = index of the first one on this sub-page
+// per_page:    5 → large font, one column; 10 → small font, two columns of 5
+// market_open: false → footer shows "closed" instead of the data age
 // Only cells whose quote changed are repainted, so updates don't flicker.
 void display_draw_stocks(
     const char* label,
@@ -113,6 +133,7 @@ void display_draw_stocks(
     int count,
     int first,
     int per_page,
+    bool market_open,
     int age_seconds,
     bool wifi_ok,
     int battery_pct,
@@ -124,6 +145,31 @@ void display_draw_stocks(
     bool snow_today,
     bool clear_today
 );
+
+// Which list cell (0 … per_page-1) is at screen position x,y on the stocks
+// page, or -1 if none. Lets the caller turn a tap into a ticker index.
+int display_stock_cell_at(int x, int y, int per_page);
+
+// Everything the standard footer shows
+struct FooterInfo {
+    const char* weather_str = "";
+    const char* uv_str      = "";
+    bool rain_today  = false;
+    int  rain_pct    = 0;
+    bool snow_today  = false;
+    bool clear_today = false;
+    bool wifi_ok     = true;
+    int  battery_pct = -1;
+    bool battery_charging = false;
+};
+
+// Detail view for one ticker: price, change, previous close, open, day range,
+// 52-week range and a large intraday chart.
+// label: header text, e.g. "VWCE  3/11"; chart: nullptr while it's loading.
+void display_draw_stock_detail(const char* label, int page_idx, int page_count,
+                               const StockQuote& q, const StockChart* chart,
+                               bool market_open, int age_seconds,
+                               const FooterInfo& footer);
 
 // Boot animation (Matrix-style cascading characters).
 // Start it before the blocking setup steps; update the status text as each

@@ -165,15 +165,12 @@ static bool process_json_body(
         int delay_minutes = scheduled > 0
             ? (int)((actual - scheduled) / 60)
             : 0;
-        int mins_until = (int)((actual - now) / 60);
-
-        if (mins_until < 0) { dbg_past++; continue; }
-        if (mins_until > 99) mins_until = 99;
+        if (actual < now - 30) { dbg_past++; continue; }
 
         Departure d;
         d.line        = line;
         d.destination = dest;
-        d.minutes     = mins_until;
+        d.dep_time    = actual;
         d.delay       = delay_minutes;
         results.push_back(d);
 
@@ -208,6 +205,11 @@ bool api_fetch_departures(
     }
     url += encoded;
     url += "&limit=" + String(API_FETCH_LIMIT);
+    // Ask only for the fields we parse — without this every entry carries its full
+    // passList and a 20-entry board is ~240 KB instead of ~3 KB.
+    url += "&fields[]=stationboard/number&fields[]=stationboard/category"
+           "&fields[]=stationboard/to&fields[]=stationboard/stop/departure"
+           "&fields[]=stationboard/stop/prognosis/departure";
 
     Serial.print("[API] Fetching: ");
     Serial.println(url);

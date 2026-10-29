@@ -44,6 +44,7 @@ static uint16_t TRAIL[4] = { 0xF480, 0xC3A0, 0x7A40, 0x4960 };
 //   static region (weather/UV) redraws on weather change (~15 min)
 //   dynamic region (age + dot) redraws every second
 static time_t    s_last_fetch_time      = -1;
+static uint32_t  s_last_rows_sig        = 0;    // fingerprint of the rows last drawn
 static int       s_last_clock_minute    = -1;
 static int       s_last_battery_pct     = -2;   // -2 = never drawn; triggers first paint
 static bool      s_last_battery_charging = false;
@@ -66,6 +67,10 @@ static int       s_stocks_last_first    = -1;  // -1 forces a full repaint
 static int       s_stocks_last_per_page = -1;
 static int       s_stocks_last_minute   = -1;
 static uint32_t  s_stocks_weather_hash  = 0xFFFFFFFF;
+// Stock detail view: signature of what's drawn (-1 = full repaint needed)
+static int       s_detail_idx_sig       = -1;
+static int       s_detail_minute        = -1;
+static uint32_t  s_detail_weather       = 0xFFFFFFFF;
 
 // ── Backlight PWM ─────────────────────────────────────────────────────────────
 #define BL_PWM_CHANNEL    0
@@ -203,6 +208,35 @@ static uint32_t weather_hash(const char* weather_str, const char* uv_str,
     return h;
 }
 
+// ── Off-screen rendering (flicker-free redraws) ──────────────────────────────
+// Full-screen canvas in PSRAM (480×222×2 = 213 KB), created on first use. While a
+// FrameBuffered object is alive, every draw helper (they all go through `gfx`)
+// renders into the canvas; when it goes out of scope the band [y0, y0+h) is sent
+// to the panel in one transfer — no visible clear-then-draw. Everything drawn
+// inside the band must be fully repainted by the caller (the canvas holds stale
+// pixels from other screens). Falls back to drawing directly if PSRAM runs out.
+static Arduino_Canvas* s_canvas = nullptr;
+
+class FrameBuffered {
+public:
+    explicit FrameBuffered(int y0 = 0, int h = SCREEN_H) : _y0(y0), _h(h) {
+        if (!s_canvas) {
+            s_canvas = new Arduino_Canvas(SCREEN_W, SCREEN_H, gfx);
+            if (!s_canvas->begin(GFX_SKIP_OUTPUT_BEGIN)) { delete s_canvas; s_canvas = nullptr; }
+        }
+        if (s_canvas) { _screen = gfx; gfx = s_canvas; }
+    }
+    ~FrameBuffered() {
+        if (!_screen) return;
+        gfx = _screen;
+        // Canvas rotation 0 → framebuffer rows are SCREEN_W pixels, so a band is contiguous
+        gfx->draw16bitRGBBitmap(0, _y0, s_canvas->getFramebuffer() + _y0 * SCREEN_W, SCREEN_W, _h);
+    }
+private:
+    Arduino_GFX* _screen = nullptr;
+    int _y0, _h;
+};
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  PUBLIC INTERFACE
 // ═════════════════════════════════════════════════════════════════════════════
@@ -320,6 +354,7 @@ void display_invalidate() {
     s_commute_scroll_ms     = 0;
     s_commute_weather_hash  = 0xFFFFFFFF;
     s_stocks_last_first     = -1;
+    s_detail_idx_sig        = -1;
 }
 
 // ── Umbrella icon (12×15) ────────────────────────────────────────────────────
@@ -393,28 +428,48 @@ static void draw_bus_icon(int x, int y, uint16_t color) {
     gfx->fillRect(x + 21, y + 25, 7,  3, color);  // right wheel
 }
 
-// ── Night-mode brightness ─────────────────────────────────────────────────────
-static uint8_t s_day_brightness = DAY_BRIGHTNESS;  // cycled by display_step_brightness()
-static bool    s_last_night_state = false;  // tracks last known night/day to detect transitions
+// ── Day / night brightness ───────────────────────────────────────────────────
+// Day and night each have their own level, cycled by the brightness button and
+// saved separately — adjusting at night no longer changes the daytime level.
+static const uint8_t DAY_LEVELS[]   = { 100, 80, 60, 40, 20 };
+static const uint8_t NIGHT_LEVELS[] = { 30, 20, 15, 10, 5 };
+static uint8_t s_day_brightness    = DAY_BRIGHTNESS;
+static uint8_t s_night_brightness  = NIGHT_BRIGHTNESS;
+static bool    s_last_night_state  = false;  // last known night/day, to detect transitions
+static bool    s_screen_on         = true;
+static int     s_night_start_min   = NIGHT_START_HOUR * 60;  // minutes after midnight
+static int     s_night_end_min     = NIGHT_END_HOUR * 60;
 
-static bool is_night_hours() {
+bool display_is_night() {
     time_t now = time(nullptr);
     if (now < 1700000000) return false;
     struct tm t; localtime_r(&now, &t);
-    int h = t.tm_hour;
-    return (NIGHT_START_HOUR > NIGHT_END_HOUR)
-        ? (h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR)
-        : (h >= NIGHT_START_HOUR && h < NIGHT_END_HOUR);
+    int m = t.tm_hour * 60 + t.tm_min;
+    if (s_night_start_min == s_night_end_min) return false;  // night mode disabled
+    return (s_night_start_min > s_night_end_min)
+        ? (m >= s_night_start_min || m < s_night_end_min)
+        : (m >= s_night_start_min && m < s_night_end_min);
 }
 
-// Called once per second from draw_board/draw_commute/draw_flight.
-// Only applies automatic brightness at the night/day transition — leaves the
-// user's manual level alone between transitions so step_brightness works at night.
+void display_set_night_schedule(int start_min, int end_min) {
+    s_night_start_min  = start_min;
+    s_night_end_min    = end_min;
+    s_last_night_state = !display_is_night();  // force re-apply on next draw
+}
+
+// Re-apply the level for the current day/night state (after a pulse, wake, …)
+void display_restore_brightness() {
+    if (!s_screen_on) return;
+    display_set_brightness(display_is_night() ? s_night_brightness : s_day_brightness);
+}
+
+// Called once per second from every draw function. Switches level only at the
+// day/night transition so manual adjustments stick until the next transition.
 static void apply_night_brightness() {
-    bool night = is_night_hours();
+    bool night = display_is_night();
     if (night != s_last_night_state) {
         s_last_night_state = night;
-        display_set_brightness(night ? NIGHT_BRIGHTNESS : s_day_brightness);
+        display_restore_brightness();
         Serial.printf("[Display] Auto brightness: %s mode\n", night ? "night" : "day");
     }
 }
@@ -422,26 +477,57 @@ static void apply_night_brightness() {
 void display_init_brightness() {
     Preferences prefs;
     prefs.begin("tramli", true);
-    int b = prefs.getInt("bright_day", DAY_BRIGHTNESS);
+    int d = prefs.getInt("bright_day",   DAY_BRIGHTNESS);
+    int n = prefs.getInt("bright_night", NIGHT_BRIGHTNESS);
     prefs.end();
-    if (b >= 20 && b <= 100) s_day_brightness = (uint8_t)b;
-    // Apply correct brightness for current time and seed the transition tracker.
-    s_last_night_state = is_night_hours();
-    display_set_brightness(s_last_night_state ? NIGHT_BRIGHTNESS : s_day_brightness);
-    Serial.printf("[Display] Brightness loaded: %d%% (%s)\n",
-                  s_day_brightness, s_last_night_state ? "night" : "day");
+    if (d >= 5 && d <= 100) s_day_brightness   = (uint8_t)d;
+    if (n >= 5 && n <= 100) s_night_brightness = (uint8_t)n;
+    s_last_night_state = display_is_night();
+    display_restore_brightness();
+    Serial.printf("[Display] Brightness loaded: day %d%%, night %d%% (%s)\n",
+                  s_day_brightness, s_night_brightness, s_last_night_state ? "night" : "day");
+}
+
+// Next level in the cycle (wraps); unknown levels jump to the first entry
+static uint8_t next_level(const uint8_t* levels, int n, uint8_t cur) {
+    for (int i = 0; i < n; i++)
+        if (levels[i] == cur) return levels[(i + 1) % n];
+    return levels[0];
 }
 
 void display_step_brightness() {
-    // Cycle: 100→80→60→40→20→100 — always applies immediately, even at night.
-    s_day_brightness = (s_day_brightness > 20) ? s_day_brightness - 20 : 100;
-    display_set_brightness(s_day_brightness);
+    bool night = display_is_night();
+    uint8_t& level = night ? s_night_brightness : s_day_brightness;
+    level = night ? next_level(NIGHT_LEVELS, sizeof(NIGHT_LEVELS), level)
+                  : next_level(DAY_LEVELS,   sizeof(DAY_LEVELS),   level);
+    display_set_brightness(level);
     Preferences prefs;
     prefs.begin("tramli", false);
-    prefs.putInt("bright_day", s_day_brightness);
+    prefs.putInt(night ? "bright_night" : "bright_day", level);
     prefs.end();
-    Serial.printf("[Display] Brightness → %d%%\n", s_day_brightness);
+    Serial.printf("[Display] %s brightness → %d%%\n", night ? "Night" : "Day", level);
 }
+
+void display_set_screen_on(bool on) {
+    if (on == s_screen_on || !gfx) return;
+    s_screen_on = on;
+    if (on) {
+        gfx->displayOn();
+        display_invalidate();        // panel content isn't trusted after sleep — repaint
+        display_restore_brightness();
+    } else {
+        display_set_brightness(0);
+        gfx->displayOff();           // panel sleep: backlight off alone still powers the driver
+    }
+    Serial.printf("[Display] Screen %s\n", on ? "on" : "off");
+}
+
+bool display_screen_on() { return s_screen_on; }
+
+// Estimated battery runtime shown in the header when low (-1 = unknown)
+static float s_battery_hours = -1;
+
+void display_set_battery_estimate(float hours_left) { s_battery_hours = hours_left; }
 
 // ── Header ────────────────────────────────────────────────────────────────────
 static void draw_header(const char* stop_name, int stop_index, int stop_count,
@@ -473,12 +559,19 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
     int dots_w = stop_count * 12;
     int dots_x = (dots_w > 0) ? (rx -= 8, rx -= dots_w, rx) : rx;
 
-    // Left cluster: battery icon (22px) + % label + 6px gap + stop name
-    char pct_buf[8] = "";
+    // Left cluster: battery icon (22px) + % label + 6px gap + stop name.
+    // When low and unplugged, the label adds the estimated time left: "18% ~2h".
+    char pct_buf[16] = "";
     String pct_str;
     int label_x = PAD;
     if (battery_pct >= 0) {
-        snprintf(pct_buf, sizeof(pct_buf), battery_charging ? "%d%%+" : "%d%%", battery_pct);
+        if (battery_charging)
+            snprintf(pct_buf, sizeof(pct_buf), "%d%%+", battery_pct);
+        else if (battery_pct <= BATTERY_SHOW_ESTIMATE_PCT && s_battery_hours >= 0)
+            snprintf(pct_buf, sizeof(pct_buf), s_battery_hours < 1 ? "%d%% <1h" : "%d%% ~%.0fh",
+                     battery_pct, s_battery_hours);
+        else
+            snprintf(pct_buf, sizeof(pct_buf), "%d%%", battery_pct);
         pct_str  = pct_buf;
         label_x  = PAD + 22 + 2 + text_w(pct_str, 2) + 6;
     }
@@ -522,8 +615,40 @@ static void draw_header(const char* stop_name, int stop_index, int stop_count,
 }
 
 // ── Rows ──────────────────────────────────────────────────────────────────────
+// A departure that left more than this long ago is no longer shown
+static const int DEPARTED_GRACE_SEC = 30;
+
+// Minutes until departure as shown on the board (0 = bus icon), or -1 if gone.
+static int departure_minutes(const Departure& d, time_t now) {
+    long secs = (long)(d.dep_time - now);
+    if (secs < -DEPARTED_GRACE_SEC) return -1;
+    int mins = (secs > 0) ? (int)(secs / 60) : 0;
+    return (mins > 99) ? 99 : mins;
+}
+
+// Departures still to come, in order — what the board actually shows.
+static std::vector<Departure> upcoming(const std::vector<Departure>& all, time_t now) {
+    std::vector<Departure> out;
+    for (const auto& d : all)
+        if (departure_minutes(d, now) >= 0) out.push_back(d);
+    return out;
+}
+
+// Fingerprint of what the rows would display: redraw only when it changes.
+static uint32_t rows_signature(const std::vector<Departure>& shown, int max_rows, time_t now) {
+    uint32_t h = 2166136261u;
+    int n = std::min((int)shown.size(), max_rows);
+    for (int i = 0; i < n; i++) {
+        h = (h ^ (uint32_t)departure_minutes(shown[i], now)) * 16777619u;
+        h = (h ^ (uint32_t)shown[i].delay) * 16777619u;
+        for (char c : shown[i].line)        h = (h ^ (uint8_t)c) * 16777619u;
+        for (char c : shown[i].destination) h = (h ^ (uint8_t)c) * 16777619u;
+    }
+    return h ^ (uint32_t)n;
+}
+
 static void draw_rows(const std::vector<Departure>& departures, time_t fetch_time,
-                      bool large_font) {
+                      bool large_font, time_t now) {
     int rows_top = HEADER_H;
     int rows_h   = SCREEN_H - FOOTER_H - rows_top;
     int max_rows = large_font ? 2 : ROW_COUNT;
@@ -576,11 +701,12 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
         }
 
         // Time or bus icon
-        if (dep.minutes == 0) {
+        int mins = departure_minutes(dep, now);
+        if (mins <= 0) {
             draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, c_row0);
         } else {
             char tbuf[8];
-            snprintf(tbuf, sizeof(tbuf), "%d'", dep.minutes);
+            snprintf(tbuf, sizeof(tbuf), "%d'", mins);
             String ts = tbuf;
             draw_text(ts, SCREEN_W - PAD - text_w(ts, row_fsz), text_y, row_fsz, c_row0);
         }
@@ -617,9 +743,12 @@ static void draw_footer_static(int fy, const char* weather_str, const char* uv_s
         x += 11;
     }
 
+    // Text never runs into the dynamic region (age + Wi-Fi dot) on the right
+    const int x_max = SCREEN_W - FOOTER_AGE_REGION_W - 6;
+
     if (weather_str && strlen(weather_str) > 0) {
         String s = to_latin1(weather_str);
-        draw_text(s, x, ty, fsz, c_row0);
+        draw_text_safe(s, x, ty, fsz, c_row0, 0, x_max);
         x += text_w(s, fsz) + 14;
     }
 
@@ -636,18 +765,20 @@ static void draw_footer_static(int fy, const char* weather_str, const char* uv_s
         x += 12 + 14;  // umbrella icon width (12px) + consistent gap
     }
 
-    if (uv_str && strlen(uv_str) > 0) {
+    if (uv_str && strlen(uv_str) > 0 && x < x_max) {
         String s = to_latin1(uv_str);
-        draw_text(s, x, ty, fsz, c_row0);
+        draw_text_safe(s, x, ty, fsz, c_row0, 0, x_max);
     }
 }
 
 // ── Footer — dynamic region (age counter + status dot) ────────────────────────
 // Erases + redraws only the right FOOTER_AGE_REGION_W pixels every second.
 // Starts erase at fy+1 to preserve the separator line drawn by draw_footer_static.
+// status_text: shown instead of the age when set (e.g. "closed" on the portfolio page)
 static void draw_footer_dynamic(int fy, bool from_cache, bool wifi_ok,
                                 int age_seconds, bool large_font,
-                                time_t countdown_target, int countdown_icon) {
+                                time_t countdown_target, int countdown_icon,
+                                const char* status_text = nullptr) {
     gfx->fillRect(SCREEN_W - FOOTER_AGE_REGION_W, fy + 1,
                   FOOTER_AGE_REGION_W, FOOTER_H - 1, BLACK);
 
@@ -673,7 +804,8 @@ static void draw_footer_dynamic(int fy, bool from_cache, bool wifi_ok,
         else
             snprintf(text_buf, sizeof(text_buf), "%lds", secs_left);
     } else {
-        if (from_cache)            snprintf(text_buf, sizeof(text_buf), "cached");
+        if (status_text)           snprintf(text_buf, sizeof(text_buf), "%s", status_text);
+        else if (from_cache)       snprintf(text_buf, sizeof(text_buf), "cached");
         else if (age_seconds < 60) snprintf(text_buf, sizeof(text_buf), "now");
         else                       snprintf(text_buf, sizeof(text_buf), "%dm", age_seconds / 60);
     }
@@ -720,21 +852,34 @@ void display_draw_board(
     localtime_r(&now_t, &tm_now);
     int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
 
+    // Each band (header / rows / footer) is drawn off-screen and swapped in at
+    // once — the live countdown redraws rows several times a minute and a visible
+    // clear-then-draw would flicker.
     if (cur_minute != s_last_clock_minute || battery_pct != s_last_battery_pct || battery_charging != s_last_battery_charging) {
         s_last_clock_minute     = cur_minute;
         s_last_battery_pct      = battery_pct;
         s_last_battery_charging = battery_charging;
+        FrameBuffered band(0, HEADER_H);
         draw_header(stop_name, stop_index, stop_count, false, large_font_mode, battery_pct, battery_charging);
     }
 
-    if (fetch_time != s_last_fetch_time) {
+    // Rows: minutes are computed from departure times every second, so the board
+    // counts down between fetches (and departed entries drop off)
+    std::vector<Departure> shown = upcoming(departures, now_t);
+    uint32_t sig = rows_signature(shown, large_font_mode ? 2 : ROW_COUNT, now_t);
+    if (fetch_time != s_last_fetch_time || sig != s_last_rows_sig) {
         s_last_fetch_time = fetch_time;
-        draw_rows(departures, fetch_time, large_font_mode);
+        s_last_rows_sig   = sig;
+        FrameBuffered band(HEADER_H, SCREEN_H - FOOTER_H - HEADER_H);
+        draw_rows(shown, fetch_time, large_font_mode, now_t);
     }
 
+    // Footer band: the static part is only re-rendered when the weather changes,
+    // but it lives in the same canvas band as the per-second age counter
     int fy = SCREEN_H - FOOTER_H;
     uint32_t wh = weather_hash(weather_str, uv_str, rain_today, rain_pct,
                                snow_today, clear_today);
+    FrameBuffered band(fy, FOOTER_H);
     if (wh != s_last_weather_hash || !s_footer_static_drawn) {
         s_last_weather_hash   = wh;
         s_footer_static_drawn = true;
@@ -932,6 +1077,33 @@ static String format_stock_price(float p) {
     return buf;
 }
 
+// Mini intraday chart in [x0, x1] × [y_top, y_top + h). Scaled to the day's range
+// including the previous close, which is drawn as a dotted zero line.
+static void draw_sparkline(const StockQuote& q, int x0, int x1, int y_top, int h,
+                           uint16_t color) {
+    if (q.spark_n < 2 || x1 - x0 < 20) return;
+    float lo = (q.prev_close > 0) ? q.prev_close : q.spark[0];
+    float hi = lo;
+    for (int i = 0; i < q.spark_n; i++) {
+        lo = std::min(lo, q.spark[i]);
+        hi = std::max(hi, q.spark[i]);
+    }
+    if (hi - lo < 1e-6f) hi = lo + 1.0f;   // flat day: draw a level line
+    auto ypix = [&](float v) {
+        return y_top + h - 1 - (int)lroundf((v - lo) / (hi - lo) * (h - 1));
+    };
+    if (q.prev_close > 0) {
+        int yb = ypix(q.prev_close);
+        for (int x = x0; x <= x1; x += 3) gfx->drawPixel(x, yb, c_meta);
+    }
+    int n = q.spark_n;
+    for (int i = 1; i < n; i++) {
+        int xa = x0 + (i - 1) * (x1 - x0) / (n - 1);
+        int xb = x0 + i * (x1 - x0) / (n - 1);
+        gfx->drawLine(xa, ypix(q.spark[i - 1]), xb, ypix(q.spark[i]), color);
+    }
+}
+
 // Repaints one cell. Bottom pixel row is left alone (row separator lives there).
 static void draw_stock_cell(int slot, int per_page, const StockQuote& q) {
     int x, y, w, h;
@@ -976,6 +1148,13 @@ static void draw_stock_cell(int slot, int per_page, const StockQuote& q) {
     }
     String pct = pbuf;
     draw_text(pct, right - text_w(pct, fsz), text_y, fsz, pct_col);
+
+    // Mini chart in a fixed column between ticker and price (aligned across
+    // rows); pushed right if a long ticker needs the room, skipped if too narrow
+    const int spark_x0 = std::max(left + (big ? 112 : 52), left + text_w(sym, fsz) + 8);
+    const int spark_x1 = price_right - (big ? 120 : 62);
+    const int spark_h  = big ? 18 : 14;
+    draw_sparkline(q, spark_x0, spark_x1, y + (h - 1 - spark_h) / 2, spark_h, pct_col);
 }
 
 void display_draw_stocks(
@@ -983,6 +1162,7 @@ void display_draw_stocks(
     int page_idx, int page_count,
     const StockQuote quotes[], int count,
     int first, int per_page,
+    bool market_open,
     int age_seconds,
     bool wifi_ok,
     int battery_pct,
@@ -1020,8 +1200,8 @@ void display_draw_stocks(
         }
     }
 
-    // Header: label carries the sub-page and "closed" marker, which only change
-    // on a sub-page switch (full_redraw) or on the hour (minute change)
+    // Header: label carries the sub-page number, which only changes on a
+    // sub-page switch (full_redraw); the clock needs a minute-change redraw
     if (full_redraw || cur_minute != s_stocks_last_minute ||
         battery_pct != s_last_battery_pct || battery_charging != s_last_battery_charging) {
         s_stocks_last_minute    = cur_minute;
@@ -1046,7 +1226,139 @@ void display_draw_stocks(
         draw_footer_static(fy, weather_str, uv_str, rain_today, rain_pct,
                            snow_today, clear_today, false);
     }
-    draw_footer_dynamic(fy, false, wifi_ok, age_seconds, false, 0, 0);
+    draw_footer_dynamic(fy, false, wifi_ok, age_seconds, false, 0, 0,
+                        market_open ? nullptr : "closed");
+}
+
+int display_stock_cell_at(int x, int y, int per_page) {
+    const int rows_h = SCREEN_H - FOOTER_H - HEADER_H;
+    if (y < HEADER_H || y >= HEADER_H + rows_h) return -1;
+    int row = (y - HEADER_H) / (rows_h / STOCK_ROWS);
+    int col = (per_page > STOCK_ROWS && x >= SCREEN_W / 2) ? 1 : 0;
+    return std::min(row, STOCK_ROWS - 1) + col * STOCK_ROWS;
+}
+
+// ── Stock detail view ────────────────────────────────────────────────────────
+// Left: price, change, previous close / open / day range / 52-week range.
+// Right: the day's chart with the previous close as a dotted line.
+// Full repaint (off-screen) when the ticker, its data or the minute changes;
+// otherwise only the footer's age counter.
+
+static void draw_detail_chart(const StockChart& c, int x0, int y0, int w, int h, uint16_t color) {
+    float lo = (c.prev_close > 0) ? c.prev_close : c.pts[0];
+    float hi = lo;
+    for (int i = 0; i < c.n; i++) { lo = std::min(lo, c.pts[i]); hi = std::max(hi, c.pts[i]); }
+    if (hi - lo < 1e-6f) hi = lo + 1.0f;
+    auto ypix = [&](float v) { return y0 + h - 1 - (int)lroundf((v - lo) / (hi - lo) * (h - 1)); };
+
+    gfx->drawRect(x0, y0, w, h, c_meta);
+    if (c.prev_close > 0) {
+        int yb = ypix(c.prev_close);
+        for (int x = x0 + 2; x < x0 + w - 2; x += 4) gfx->drawPixel(x, yb, c_dim);
+    }
+    for (int i = 1; i < c.n; i++) {
+        int xa = x0 + 1 + (i - 1) * (w - 3) / (c.n - 1);
+        int xb = x0 + 1 + i * (w - 3) / (c.n - 1);
+        gfx->drawLine(xa, ypix(c.pts[i - 1]), xb, ypix(c.pts[i]), color);
+        gfx->drawLine(xa, ypix(c.pts[i - 1]) + 1, xb, ypix(c.pts[i]) + 1, color);   // 2 px thick
+    }
+    // High / low of the chart in the corners
+    String hs = format_stock_price(hi), ls = format_stock_price(lo);
+    draw_text(hs, x0 + w - 4 - text_w(hs, 2), y0 + 3, 2, c_meta);
+    draw_text(ls, x0 + w - 4 - text_w(ls, 2), y0 + h - 19, 2, c_meta);
+}
+
+void display_draw_stock_detail(const char* label, int page_idx, int page_count,
+                               const StockQuote& q, const StockChart* chart,
+                               bool market_open, int age_seconds,
+                               const FooterInfo& f) {
+    if (!gfx) return;
+    apply_night_brightness();
+
+    time_t now_t = time(nullptr);
+    struct tm tm_now;
+    localtime_r(&now_t, &tm_now);
+    int cur_minute = tm_now.tm_hour * 60 + tm_now.tm_min;
+
+    // Repaint when anything shown changes (ticker, quote, chart arrival, minute)
+    uint32_t sig = 2166136261u;
+    for (char ch : q.symbol) sig = (sig ^ (uint8_t)ch) * 16777619u;
+    sig = (sig ^ (uint32_t)q.fetch_time) * 16777619u;
+    sig = (sig ^ (uint32_t)(chart ? chart->n + 1 : 0)) * 16777619u;
+    sig &= 0x7FFFFFFF;   // never equals the -1 "repaint" marker
+    uint32_t wh = weather_hash(f.weather_str, f.uv_str, f.rain_today, f.rain_pct,
+                               f.snow_today, f.clear_today);
+    int fy = SCREEN_H - FOOTER_H;
+
+    if ((int)sig != s_detail_idx_sig || cur_minute != s_detail_minute || wh != s_detail_weather) {
+        s_detail_idx_sig = (int)sig;
+        s_detail_minute  = cur_minute;
+        s_detail_weather = wh;
+        s_last_battery_pct = f.battery_pct;
+        s_last_battery_charging = f.battery_charging;
+
+        FrameBuffered frame;   // whole screen off-screen → no flicker
+        gfx->fillScreen(BLACK);
+        draw_header(label, page_idx, page_count, false, false, f.battery_pct, f.battery_charging);
+
+        const int top = HEADER_H + 4;
+        String name = to_latin1(q.name.length() ? q.name : q.symbol);
+        draw_text_safe(name, PAD, top, 2, c_dim, 0, SCREEN_W - PAD);
+
+        const int chart_x = 218, chart_y = top + 24, chart_w = SCREEN_W - PAD - chart_x;
+        const int chart_h = fy - 6 - chart_y;
+
+        if (q.status != STOCK_OK) {
+            String msg = (q.status == STOCK_NOT_FOUND) ? "Symbol not found" : "Loading...";
+            draw_text(msg, PAD, top + 40, 3, c_meta);
+        } else {
+            long hundredths = lroundf(q.change_pct * 100.0f);
+            uint16_t col = (hundredths > 0) ? COLOR_STOCK_UP : (hundredths < 0) ? COLOR_STOCK_DOWN : c_dim;
+
+            draw_text(format_stock_price(q.price), PAD, top + 22, 4, c_row0);
+            char chg[32];
+            snprintf(chg, sizeof(chg), "%+.2f (%+.2f%%)", q.price - q.prev_close, hundredths / 100.0f);
+            draw_text(chg, PAD, top + 56, 2, col);
+
+            // Figures: label in dim, value in main colour; ranges as "low-high"
+            struct Row { const char* label; String value; };
+            auto range = [](float a, float b) {
+                return (a > 0 && b > 0) ? format_stock_price(a) + "-" + format_stock_price(b) : String("--");
+            };
+            Row rows[] = {
+                { "Prev",  q.prev_close > 0 ? format_stock_price(q.prev_close) : String("--") },
+                { "Open",  q.open > 0       ? format_stock_price(q.open)       : String("--") },
+                { "Day",   range(q.day_low, q.day_high) },
+                { "52w",   range(q.year_low, q.year_high) },
+            };
+            int y = top + 80;
+            for (const Row& r : rows) {
+                draw_text(r.label, PAD, y, 2, c_dim);
+                draw_text_safe(r.value, PAD + 48, y, 2, c_row0, 0, chart_x - 6);
+                y += 17;
+            }
+
+            if (!chart) {
+                String msg = "Loading chart...";
+                draw_text(msg, chart_x + (chart_w - text_w(msg, 2)) / 2, chart_y + chart_h / 2 - 8, 2, c_meta);
+            } else if (chart->n < 2) {
+                String msg = "No chart";
+                draw_text(msg, chart_x + (chart_w - text_w(msg, 2)) / 2, chart_y + chart_h / 2 - 8, 2, c_meta);
+            } else {
+                draw_detail_chart(*chart, chart_x, chart_y, chart_w, chart_h, col);
+            }
+        }
+
+        draw_footer_static(fy, f.weather_str, f.uv_str, f.rain_today, f.rain_pct,
+                           f.snow_today, f.clear_today, false);
+        draw_footer_dynamic(fy, false, f.wifi_ok, age_seconds, false, 0, 0,
+                            market_open ? nullptr : "closed");
+        return;
+    }
+
+    FrameBuffered band(fy, FOOTER_H);   // canvas band still holds the static footer
+    draw_footer_dynamic(fy, false, f.wifi_ok, age_seconds, false, 0, 0,
+                        market_open ? nullptr : "closed");
 }
 
 // ── Flight screen ─────────────────────────────────────────────────────────────
@@ -1273,6 +1585,9 @@ void display_draw_flight(int slot, int flight_count, const FlightInfo& fi, bool 
     s_flight_last_minute = cur_minute;
     s_flight_last_fetch  = fi.fetched_at;
 
+    // Render off-screen and push the finished frame in one go — the old
+    // clear-then-draw flashed the whole screen once a minute.
+    FrameBuffered fb;
     gfx->fillScreen(BLACK);
 
     // Header

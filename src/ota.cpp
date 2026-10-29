@@ -4,12 +4,17 @@
 // The device fetches a small version.json at OTA_VERSION_URL hourly.
 // If the remote version is newer than FIRMWARE_VERSION, it downloads the
 // binary URL from that JSON and flashes it via the ESP32 OTA partition.
-// All networking uses WiFiClientSecure (setInsecure) + the global http_lock.
+// All networking uses WiFiClientSecure + the global http_lock. Certificates ARE
+// verified (against include/ca_certs.h): a hostile network could otherwise serve
+// a fake version.json and firmware. If GitHub ever moves to a CA that isn't in
+// the bundle, checks fail safely (no update) — regenerate ca_certs.h with
+// scripts/gen_ca_certs.py, or flash manually via the portal's Firmware page.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/ota.h"
 #include "../include/config.h"
 #include "../include/http_lock.h"
+#include "../include/ca_certs.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -33,9 +38,13 @@ bool ota_check(String& out_url) {
     if (strlen(OTA_VERSION_URL) == 0) return false;
 
     Serial.printf("[OTA] Checking for updates (current: %s)\n", FIRMWARE_VERSION);
+    if (time(nullptr) < 1700000000) {   // certificate dates can't be checked yet
+        Serial.println("[OTA] Clock not synced — skipping check");
+        return false;
+    }
 
     WiFiClientSecure wc;
-    wc.setInsecure();
+    wc.setCACert(OTA_ROOT_CAS);
     HTTPClient http;
     http.setTimeout(10000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -73,7 +82,7 @@ bool ota_apply(const String& url, void (*progress_cb)(int percent)) {
     Serial.printf("[OTA] Downloading firmware: %s\n", url.c_str());
 
     WiFiClientSecure wc;
-    wc.setInsecure();
+    wc.setCACert(OTA_ROOT_CAS);
     HTTPClient http;
     // setTimeout() takes a uint16_t (max 65535 ms) — it's a per-read timeout, not a
     // total. The overall stall guard is OTA_STALL_MS in the download loop below.

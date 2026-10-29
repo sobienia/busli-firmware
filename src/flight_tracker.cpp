@@ -15,6 +15,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -116,9 +117,12 @@ static String url_encode(const String& s) {
 // ── HTTP body reader — PSRAM buffer, proper chunked decode ────────────────────
 // Allocates buffer in PSRAM (avoids String realloc corruption).
 // Handles both Content-Length and chunked transfer encoding.
-// Returns bytes written; *out_buf must be free()d by caller (nullptr on failure).
+// stop_after: optional text — reading stops once it (and the ']' closing its
+// entry) has arrived. Returns bytes written; *out_buf must be free()d by caller
+// (nullptr on failure).
 
-static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes) {
+static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes,
+                              const char* stop_after = nullptr) {
     *out_buf = nullptr;
     char* buf = (char*)heap_caps_malloc(max_bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) { Serial.println("[Flight] PSRAM alloc failed"); return 0; }
@@ -138,6 +142,19 @@ static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes
         return now - last_data_ms > READ_STALL_MS || now - start_ms > READ_CAP_MS;
     };
     bool complete = false;
+    bool stopped  = false;   // stop_after found — the rest isn't needed
+
+    // Early stop: once stop_after has arrived together with the ']' that closes
+    // its state entry, stop reading (on average halves a 1 MB+ download).
+    // Only the newly appended bytes (plus an overlap) are searched each time.
+    auto found_stop = [&](size_t prev_total) -> bool {
+        if (!stop_after || total == prev_total) return false;
+        size_t overlap = strlen(stop_after) + 256;
+        size_t from = (prev_total > overlap) ? prev_total - overlap : 0;
+        buf[total] = '\0';
+        const char* hit = strstr(buf + from, stop_after);
+        return hit && strchr(hit, ']');
+    };
 
     if (clen >= 0) {
         // Known content-length — read directly
@@ -145,9 +162,11 @@ static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes
         while (remaining > 0 && !timed_out()) {
             int av = s->available();
             if (av > 0) {
+                size_t before = total;
                 size_t got = s->readBytes(buf + total, min((size_t)av, remaining));
                 total += got; remaining -= got;
                 if (got > 0) last_data_ms = millis();
+                if (found_stop(before)) { stopped = true; break; }
             } else if (!s->connected()) {
                 break;
             } else delay(1);
@@ -157,7 +176,7 @@ static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes
         // Chunked transfer encoding — decode chunk-size headers manually.
         // getStreamPtr() gives the raw TCP stream; chunk-size lines (e.g. "e68\r\n")
         // would corrupt JSON parsing if not stripped.
-        while (!timed_out()) {
+        while (!timed_out() && !stopped) {
             // Read chunk-size line (hex digits + CRLF)
             char sz[16] = {}; int sl = 0;
             while (!timed_out()) {
@@ -187,14 +206,17 @@ static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes
                 }
                 size_t n = min((size_t)av, rem);
                 if (total + n < max_bytes) {
+                    size_t before = total;
                     size_t got = s->readBytes(buf + total, n);
                     total += got; rem -= got;
+                    if (found_stop(before)) { stopped = true; break; }
                 } else {
                     uint8_t drain[128];
                     rem -= s->readBytes(drain, min(n, sizeof(drain)));
                 }
                 last_data_ms = millis();
             }
+            if (stopped) break;
             // Skip trailing CRLF after chunk body
             while (!timed_out()) {
                 if (!s->available()) {
@@ -208,7 +230,7 @@ static size_t http_read_psram(HTTPClient& http, char** out_buf, size_t max_bytes
 
     Serial.printf("[Flight] read %u bytes in %lu ms (%s, content-length %d)\n",
                   (unsigned)total, (unsigned long)(millis() - start_ms),
-                  complete ? "complete" : "TRUNCATED", clen);
+                  stopped ? "found early" : complete ? "complete" : "TRUNCATED", clen);
     buf[total] = '\0';
     *out_buf   = buf;
     return total;
@@ -296,18 +318,19 @@ static bool fetch_states(const String& callsign, FlightInfo& fi, String& icao24_
 
     // ── Path B: no icao24 — full global dump, PSRAM buffer, substring scan ───
     Serial.println("[Flight] no icao24 cached — scanning full global state dump");
+    // Search for the quoted padded callsign: ["icao24hex","THA970  ","country",...
+    // The download stops as soon as that entry has arrived.
+    char needle[12];
+    snprintf(needle, sizeof(needle), "\"%s\"", cs.c_str());  // e.g. "\"THA970  \""
     char* buf = nullptr;
-    size_t total = http_read_psram(http, &buf, 3UL * 1024 * 1024);  // 3 MB cap
+    size_t total = http_read_psram(http, &buf, 3UL * 1024 * 1024, needle);  // 3 MB cap
     http.end();
     http_lock_give();
     if (!buf) return false;
 
     Serial.printf("[Flight] global body %u bytes\n", (unsigned)total);
 
-    // Search for the quoted padded callsign: ["icao24hex","THA970  ","country",...
     bool result = false;
-    char needle[12];
-    snprintf(needle, sizeof(needle), "\"%s\"", cs.c_str());  // e.g. "\"THA970  \""
     char* hit = strstr(buf, needle);
     if (!hit) {
         // Also try without trailing spaces (some entries may be stored trimmed)
@@ -476,6 +499,32 @@ static void update_eta(FlightInfo& fi) {
 
 // ── Internal refresh ──────────────────────────────────────────────────────────
 
+// ── Aircraft ID cache ────────────────────────────────────────────────────────
+// Finding the ICAO24 needs the 1 MB+ worldwide dump; once known it's kept in NVS
+// per flight + date, so a reboot (or OTA) during the flight doesn't repeat it.
+static String icao_cache_key(const FlightEntry& e) {
+    uint32_t h = 2166136261u;
+    for (char c : e.callsign + "|" + e.dep_date) h = (h ^ (uint8_t)c) * 16777619u;
+    char key[12];
+    snprintf(key, sizeof(key), "i%08lx", (unsigned long)h);
+    return key;
+}
+
+static String icao_cache_get(const FlightEntry& e) {
+    Preferences prefs;
+    prefs.begin("flight", true);
+    String v = prefs.getString(icao_cache_key(e).c_str(), "");
+    prefs.end();
+    return v;
+}
+
+static void icao_cache_put(const FlightEntry& e, const String& icao24) {
+    Preferences prefs;
+    prefs.begin("flight", false);
+    prefs.putString(icao_cache_key(e).c_str(), icao24);
+    prefs.end();
+}
+
 // "YYYY-MM-DD" + "HH:MM" in Swiss local time → epoch (0 if either is malformed).
 static time_t make_local_epoch(const String& date, const String& hhmm) {
     if (date.length() < 10 || hhmm.length() < 5 || hhmm[2] != ':') return 0;
@@ -536,10 +585,13 @@ static void do_refresh(int slot) {
     if (in_search_window(slot, time(nullptr))) {
         // Step 1: live state — use ICAO callsign for the API, keep display name in fi.callsign
         String api_cs = to_icao_callsign(s_entries[slot].callsign);
+        if (s_icao24[slot].isEmpty()) s_icao24[slot] = icao_cache_get(s_entries[slot]);
         String icao24 = s_icao24[slot];
         bool live = fetch_states(api_cs, fi, icao24);
-        if (live && icao24.length() > 0)
+        if (live && icao24.length() > 0 && icao24 != s_icao24[slot]) {
             s_icao24[slot] = icao24;
+            icao_cache_put(s_entries[slot], icao24);
+        }
 
         // Step 2: actual takeoff time — once per flight, as soon as it's airborne
         if (live && fi.airborne && !fi.dep_actual && s_icao24[slot].length() > 0) {

@@ -13,17 +13,27 @@
 // If it has "V1.1" → set to 11. Otherwise → leave at 10.
 #define BOARD_VERSION 11
 
-// Transit refresh intervals
+// Transit refresh intervals (the board counts down between fetches)
 #define ACTIVE_REFRESH_SEC    30   // currently-displayed stop
 #define INACTIVE_REFRESH_SEC  90   // background stops (3× less frequent)
+#define NIGHT_ACTIVE_REFRESH_SEC    120  // night hours, screen dimmed
+#define NIGHT_INACTIVE_REFRESH_SEC  600
+#define SCREEN_OFF_REFRESH_SEC      900  // screen off: all stops (refreshed on wake)
 
 // Display brightness (0–100, percent)
 #define DAY_BRIGHTNESS    80
 #define NIGHT_BRIGHTNESS  15
 
-// Night mode hours (24-hour format)
+// Night mode defaults (24-hour format) — editable in the config portal
 #define NIGHT_START_HOUR  23
 #define NIGHT_END_HOUR    6
+#define WAKE_ON_TOUCH_SEC 30     // screen-off night mode: how long a touch/button wakes it
+
+// Battery warnings: a message appears once when the level first drops to each
+// of these (ascending), until the device is plugged in again
+static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
+#define BATTERY_WARN_SHOW_MS   10000   // how long the warning stays (touch dismisses)
+#define BATTERY_SHOW_ESTIMATE_PCT 30   // header shows "~Nh" left at or below this level
 
 // Timezone — Switzerland CET (DST handled automatically in code)
 #define TIMEZONE_OFFSET_SEC  3600
@@ -102,9 +112,12 @@
 // ║  WEATHER (Open-Meteo — free, no API key required)                         ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
+// Weather follows the stop on screen; these are only used until its location is known
 #define WEATHER_LAT            47.376   // Zürich
 #define WEATHER_LON             8.541
+#define RAIN_ALERT_MINUTES     120      // footer warns about rain starting within this window
 #define WEATHER_REFRESH_SEC     900     // 15 minutes
+#define WEATHER_OFF_REFRESH_SEC 3600    // while the screen is off at night
 #define WEATHER_TIMEOUT_MS     5000
 #define WEATHER_RAIN_PROB_PCT    30     // umbrella if daily precip probability >= this
 
@@ -113,6 +126,7 @@
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 #define PORTAL_TIMEOUT_MS  300000  // 5 minutes; 0 = no timeout
+#define WEB_HOSTNAME       "busli" // settings on the normal Wi-Fi: http://busli.local
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  COMMUTE REFRESH                                                          ║
@@ -154,7 +168,7 @@
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.6.0"
+#define FIRMWARE_VERSION        "1.7.0"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 

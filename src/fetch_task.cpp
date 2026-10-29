@@ -23,6 +23,7 @@
 #include "api.h"
 #include "weather.h"
 #include "commute.h"
+#include "../include/geo.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -35,6 +36,7 @@ static volatile int      s_active_stop    = 0;
 static volatile bool     s_force_refresh  = false;
 static volatile bool     s_force_commute  = false;
 static volatile bool     s_ota_enabled    = true;
+static volatile FetchPower s_power        = FETCH_POWER_NORMAL;
 
 // Per-stop last-fetch timestamps for adaptive scheduling
 static time_t s_stop_last_attempt[8] = {};
@@ -44,9 +46,21 @@ static int    s_flight_count = 0;
 static time_t s_flight_last_fetch[2] = {0, 0};
 static volatile bool s_flight_forced[2] = {false, false};  // set by main loop (long press)
 
-// Weather cache
-static WeatherData s_weather   = {};
-static bool        s_weather_ok = false;
+// Weather per place — the footer shows the weather of the stop on screen.
+// Places: transit stops [0, s_num_stops), then commute home, commute work, and
+// "here" (the device's own location, for the portfolio page). All configured
+// places are kept fresh in the background so switching pages shows the right
+// town immediately; the place on screen is refreshed first.
+static const int MAX_PLACES = 8 + 3;
+struct PlaceWeather {
+    GeoPlace    geo;               // coordinates + town (geo module, NVS-cached)
+    time_t      geo_tried    = 0;  // last lookup attempt (retried hourly on failure)
+    WeatherData wx           = {};
+    bool        ok           = false;
+    time_t      last_attempt = 0;
+};
+static PlaceWeather   s_places[MAX_PLACES];
+static volatile int   s_weather_place = 0;
 
 // Commute cache
 static String      s_home_station;
@@ -80,6 +94,16 @@ static time_t        s_stock_last_attempt[STOCKS_MAX] = {};
 static bool          s_stock_need_close[STOCKS_MAX]   = {};  // last fetch was during market hours
 static volatile bool s_stock_forced[STOCKS_MAX]       = {};
 
+// Detail-view chart — fetched on demand for the ticker the user opened
+static volatile int  s_chart_request = -1;   // ticker index wanted; -1 = detail view closed
+static StockChart    s_chart;                // guarded by s_mutex
+static int           s_chart_idx     = -1;   // ticker s_chart belongs to
+static time_t        s_chart_time    = 0;
+
+// Lets the UI cut the loop's idle wait short for user-triggered work
+static TaskHandle_t  s_task = nullptr;
+static void wake_task() { if (s_task) xTaskNotifyGive(s_task); }
+
 static void do_fetch(int idx) {
     std::vector<Departure> fresh;
     http_lock_take();
@@ -107,13 +131,52 @@ static void do_fetch(int idx) {
     xSemaphoreGive(s_mutex);
 }
 
-static bool do_fetch_weather() {
+static int place_here()  { return s_num_stops + 2; }
+static int place_count() { return s_num_stops + 3; }
+
+static String place_station(int place) {
+    if (place < s_num_stops)      return s_stops[place].station;
+    if (place == s_num_stops)     return s_home_station;
+    if (place == s_num_stops + 1) return s_work_station;
+    return "";
+}
+
+// A place is worth fetching weather for if we know (or can find out) where it is
+static bool place_configured(int place) {
+    return place == place_here() || !place_station(place).isEmpty();
+}
+
+static bool do_fetch_weather(int place) {
+    if (place < 0 || place >= MAX_PLACES) return false;
+    PlaceWeather& pw = s_places[place];
+    time_t now = time(nullptr);
+
+    // Find where the place is (stations: once, NVS-cached; "here": once per boot)
+    if (!pw.geo.valid && (pw.geo_tried == 0 || now - pw.geo_tried >= 3600)) {
+        pw.geo_tried = now;
+        GeoPlace g;
+        bool found = (place == place_here()) ? geo_resolve_here(g)
+                                             : geo_resolve_station(place_station(place), g);
+        if (found) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            pw.geo = g;
+            xSemaphoreGive(s_mutex);
+        }
+    }
+    // Unknown location: "here" falls back to the first stop, everything else to Zürich
+    const GeoPlace& g = pw.geo.valid ? pw.geo
+                      : (place == place_here() && s_places[0].geo.valid) ? s_places[0].geo
+                      : pw.geo;
+    float lat = g.valid ? g.lat : (float)WEATHER_LAT;
+    float lon = g.valid ? g.lon : (float)WEATHER_LON;
+
     WeatherData wd;
     http_lock_take();
-    bool ok = weather_fetch(wd);
+    bool ok = weather_fetch(lat, lon, wd);
     http_lock_give();
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (ok) { s_weather = wd; s_weather_ok = true; }
+    pw.last_attempt = time(nullptr);
+    if (ok) { pw.wx = wd; pw.ok = true; }
     xSemaphoreGive(s_mutex);
     return ok;
 }
@@ -218,6 +281,13 @@ static void do_fetch_stock(int i) {
         c.change_pct = q.change_pct;
         c.currency   = q.currency;
         c.fetch_time = now;
+        c.prev_close = q.prev_close;
+        c.spark_n    = q.spark_n;
+        memcpy(c.spark, q.spark, sizeof(float) * q.spark_n);
+        c.name       = q.name;
+        c.open       = q.open;
+        c.day_low    = q.day_low;   c.day_high  = q.day_high;
+        c.year_low   = q.year_low;  c.year_high = q.year_high;
         s_stock_need_close[i] = stocks_market_open(now);
     } else if (r == STOCK_FETCH_NOT_FOUND) {
         c.status = STOCK_NOT_FOUND;
@@ -227,18 +297,32 @@ static void do_fetch_stock(int i) {
     xSemaphoreGive(s_mutex);
 }
 
+// Weather interval for a place: retry failures after 60 s; slower with the screen off
+static long weather_interval(const PlaceWeather& pw) {
+    if (!pw.ok) return 60;
+    return (s_power == FETCH_POWER_SCREEN_OFF) ? WEATHER_OFF_REFRESH_SEC : WEATHER_REFRESH_SEC;
+}
+
+static bool weather_due(int place, time_t now) {
+    const PlaceWeather& pw = s_places[place];
+    return pw.last_attempt == 0 || now - pw.last_attempt >= weather_interval(pw);
+}
+
 static void fetch_task_loop(void* /*param*/) {
-    // Fetch weather and commute immediately so data is available within seconds of boot.
-    do_fetch_weather();
+    // Startup: departures first — they're what the screen shows. The visible stop
+    // goes first, then the others (~3 KB each, so this takes a few seconds).
+    // Weather and commute follow; flights (up to a 1 MB download) are left to the
+    // normal schedule below so they never delay the first board.
+    do_fetch(s_active_stop);
+    s_stop_last_attempt[s_active_stop] = time(nullptr);
+    for (int i = 0; i < s_num_stops; i++) {
+        if (i == s_active_stop) continue;
+        do_fetch(i);
+        s_stop_last_attempt[i] = time(nullptr);
+    }
+    do_fetch_weather(s_weather_place);
     do_fetch_commute();
 
-    // Initial flight fetches (may block up to ~24s per slot — intentionally on core 0).
-    for (int i = 0; i < s_flight_count; i++) {
-        flight_tracker_refresh(i);
-        s_flight_last_fetch[i] = time(nullptr);
-    }
-
-    time_t last_weather_fetch = time(nullptr);
     time_t last_commute_fetch = time(nullptr);
     // First OTA check fires at boot+2min, then every OTA_CHECK_INTERVAL_SEC after that.
     time_t last_ota_check     = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 120;
@@ -251,6 +335,30 @@ static void fetch_task_loop(void* /*param*/) {
     for (;;) {
         time_t now = time(nullptr);
 
+        // ── Stock detail chart (user is looking at it — goes first) ───────────
+        // Fetched when a ticker is opened; refreshed with the quotes while the
+        // market is open.
+        {
+            int want = s_chart_request;
+            if (want >= 0 && want < s_stock_count &&
+                (want != s_chart_idx ||
+                 (stocks_market_open(now) && now - s_chart_time >= STOCKS_REFRESH_SEC))) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                String symbol = s_stock_quotes[want].symbol;
+                xSemaphoreGive(s_mutex);
+                StockChart chart;
+                http_lock_take();
+                StockFetchResult r = stocks_fetch_chart(symbol, chart);
+                http_lock_give();
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                if (r == STOCK_FETCH_OK) s_chart = chart;
+                else                     s_chart.n = 0;   // show "no chart" rather than another ticker's
+                s_chart_idx  = want;
+                s_chart_time = time(nullptr);
+                xSemaphoreGive(s_mutex);
+            }
+        }
+
         // ── Transit: adaptive scheduling ──────────────────────────────────────
         // Active stop: ACTIVE_REFRESH_SEC. Inactive stops: INACTIVE_REFRESH_SEC.
         // Pick the most overdue stop on each iteration.
@@ -261,9 +369,15 @@ static void fetch_task_loop(void* /*param*/) {
             fetch_idx       = s_active_stop;
             s_force_refresh = false;
         } else {
+            FetchPower power = s_power;
+            int active_sec   = (power == FETCH_POWER_NORMAL) ? ACTIVE_REFRESH_SEC
+                             : (power == FETCH_POWER_NIGHT)  ? NIGHT_ACTIVE_REFRESH_SEC
+                                                             : SCREEN_OFF_REFRESH_SEC;
+            int inactive_sec = (power == FETCH_POWER_NORMAL) ? INACTIVE_REFRESH_SEC
+                             : (power == FETCH_POWER_NIGHT)  ? NIGHT_INACTIVE_REFRESH_SEC
+                                                             : SCREEN_OFF_REFRESH_SEC;
             for (int i = 0; i < s_num_stops; i++) {
-                int  threshold = (i == s_active_stop) ? ACTIVE_REFRESH_SEC
-                                                      : INACTIVE_REFRESH_SEC;
+                int  threshold = (i == s_active_stop) ? active_sec : inactive_sec;
                 long overdue   = (long)(now - s_stop_last_attempt[i]) - threshold;
                 if (overdue > best_overdue) {
                     best_overdue = overdue;
@@ -278,11 +392,20 @@ static void fetch_task_loop(void* /*param*/) {
         }
 
         // ── Weather ───────────────────────────────────────────────────────────
-        if (now - last_weather_fetch >= WEATHER_REFRESH_SEC) {
-            bool ok = do_fetch_weather();
-            // On failure retry in 60 s; on success wait the full refresh interval.
-            last_weather_fetch = ok ? time(nullptr)
-                                    : time(nullptr) - WEATHER_REFRESH_SEC + 60;
+        // The place on screen first; otherwise one other place that's due, so
+        // every stop's town and weather are ready before you swipe to it.
+        {
+            int wp = s_weather_place;
+            if (weather_due(wp, now)) {
+                do_fetch_weather(wp);
+            } else {
+                for (int p = 0; p < place_count() && p < MAX_PLACES; p++) {
+                    if (p != wp && place_configured(p) && weather_due(p, now)) {
+                        do_fetch_weather(p);
+                        break;
+                    }
+                }
+            }
         }
 
         // ── Commute ───────────────────────────────────────────────────────────
@@ -353,7 +476,8 @@ static void fetch_task_loop(void* /*param*/) {
             Serial.println("[NTP] Daily resync triggered");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(FETCH_LOOP_MS));
+        // Idle until the next round — or earlier when the UI asks for something
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FETCH_LOOP_MS));
     }
 }
 
@@ -366,7 +490,7 @@ void fetch_task_start(const StopConfig* stops, int num_stops) {
     xTaskCreatePinnedToCore(
         fetch_task_loop, "fetch",
         FETCH_TASK_STACK, nullptr, FETCH_TASK_PRIORITY,
-        nullptr, 0   // pin to core 0 (WiFi core)
+        &s_task, 0   // pin to core 0 (WiFi core)
     );
 }
 
@@ -387,11 +511,12 @@ void fetch_task_set_active_stop(int new_idx) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool needs_fetch = !s_cache[new_idx].ever_fetched;
     xSemaphoreGive(s_mutex);
-    if (needs_fetch) s_force_refresh = true;
+    if (needs_fetch) { s_force_refresh = true; wake_task(); }
 }
 
 void fetch_task_force_refresh() {
     s_force_refresh = true;
+    wake_task();
 }
 
 void fetch_task_set_commute(const String& home, const String& work) {
@@ -399,10 +524,18 @@ void fetch_task_set_commute(const String& home, const String& work) {
     s_work_station = work;
 }
 
-bool fetch_task_get_weather(WeatherData& out) {
+void fetch_task_set_weather_place(int place) {
+    if      (place == WEATHER_PLACE_HOME) place = s_num_stops;
+    else if (place == WEATHER_PLACE_WORK) place = s_num_stops + 1;
+    else if (place == WEATHER_PLACE_HERE) place = place_here();
+    if (place >= 0 && place < MAX_PLACES) s_weather_place = place;
+}
+
+bool fetch_task_get_weather(WeatherData& out, String& out_city) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool ok = s_weather_ok;
-    if (ok) out = s_weather;
+    const PlaceWeather& pw = s_places[s_weather_place];
+    bool ok = pw.ok;
+    if (ok) { out = pw.wx; out_city = pw.geo.city; }
     xSemaphoreGive(s_mutex);
     return ok;
 }
@@ -417,6 +550,7 @@ bool fetch_task_get_commute(CommuteData& out_home, CommuteData& out_work) {
 
 void fetch_task_force_commute_refresh() {
     s_force_commute = true;
+    wake_task();
 }
 
 void fetch_task_set_ota_enabled(bool enabled) {
@@ -472,8 +606,29 @@ void fetch_task_init_flights(const FlightEntry* entries, int count) {
     for (int i = 0; i < count; i++) s_flight_last_fetch[i] = 0; // trigger immediate fetch
 }
 
+void fetch_task_set_power_mode(FetchPower mode) {
+    if (mode != s_power) {
+        s_power = mode;
+        Serial.printf("[Fetch] Power mode %d\n", (int)mode);
+    }
+}
+
 void fetch_task_force_flight_refresh(int slot) {
-    if (slot >= 0 && slot < 2) s_flight_forced[slot] = true;
+    if (slot >= 0 && slot < 2) { s_flight_forced[slot] = true; wake_task(); }
+}
+
+void fetch_task_request_stock_chart(int idx) {
+    if (idx == s_chart_request) return;
+    s_chart_request = idx;
+    if (idx >= 0) wake_task();
+}
+
+bool fetch_task_get_stock_chart(int idx, StockChart& out) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = (idx >= 0 && idx == s_chart_idx);
+    if (ok) out = s_chart;
+    xSemaphoreGive(s_mutex);
+    return ok;
 }
 
 void fetch_task_notify_pager_activity() {
@@ -503,4 +658,6 @@ int fetch_task_get_stocks(StockQuote out[]) {
 
 void fetch_task_force_stocks_refresh() {
     for (int i = 0; i < STOCKS_MAX; i++) s_stock_forced[i] = true;
+    s_chart_time = 0;   // detail chart too, if one is open
+    wake_task();
 }

@@ -16,9 +16,18 @@ struct StopCache {
     bool   ever_fetched = false;
 };
 
-// Call once from setup() after WiFi is connected.
-// Fetches stop 0 synchronously so the display has data immediately,
-// then launches a background FreeRTOS task (core 0) for all subsequent fetches.
+// How eagerly to refresh transit data (see TRANSIT_*_SEC in config.h)
+enum FetchPower {
+    FETCH_POWER_NORMAL,      // day: visible stop every 30 s
+    FETCH_POWER_NIGHT,       // night hours, screen on (dimmed)
+    FETCH_POWER_SCREEN_OFF,  // screen off: rarely — the board isn't visible
+};
+
+// Set from the main loop whenever the screen/night state changes.
+void fetch_task_set_power_mode(FetchPower mode);
+
+// Call once from setup() after WiFi is connected. Launches the background
+// FreeRTOS task (core 0), which loads all stops' departures first, then the rest.
 void fetch_task_start(const StopConfig* stops, int num_stops);
 
 // Read the cached data for a stop. Takes the mutex briefly; never blocks.
@@ -38,9 +47,20 @@ void fetch_task_force_refresh();
 // Call before fetch_task_start(). Empty strings disable commute fetching.
 void fetch_task_set_commute(const String& home, const String& work);
 
-// Read the latest weather / commute data from the background cache.
+// Which place's weather the footer shows: a transit stop index (0…), or one of:
+enum WeatherPlace {
+    WEATHER_PLACE_HOME = -1,   // commute home station
+    WEATHER_PLACE_WORK = -2,   // commute work station
+    WEATHER_PLACE_HERE = -3,   // the device itself (IP location) — portfolio page
+};
+void fetch_task_set_weather_place(int place);
+
+// Read the latest weather for the current place, plus its town name ("" if
+// unknown). Never blocks; returns false if that place has no data yet.
+bool fetch_task_get_weather(WeatherData& out, String& out_city);
+
+// Read the latest commute data from the background cache.
 // Never blocks; returns false if no data has been fetched yet.
-bool fetch_task_get_weather(WeatherData& out);
 bool fetch_task_get_commute(CommuteData& out_home, CommuteData& out_work);
 
 // Ask the background task to re-fetch commute data on its next iteration.
@@ -90,3 +110,10 @@ int  fetch_task_get_stocks(StockQuote out[]);
 
 // Re-fetch all tickers (staggered), even outside market hours.
 void fetch_task_force_stocks_refresh();
+
+// Detail view: ask for ticker idx's fine-grained chart (-1 = detail view closed).
+// Fetched right away, then refreshed with the quotes while the market is open.
+void fetch_task_request_stock_chart(int idx);
+
+// The chart for ticker idx, once it has arrived (false = still loading).
+bool fetch_task_get_stock_chart(int idx, StockChart& out);

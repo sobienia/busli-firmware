@@ -14,16 +14,22 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-bool weather_fetch(WeatherData& out) {
-    char url[320];
+// Rain alert: 15-minute precipitation slots (each value = rain in the 15 min
+// ending at its timestamp). A slot counts as wet at RAIN_ALERT_MM or more.
+static const int   RAIN_SLOTS    = RAIN_ALERT_MINUTES / 15 + 1;
+static const float RAIN_ALERT_MM = 0.1f;
+
+bool weather_fetch(float lat, float lon, WeatherData& out) {
+    char url[420];
     snprintf(url, sizeof(url),
         "http://api.open-meteo.com/v1/forecast"
         "?latitude=%.3f&longitude=%.3f"
-        "&current=temperature_2m,weather_code,uv_index"
+        "&current=temperature_2m,weather_code,uv_index,precipitation"
         "&daily=weather_code,precipitation_probability_max,temperature_2m_max,uv_index_max"
-        "&timezone=Europe%%2FZurich"
+        "&minutely_15=precipitation&forecast_minutely_15=%d"
+        "&timezone=Europe%%2FZurich&timeformat=unixtime"
         "&forecast_days=1",
-        (double)WEATHER_LAT, (double)WEATHER_LON);
+        (double)lat, (double)lon, RAIN_SLOTS);
 
     Serial.print("[Weather] Fetching: ");
     Serial.println(url);
@@ -70,12 +76,33 @@ bool weather_fetch(WeatherData& out) {
     out.snow_today  = is_snow;
     out.clear_today = (daily_code == 0 || daily_code == 1);
     out.rain_today  = is_rain || (!is_snow && out.precip_prob_pct >= WEATHER_RAIN_PROB_PCT);
-    out.valid       = true;
 
-    Serial.printf("[Weather] cur=%.1f max=%.1f UV%d/%d rain=%s snow=%s clear=%s (code=%d prob=%d%%)\n",
+    // Short-term rain: is it raining now, and when does it start / stop?
+    JsonArray times = doc["minutely_15"]["time"];
+    JsonArray mm    = doc["minutely_15"]["precipitation"];
+    time_t now      = time(nullptr);
+    out.raining_now = (doc["current"]["precipitation"] | 0.0f) >= RAIN_ALERT_MM;
+    out.rain_start  = 0;
+    out.rain_end    = 0;
+    for (size_t i = 0; i < times.size() && i < mm.size(); i++) {
+        time_t slot_end = (time_t)(times[i] | 0L);
+        if (slot_end <= now) continue;
+        bool wet = (mm[i] | 0.0f) >= RAIN_ALERT_MM;
+        if (!out.raining_now && wet)  { out.rain_start = slot_end - 15 * 60; break; }
+        if (out.raining_now && !wet)  { out.rain_end   = slot_end - 15 * 60; break; }
+    }
+    if (out.rain_start > 0 && out.rain_start <= now) {   // already started
+        out.raining_now = true;
+        out.rain_start  = 0;
+    }
+    out.valid = true;
+
+    Serial.printf("[Weather] cur=%.1f max=%.1f UV%d/%d rain=%s snow=%s clear=%s (code=%d prob=%d%%)"
+                  " now=%s start=%ld end=%ld\n",
         out.temp_c, out.temp_max_c, out.uv_index, out.uv_index_max,
         out.rain_today ? "y" : "n", out.snow_today ? "y" : "n",
-        out.clear_today ? "y" : "n", daily_code, out.precip_prob_pct);
+        out.clear_today ? "y" : "n", daily_code, out.precip_prob_pct,
+        out.raining_now ? "y" : "n", (long)out.rain_start, (long)out.rain_end);
 
     return true;
 }

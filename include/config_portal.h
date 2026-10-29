@@ -75,6 +75,16 @@ struct StocksConfig {
     int    rotate_sec = STOCKS_ROTATE_SEC_DEFAULT;  // sub-page rotation interval
 };
 
+// Night mode: dim or switch off the screen during these hours.
+struct NightConfig {
+    int  start_min  = NIGHT_START_HOUR * 60;  // minutes after midnight
+    int  end_min    = NIGHT_END_HOUR * 60;    // start == end → night mode off
+    bool screen_off = false;                  // false = dim, true = screen off (touch wakes)
+};
+
+// Load night-mode settings (defaults when nothing is saved).
+void config_load_night(NightConfig& out);
+
 // Load stock tickers + display settings. Returns true if at least one ticker is set.
 bool config_load_stocks(StocksConfig& out);
 
@@ -85,3 +95,14 @@ void config_save_stocks(const StocksConfig& cfg);
 // or until timeoutMs elapses (then returns so normal boot can continue).
 // Pass timeoutMs=0 for no timeout.
 void config_portal_run(uint32_t timeoutMs = 0);
+
+// ── Settings page on the normal Wi-Fi (http://busli.local or the device IP) ──
+// Start serving the settings page on the home network. Call once WiFi is up.
+void config_web_begin();
+
+// Serve pending requests; reboots after a save. Call every loop() iteration.
+void config_web_poll();
+
+// Called with the 6-digit pairing code when a browser asks to pair (show it on
+// screen), and with nullptr when the code is used up or expires (hide it).
+void config_web_set_pairing_callback(void (*cb)(const char* code));

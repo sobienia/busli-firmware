@@ -148,6 +148,14 @@ bool commute_fetch(const String& from_station, const String& to_station, Commute
     url += url_encode(to_station);
     url += "&limit=";
     url += String(COMMUTE_MAX_CONNECTIONS);
+    // Only the fields we parse — cuts the response from ~40 KB to ~3 KB
+    url += "&fields[]=connections/sections/journey/name"
+           "&fields[]=connections/sections/journey/category"
+           "&fields[]=connections/sections/journey/number"
+           "&fields[]=connections/sections/departure/station/name"
+           "&fields[]=connections/sections/departure/departure"
+           "&fields[]=connections/sections/arrival/station/name"
+           "&fields[]=connections/sections/arrival/arrival";
 
     Serial.print("[Commute] Fetching: ");
     Serial.println(url);

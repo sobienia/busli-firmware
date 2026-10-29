@@ -103,6 +103,10 @@ TouchGesture touch_poll() {
         }
         s_last_tap_ms        = now;
         s_waiting_double_tap = true;
+    } else if (s_waiting_double_tap && millis() - s_last_tap_ms >= TOUCH_DOUBLE_TAP_MS) {
+        // No second tap came — it was a single tap (position: last raw point)
+        s_waiting_double_tap = false;
+        return TOUCH_TAP;
     }
 
     return TOUCH_NONE;

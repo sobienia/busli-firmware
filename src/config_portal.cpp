@@ -11,6 +11,10 @@
 //
 // If the device is online when the portal starts, it stays connected (AP+STA)
 // so buttons that need the internet — pager Test, stock Check — work.
+//
+// The same pages are also served on the normal Wi-Fi (http://busli.local or the
+// device IP) via config_web_begin()/config_web_poll(). There, a browser must
+// first pair with a 6-digit code shown on the device screen.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/config_portal.h"
@@ -25,6 +29,7 @@
 #include <esp_wifi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Update.h>
@@ -41,6 +46,7 @@
 #define NVS_KEY_PARCEL      "parcel"
 #define NVS_KEY_PAGER       "pager"
 #define NVS_KEY_STOCKS      "stocks"
+#define NVS_KEY_NIGHT       "night"
 #define MAX_WIFI        3
 #define MAX_STOPS       6
 #define MAX_FLIGHTS     2
@@ -48,6 +54,52 @@
 static WebServer  s_server(80);
 static DNSServer  s_dns;
 static bool       s_saved = false;
+static bool       s_routes_ready = false;  // server listening (routes registered)
+static bool       s_web_enabled  = false;  // serving on the normal Wi-Fi too
+
+// ── Access control ────────────────────────────────────────────────────────────
+// Requests through the setup hotspot are trusted — starting it needs physical
+// access (holding the button). On the normal Wi-Fi, a browser pairs once with a
+// 6-digit code shown on the device and then gets a session cookie that lasts
+// until the next reboot. Wrong codes are limited per code.
+static const uint32_t PAIR_CODE_TTL_MS  = 120000;
+static const int      PAIR_MAX_ATTEMPTS = 5;
+static String   s_session_token;              // "" = no browser paired yet
+static String   s_pair_code;                  // "" = no code showing
+static uint32_t s_pair_started_ms = 0;
+static int      s_pair_attempts   = 0;
+static void   (*s_pair_cb)(const char* code) = nullptr;
+
+static String random_hex(int bytes) {
+    String s;
+    for (int i = 0; i < bytes; i++) {
+        char b[3];
+        snprintf(b, sizeof(b), "%02x", (unsigned)(esp_random() & 0xFF));
+        s += b;
+    }
+    return s;
+}
+
+static void pair_code_clear() {
+    if (s_pair_code.isEmpty()) return;
+    s_pair_code = "";
+    if (s_pair_cb) s_pair_cb(nullptr);
+}
+
+static bool from_setup_hotspot() {
+    return (WiFi.getMode() & WIFI_MODE_AP) &&
+           s_server.client().localIP() == WiFi.softAPIP();
+}
+
+static bool authorized() {
+    if (from_setup_hotspot()) return true;
+    if (s_session_token.isEmpty()) return false;
+    return s_server.header("Cookie").indexOf("busli_s=" + s_session_token) >= 0;
+}
+
+static void send_forbidden() {
+    s_server.send(403, "application/json", F("{\"ok\":false,\"msg\":\"not paired\"}"));
+}
 
 // ── NVS helpers ───────────────────────────────────────────────────────────────
 
@@ -218,6 +270,47 @@ void config_save_pager(const PagerConfig& cfg) {
     prefs.begin(NVS_NAMESPACE, false);
     prefs.putString(NVS_KEY_PAGER, json);
     prefs.end();
+}
+
+void config_load_night(NightConfig& out) {
+    out = NightConfig();
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    String json = prefs.getString(NVS_KEY_NIGHT, "");
+    prefs.end();
+    if (json.isEmpty()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return;
+    out.start_min  = constrain(doc["s"] | out.start_min, 0, 1439);
+    out.end_min    = constrain(doc["e"] | out.end_min,   0, 1439);
+    out.screen_off = doc["o"] | false;
+}
+
+static void config_save_night(const NightConfig& cfg) {
+    JsonDocument doc;
+    doc["s"] = cfg.start_min;
+    doc["e"] = cfg.end_min;
+    doc["o"] = cfg.screen_off;
+    String json;
+    serializeJson(doc, json);
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putString(NVS_KEY_NIGHT, json);
+    prefs.end();
+}
+
+// "HH:MM" ↔ minutes after midnight (for <input type=time>)
+static String hhmm(int minutes) {
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02d:%02d", minutes / 60, minutes % 60);
+    return buf;
+}
+
+static int parse_hhmm(const String& s, int fallback) {
+    if (s.length() < 5 || s[2] != ':') return fallback;
+    int h = s.substring(0, 2).toInt(), m = s.substring(3, 5).toInt();
+    if (h < 0 || h > 23 || m < 0 || m > 59) return fallback;
+    return h * 60 + m;
 }
 
 bool config_load_stocks(StocksConfig& out) {
@@ -408,7 +501,9 @@ static String build_page(String ssids[], String passes[], String users[],
                           bool ota_enabled,
                           const String& parcel_tracking, int parcel_pulses,
                           const PagerConfig& pager,
-                          const StocksConfig& stocks) {
+                          const StocksConfig& stocks,
+                          const NightConfig& night,
+                          bool via_hotspot) {
     String h;
     h.reserve(16000);
 
@@ -452,10 +547,13 @@ static String build_page(String ssids[], String passes[], String users[],
                "color .15s}"
            ".ip.sel{border-color:#f7b500;color:#f7b500}"
            "</style></head><body>"
-           "<h1>Busli</h1>"
-           "<p class='sub'>Connected to <b>Busli&#8209;Config</b> &mdash; "
-           "save to reboot with new settings</p>"
-           "<form method='POST' action='/save'>");
+           "<h1>Busli</h1>");
+    h += via_hotspot
+        ? F("<p class='sub'>Connected to <b>Busli&#8209;Config</b> &mdash; "
+            "save to reboot with new settings</p>")
+        : F("<p class='sub'>Settings over your Wi-Fi &mdash; "
+            "save to reboot with new settings</p>");
+    h += F("<form method='POST' action='/save'>");
 
     // ── WiFi section ─────────────────────────────────────────────────────────
     h += F("<h2>WiFi Networks</h2>");
@@ -467,9 +565,10 @@ static String build_page(String ssids[], String passes[], String users[],
         h += "<label>SSID</label>"
              "<input type='text' name='w" + String(i) + "s' value='"
              + html_encode(ssids[i]) + "'>";
+        // Saved passwords are never sent to the browser — blank keeps the current one
         h += "<label>Password</label>"
-             "<input type='password' name='w" + String(i) + "p' value='"
-             + html_encode(passes[i]) + "'>";
+             "<input type='password' name='w" + String(i) + "p' value='' autocomplete='new-password' "
+             "placeholder='" + String(passes[i].length() > 0 ? "saved — type to change" : "") + "'>";
         h += "<label>Username <span style='font-weight:normal;color:#666'>(leave blank for normal WPA2, fill in for enterprise/work networks)</span></label>"
              "<input type='text' name='w" + String(i) + "u' value='"
              + html_encode(users[i]) + "' autocomplete='off'>";
@@ -575,8 +674,8 @@ static String build_page(String ssids[], String passes[], String users[],
          "<input type='text' name='osky_u' autocomplete='off' value='"
          + html_encode(opensky_user) + "'>";
     h += "<label>Password</label>"
-         "<input type='password' name='osky_p' value='"
-         + html_encode(opensky_pass) + "'>";
+         "<input type='password' name='osky_p' value='' autocomplete='new-password' "
+         "placeholder='" + String(opensky_pass.length() > 0 ? "saved — type to change" : "") + "'>";
     h += F("</div>");
 
     // ── Commute section ──────────────────────────────────────────────────────
@@ -683,6 +782,26 @@ static String build_page(String ssids[], String passes[], String users[],
              "</div>";
         h += "</div>";
     }
+    h += F("</div>");
+
+    // ── Night mode section ───────────────────────────────────────────────────
+    h += F("<h2>Night mode</h2><div class='card'>"
+           "<p class='hint' style='margin:0 0 8px'>During these hours the screen is dimmed or "
+           "switched off, and departures refresh less often to save power. "
+           "Set both times equal to disable.</p>"
+           "<div style='display:flex;gap:12px'>");
+    h += "<div style='flex:1'><label>From</label><input type='time' name='nt_s' value='"
+         + hhmm(night.start_min) + "'></div>"
+         "<div style='flex:1'><label>Until</label><input type='time' name='nt_e' value='"
+         + hhmm(night.end_min) + "'></div></div>";
+    h += "<label style='display:flex;align-items:center;gap:10px;margin-top:12px;color:#ddd'>"
+         "<input type='radio' name='nt_o' value='0' style='width:auto'"
+         + String(night.screen_off ? "" : " checked") + "> Dim the screen</label>"
+         "<label style='display:flex;align-items:center;gap:10px;color:#ddd'>"
+         "<input type='radio' name='nt_o' value='1' style='width:auto'"
+         + String(night.screen_off ? " checked" : "") + "> Turn the screen off "
+         "<span class='hint' style='margin:0'>(touch or any button wakes it for "
+         + String(WAKE_ON_TOUCH_SEC) + "&nbsp;s)</span></label>";
     h += F("</div>");
 
     // ── Updates section ──────────────────────────────────────────────────────
@@ -796,19 +915,107 @@ static String        s_parcel_tracking;
 static int           s_parcel_pulses = 3;
 static PagerConfig   s_pager;
 static StocksConfig  s_stocks;
+static NightConfig   s_night;
+
+// Read the saved configuration into the s_* form state (fresh on every page view,
+// so the normal-Wi-Fi page always shows what's stored).
+static void load_form_state() {
+    int n_wifi = config_load_wifi(s_ssids, s_passes, s_users);
+    for (int i = n_wifi; i < MAX_WIFI; i++) { s_ssids[i] = ""; s_passes[i] = ""; s_users[i] = ""; }
+    s_n_stops = config_load_stops(s_stops);
+    s_cd_label = ""; s_cd_target = ""; s_cd_icon = 0;
+    config_load_countdown(s_cd_label, s_cd_target, s_cd_icon);
+    s_n_flights = config_load_flights(s_flights);
+    s_opensky_user = ""; s_opensky_pass = "";
+    config_load_opensky(s_opensky_user, s_opensky_pass);
+    s_commute = {};
+    config_load_commute(s_commute);
+    s_ota_enabled = config_load_ota_enabled();
+    s_parcel_tracking = "";
+    s_parcel_pulses   = 3;
+    config_load_parcel(s_parcel_tracking, s_parcel_pulses);
+    s_pager = {};
+    config_load_pager(s_pager);
+    s_stocks = {};
+    config_load_stocks(s_stocks);
+    config_load_night(s_night);
+}
+
+static const char PAGE_HEAD[] PROGMEM =
+    "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Busli</title><style>"
+    "body{font:16px/1.5 sans-serif;max-width:420px;margin:0 auto;padding:32px 16px;"
+    "background:#111;color:#f7b500;text-align:center}"
+    "input{font-size:28px;letter-spacing:.3em;text-align:center;width:100%;padding:12px;"
+    "background:#1a1a1a;color:#eee;border:1px solid #383838;border-radius:8px}"
+    "button{width:100%;padding:15px;margin-top:16px;background:#f7b500;color:#000;"
+    "font-size:16px;font-weight:bold;border:none;border-radius:8px}"
+    "p{color:#999}.err{color:#f55}</style></head><body>";
+
+// Pairing page for the normal-Wi-Fi settings: shows a code on the device screen
+static void send_pair_page(const char* error) {
+    if (s_pair_code.isEmpty() || millis() - s_pair_started_ms > PAIR_CODE_TTL_MS) {
+        s_pair_code = String(100000 + esp_random() % 900000);
+        s_pair_started_ms = millis();
+        s_pair_attempts   = 0;
+        if (s_pair_cb) s_pair_cb(s_pair_code.c_str());
+        Serial.println("[Web] Pairing code shown on screen");
+    }
+    String h = FPSTR(PAGE_HEAD);
+    h += F("<h1>Busli settings</h1>"
+           "<p>Enter the 6-digit code shown on the Busli screen.</p>"
+           "<form method='POST' action='/pair'>"
+           "<input name='code' inputmode='numeric' maxlength='6' autofocus autocomplete='off'>"
+           "<button type='submit'>Continue</button></form>");
+    if (error) { h += "<p class='err'>"; h += error; h += "</p>"; }
+    h += F("</body></html>");
+    s_server.send(200, "text/html", h);
+}
+
+static void handle_pair() {
+    String code = s_server.arg("code"); code.trim();
+    bool expired = s_pair_code.isEmpty() || millis() - s_pair_started_ms > PAIR_CODE_TTL_MS;
+    if (!expired && code == s_pair_code) {
+        s_session_token = random_hex(16);
+        pair_code_clear();
+        Serial.println("[Web] Browser paired");
+        s_server.sendHeader("Set-Cookie", "busli_s=" + s_session_token + "; Path=/; HttpOnly; SameSite=Strict");
+        s_server.sendHeader("Location", "/", true);
+        s_server.send(303, "text/plain", "");
+        return;
+    }
+    if (!expired && ++s_pair_attempts >= PAIR_MAX_ATTEMPTS) {
+        pair_code_clear();            // force a fresh code on the next try
+        send_pair_page("Too many wrong codes &mdash; a new code is now on the screen.");
+        return;
+    }
+    send_pair_page(expired ? "The code expired &mdash; a new one is on the screen."
+                           : "Wrong code &mdash; please try again.");
+}
 
 static void handle_root() {
+    if (!authorized()) { send_pair_page(nullptr); return; }
+    load_form_state();
     String page = build_page(s_ssids, s_passes, s_users, s_stops, s_n_stops,
                              s_cd_label, s_cd_target, s_cd_icon,
                              s_flights, s_n_flights,
                              s_opensky_user, s_opensky_pass,
                              s_commute, s_ota_enabled,
                              s_parcel_tracking, s_parcel_pulses,
-                             s_pager, s_stocks);
+                             s_pager, s_stocks, s_night,
+                             from_setup_hotspot());
     s_server.send(200, "text/html", page);
 }
 
 static void handle_save() {
+    if (!authorized()) { send_forbidden(); return; }
+    // Saved secrets, so a blank password field can keep the current one
+    String old_ssids[MAX_WIFI], old_passes[MAX_WIFI], old_users[MAX_WIFI];
+    int n_old = config_load_wifi(old_ssids, old_passes, old_users);
+    String old_osky_user, old_osky_pass;
+    config_load_opensky(old_osky_user, old_osky_pass);
+
     // Parse WiFi
     String new_ssids[MAX_WIFI], new_passes[MAX_WIFI], new_users[MAX_WIFI];
     int n_wifi = 0;
@@ -817,6 +1024,10 @@ static void handle_save() {
         String pp = s_server.arg("w" + String(i) + "p");
         String uu = s_server.arg("w" + String(i) + "u");
         ss.trim(); uu.trim();
+        // Blank password + same network name as before → keep the saved password
+        if (pp.isEmpty())
+            for (int j = 0; j < n_old; j++)
+                if (old_ssids[j] == ss) { pp = old_passes[j]; break; }
         if (ss.length() > 0) {
             new_ssids[n_wifi]  = ss;
             new_passes[n_wifi] = pp;
@@ -871,6 +1082,8 @@ static void handle_save() {
 
     String new_opensky_user = s_server.arg("osky_u"); new_opensky_user.trim();
     String new_opensky_pass = s_server.arg("osky_p");
+    if (new_opensky_pass.isEmpty() && new_opensky_user == old_osky_user)
+        new_opensky_pass = old_osky_pass;   // blank = keep the saved password
 
     // Parse commute
     CommuteConfig new_commute;
@@ -911,6 +1124,12 @@ static void handle_save() {
     new_stocks.rotate_sec = constrain(s_server.arg("st_r").toInt(), 3, 300);
     config_save_stocks(new_stocks);
 
+    NightConfig new_night;
+    new_night.start_min  = parse_hhmm(s_server.arg("nt_s"), new_night.start_min);
+    new_night.end_min    = parse_hhmm(s_server.arg("nt_e"), new_night.end_min);
+    new_night.screen_off = s_server.arg("nt_o") == "1";
+    config_save_night(new_night);
+
     save_to_nvs(new_ssids, new_passes, new_users, n_wifi, new_stops, n_stops,
                 cd_label, cd_target, cd_icon, new_flights, n_flights,
                 new_opensky_user, new_opensky_pass, new_commute, new_ota_enabled,
@@ -928,6 +1147,7 @@ static void handle_save() {
 // ── Firmware update via browser upload ───────────────────────────────────────
 
 static void handle_update_page() {
+    if (!authorized()) { s_server.sendHeader("Location", "/", true); s_server.send(303); return; }
     String page;
     page.reserve(1200);
     page += F("<!DOCTYPE html><html><head>"
@@ -966,6 +1186,7 @@ static void handle_update_page() {
 }
 
 static void handle_update_upload() {
+    if (!authorized()) return;   // never flash anything from an unpaired browser
     HTTPUpload& up = s_server.upload();
     if (up.status == UPLOAD_FILE_START) {
         Serial.printf("[OTA] Upload start: %s\n", up.filename.c_str());
@@ -983,6 +1204,7 @@ static void handle_update_upload() {
 }
 
 static void handle_update_finish() {
+    if (!authorized()) { send_forbidden(); return; }
     bool ok = !Update.hasError();
     s_server.send(200, "text/html", ok
         ? F("<!DOCTYPE html><html><head>"
@@ -1001,6 +1223,7 @@ static void handle_update_finish() {
 }
 
 static void handle_pager_test() {
+    if (!authorized()) { send_forbidden(); return; }
     String topic = s_server.arg("topic"); topic.trim();
     String name  = s_server.arg("name");  name.trim();
     if (topic.isEmpty()) {
@@ -1015,6 +1238,7 @@ static void handle_pager_test() {
 
 // Fetch one quote so the user can verify a symbol/suffix before saving.
 static void handle_stock_check() {
+    if (!authorized()) { send_forbidden(); return; }
     String sym = s_server.arg("s"); sym.trim(); sym.toUpperCase();
     Serial.printf("[Portal] Stock check '%s' — STA status %d, IP %s\n", sym.c_str(),
                   (int)WiFi.status(), WiFi.localIP().toString().c_str());
@@ -1046,6 +1270,7 @@ static void handle_stock_check() {
 }
 
 static void handle_not_found() {
+    if (!from_setup_hotspot()) { s_server.send(404, "text/plain", "Not found"); return; }
     // Captive-portal redirect — iOS/Android auto-detect and open the browser
     s_server.sendHeader("Location", "http://192.168.4.1/", true);
     s_server.send(302, "text/plain", "");
@@ -1054,6 +1279,7 @@ static void handle_not_found() {
 // ── Station search (offline, from swiss_stops.h) ──────────────────────────────
 
 static void handle_stations() {
+    if (!authorized()) { send_forbidden(); return; }
     String q = s_server.arg("q");
     q.trim();
     if (q.length() < 2 || SWISS_STOPS_COUNT == 0) {
@@ -1084,30 +1310,61 @@ static void handle_stations() {
     s_server.send(200, "application/json", result);
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Public entry points ───────────────────────────────────────────────────────
+
+// Register all pages once; the same server answers on the hotspot and the normal Wi-Fi.
+static void ensure_routes() {
+    if (s_routes_ready) return;
+    static bool routes_added = false;   // handlers survive stop(); add them only once
+    if (routes_added) { s_server.begin(); s_routes_ready = true; return; }
+    routes_added = true;
+    s_server.on("/",            HTTP_GET,  handle_root);
+    s_server.on("/pair",        HTTP_POST, handle_pair);
+    s_server.on("/save",        HTTP_POST, handle_save);
+    s_server.on("/stations",    HTTP_GET,  handle_stations);
+    s_server.on("/pager_test",  HTTP_GET,  handle_pager_test);
+    s_server.on("/stock_check", HTTP_GET,  handle_stock_check);
+    s_server.on("/update",      HTTP_GET,  handle_update_page);
+    s_server.on("/update",      HTTP_POST, handle_update_finish, handle_update_upload);
+    s_server.onNotFound(handle_not_found);
+    const char* collect[] = { "Cookie" };
+    s_server.collectHeaders(collect, 1);
+    s_server.begin();
+    s_routes_ready = true;
+}
+
+// Restart after a save, giving the browser time to receive the "Saved" page
+static void finish_save_and_restart() {
+    uint32_t t = millis();
+    while (millis() - t < 1500) {
+        s_server.handleClient();
+        delay(5);
+    }
+    ESP.restart();
+}
+
+void config_web_set_pairing_callback(void (*cb)(const char* code)) { s_pair_cb = cb; }
+
+void config_web_begin() {
+    ensure_routes();
+    s_web_enabled = true;
+    if (MDNS.begin(WEB_HOSTNAME)) MDNS.addService("http", "tcp", 80);
+    Serial.printf("[Web] Settings at http://%s.local or http://%s\n",
+                  WEB_HOSTNAME, WiFi.localIP().toString().c_str());
+}
+
+void config_web_poll() {
+    if (!s_web_enabled) return;
+    s_server.handleClient();
+    if (!s_pair_code.isEmpty() && millis() - s_pair_started_ms > PAIR_CODE_TTL_MS)
+        pair_code_clear();
+    if (s_saved) finish_save_and_restart();
+}
 
 void config_portal_run(uint32_t timeoutMs) {
     Serial.println("[Portal] Starting config portal...");
     display_show_status("Configure device");
-
-    // Load current config to pre-populate the form
-    int n_wifi = config_load_wifi(s_ssids, s_passes, s_users);
-    // Fill empty slots so the form shows blanks
-    for (int i = n_wifi; i < MAX_WIFI; i++) { s_ssids[i] = ""; s_passes[i] = ""; s_users[i] = ""; }
-    s_n_stops  = config_load_stops(s_stops);
-    config_load_countdown(s_cd_label, s_cd_target, s_cd_icon);
-    s_n_flights = config_load_flights(s_flights);
-    config_load_opensky(s_opensky_user, s_opensky_pass);
-    s_commute = {};
-    config_load_commute(s_commute);
-    s_ota_enabled = config_load_ota_enabled();
-    s_parcel_tracking = "";
-    s_parcel_pulses   = 3;
-    config_load_parcel(s_parcel_tracking, s_parcel_pulses);
-    s_pager = {};
-    config_load_pager(s_pager);
-    s_stocks = {};
-    config_load_stocks(s_stocks);
+    pair_code_clear();
 
     // Start AP. If we're online, keep the station link (AP+STA) so the portal can
     // reach the internet; the AP then runs on the router's channel. Modem sleep
@@ -1131,16 +1388,7 @@ void config_portal_run(uint32_t timeoutMs) {
     // Captive-portal DNS: redirect every hostname to 192.168.4.1
     s_dns.start(53, "*", ip);
 
-    // Web server routes
-    s_server.on("/",           HTTP_GET,  handle_root);
-    s_server.on("/save",       HTTP_POST, handle_save);
-    s_server.on("/stations",   HTTP_GET,  handle_stations);
-    s_server.on("/pager_test", HTTP_GET,  handle_pager_test);
-    s_server.on("/stock_check", HTTP_GET, handle_stock_check);
-    s_server.on("/update",     HTTP_GET,  handle_update_page);
-    s_server.on("/update",     HTTP_POST, handle_update_finish, handle_update_upload);
-    s_server.onNotFound(handle_not_found);
-    s_server.begin();
+    ensure_routes();
 
     // Show connection instructions on screen — two centered lines
     char portal_msg[120];
@@ -1155,20 +1403,13 @@ void config_portal_run(uint32_t timeoutMs) {
         s_server.handleClient();
         if (timeoutMs > 0 && millis() - start > timeoutMs) {
             Serial.println("[Portal] Timeout — returning to normal boot");
-            s_server.stop();
             s_dns.stop();
             WiFi.softAPdisconnect(true);   // back to STA-only; an existing link stays up
             if (sta_online) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+            if (!s_web_enabled) { s_server.stop(); s_routes_ready = false; }
             return;
         }
         delay(5);
     }
-
-    // Give browser time to receive the "Saved" page before rebooting
-    uint32_t t = millis();
-    while (millis() - t < 1500) {
-        s_server.handleClient();
-        delay(5);
-    }
-    ESP.restart();
+    finish_save_and_restart();
 }
