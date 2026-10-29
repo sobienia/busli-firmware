@@ -95,7 +95,7 @@ void   set_initial_page();
 int    page_key(const PageInfo& p);
 int    find_page_by_key(int key);
 String page_name(int i);
-void   update_weather_place();
+void   update_fetch_focus();   // what the page on screen needs fetched (weather place, …)
 void   force_refresh_current_page();
 // by_user = false for kiosk rotation (not saved, not counted as interaction)
 void   switch_page(int new_page, bool by_user = true);

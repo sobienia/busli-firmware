@@ -41,6 +41,12 @@ static volatile bool     s_force_refresh  = false;
 static volatile bool     s_force_commute  = false;
 static volatile bool     s_ota_enabled    = true;
 static volatile FetchPower s_power        = FETCH_POWER_NORMAL;
+static volatile bool     s_departures_visible = true;    // a stop's board is on screen
+static volatile bool     s_commute_visible    = false;   // a commute page is on screen
+static volatile bool     s_wake_pending       = false;   // screen back after a quiet night
+
+// Daytime = outside the night mode hours (the main loop sets the power mode)
+static bool daytime() { return s_power == FETCH_POWER_NORMAL; }
 
 // Per-stop last-fetch timestamps for adaptive scheduling
 static time_t s_stop_last_attempt[8] = {};
@@ -221,6 +227,13 @@ static bool place_configured(int place) {
 // Coordinates for a place, looking them up first if needed (see below)
 static void place_coords(int place, float& lat, float& lon);
 
+// Distance in km (flat approximation — fine for a few km)
+static float km_between(float lat1, float lon1, float lat2, float lon2) {
+    float dx = (lon2 - lon1) * cosf((lat1 + lat2) * 0.5f * DEG_TO_RAD) * 111.32f;
+    float dy = (lat2 - lat1) * 110.57f;
+    return sqrtf(dx * dx + dy * dy);
+}
+
 static bool do_fetch_weather(int place) {
     if (place < 0 || place >= MAX_PLACES) return false;
     PlaceWeather& pw = s_places[place];
@@ -232,10 +245,24 @@ static bool do_fetch_weather(int place) {
     bool ok = weather_fetch(lat, lon, wd);
     http_lock_give();
     note_result(SRC_WEATHER, ok);
+    time_t now = time(nullptr);
+    int shared = 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    pw.last_attempt = time(nullptr);
-    if (ok) { pw.wx = wd; pw.ok = true; }
+    pw.last_attempt = now;
+    if (ok) {
+        pw.wx = wd; pw.ok = true;
+        // Places within WEATHER_SHARE_KM get the same forecast (each keeps its own
+        // town name) — Letzipark and Letzipark West don't need two requests
+        for (int p = 0; p < place_count() && p < MAX_PLACES; p++) {
+            PlaceWeather& o = s_places[p];
+            if (p == place || !o.geo.valid || !place_configured(p)) continue;
+            if (km_between(lat, lon, o.geo.lat, o.geo.lon) > WEATHER_SHARE_KM) continue;
+            o.wx = wd; o.ok = true; o.last_attempt = now;
+            shared++;
+        }
+    }
     xSemaphoreGive(s_mutex);
+    if (shared) Log.printf("[Weather] shared with %d nearby place(s)\n", shared);
     return ok;
 }
 
@@ -398,6 +425,7 @@ static void do_fetch_parcel() {
 // last batch ran during market hours). A forced refresh skips all of that.
 static bool stock_batch_due(time_t now, bool market_open) {
     if (s_stocks_force) return true;
+    if (s_power == FETCH_POWER_SCREEN_OFF) return false;   // nobody's looking; caught up on wake
     if (s_stock_batch_last != 0 && now - s_stock_batch_last < STOCKS_REFRESH_SEC) return false;
     if (market_open || s_stock_batch_need_close) return true;
     bool pending = false;
@@ -534,7 +562,7 @@ static void snapshot_save() {
         for (const Departure& d : s_cache[i].departures) {
             JsonArray a = deps.add<JsonArray>();
             a.add(d.line); a.add(d.destination); a.add((long)d.dep_time);
-            a.add(d.delay); a.add(d.platform); a.add(d.platform_changed);
+            a.add(d.delay); a.add(d.platform); a.add(d.platform_changed); a.add((int)d.vehicle);
         }
     }
     JsonArray wx = doc["wx"].to<JsonArray>();
@@ -606,6 +634,7 @@ static void snapshot_load() {
                 d.line = String(a[0] | ""); d.destination = String(a[1] | "");
                 d.dep_time = (time_t)(a[2] | 0L); d.delay = a[3] | 0;
                 d.platform = String(a[4] | ""); d.platform_changed = a[5] | false;
+                d.vehicle  = (Vehicle)constrain(a[6] | 0, 0, (int)VEHICLE_TRAIN);   // older snapshots: bus
                 s_cache[i].departures.push_back(d);
             }
             s_cache[i].fetch_time   = (time_t)(o["f"] | 0L);
@@ -687,9 +716,12 @@ static void slow_task_loop(void* /*param*/) {
     for (;;) {
         time_t now = time(nullptr);
 
-        // Flights: one slot per round to avoid back-to-back long downloads
+        // Flights: one slot per round to avoid back-to-back long downloads.
+        // Every FLIGHT_REFRESH_SEC; closer around takeoff and in the air.
         for (int i = 0; i < s_flight_count; i++) {
-            if (s_flight_forced[i] || now - s_flight_last_fetch[i] >= FLIGHT_REFRESH_SEC) {
+            long every = flight_tracker_near_flight(i, now) ? FLIGHT_ACTIVE_REFRESH_SEC
+                                                             : FLIGHT_REFRESH_SEC;
+            if (s_flight_forced[i] || now - s_flight_last_fetch[i] >= every) {
                 s_flight_forced[i] = false;
                 flight_tracker_refresh(i);
                 s_flight_last_fetch[i] = time(nullptr);
@@ -707,8 +739,11 @@ static void slow_task_loop(void* /*param*/) {
             last_ota_check = time(nullptr);
         }
 
-        // Parcel tracking
-        if (!s_parcel_tracking.isEmpty() && now - last_parcel_fetch >= PARCEL_REFRESH_SEC) {
+        // Parcel tracking: daytime only, and not once it's delivered (a new
+        // tracking number in Settings restarts it)
+        bool delivered = s_parcel_delivered_at != 0;
+        if (!s_parcel_tracking.isEmpty() && !delivered && daytime() &&
+            now - last_parcel_fetch >= PARCEL_REFRESH_SEC) {
             do_fetch_parcel();
             last_parcel_fetch = time(nullptr);
         }
@@ -752,7 +787,8 @@ static void fetch_task_loop(void* /*param*/) {
             if (pending) do_fetch_stock(i);
         }
     }
-    s_startup_done = true;
+    s_force_refresh = false;   // the page restored at boot asked for its stop: just fetched
+    s_startup_done  = true;
     Log.println("[Fetch] Startup batch done");
     snapshot_save();
 
@@ -763,6 +799,15 @@ static void fetch_task_loop(void* /*param*/) {
 
     for (;;) {
         time_t now = time(nullptr);
+
+        // ── Screen back after a quiet night: everything on the pages is due ───
+        if (s_wake_pending) {
+            s_wake_pending = false;
+            for (int i = 0; i < s_num_stops; i++) s_stop_last_attempt[i] = 0;   // stop on screen first
+            s_places[s_weather_place].last_attempt = 0;
+            if (s_stock_count > 0) s_stocks_force = true;
+            Log.println("[Fetch] Screen on — refreshing the pages");
+        }
 
         // ── Stock detail chart (user is looking at it — goes first) ───────────
         // Fetched when a ticker is opened; refreshed with the quotes while the
@@ -800,25 +845,26 @@ static void fetch_task_loop(void* /*param*/) {
         }
 
         // ── Transit: adaptive scheduling ──────────────────────────────────────
-        // Active stop: ACTIVE_REFRESH_SEC. Inactive stops: INACTIVE_REFRESH_SEC.
-        // Pick the most overdue stop on each iteration.
+        // Stop on screen: ACTIVE_REFRESH_SEC. Other stops (and the last one,
+        // while another page shows): INACTIVE_REFRESH_SEC. Slower at night; none
+        // while the screen is off / the clock shows (fetch_task_wake() catches
+        // up). Pick the most overdue stop on each iteration.
         int  fetch_idx   = -1;
         long best_overdue = -1;
+        int  stops_due   = 0;
 
         if (s_force_refresh) {
             fetch_idx       = s_active_stop;
             s_force_refresh = false;
-        } else {
-            FetchPower power = s_power;
-            int active_sec   = (power == FETCH_POWER_NORMAL) ? ACTIVE_REFRESH_SEC
-                             : (power == FETCH_POWER_NIGHT)  ? NIGHT_ACTIVE_REFRESH_SEC
-                                                             : SCREEN_OFF_REFRESH_SEC;
-            int inactive_sec = (power == FETCH_POWER_NORMAL) ? INACTIVE_REFRESH_SEC
-                             : (power == FETCH_POWER_NIGHT)  ? NIGHT_INACTIVE_REFRESH_SEC
-                                                             : SCREEN_OFF_REFRESH_SEC;
+        } else if (s_power != FETCH_POWER_SCREEN_OFF) {
+            bool day         = daytime();
+            int inactive_sec = day ? INACTIVE_REFRESH_SEC : NIGHT_INACTIVE_REFRESH_SEC;
+            int active_sec   = !s_departures_visible ? inactive_sec
+                             : day ? ACTIVE_REFRESH_SEC : NIGHT_ACTIVE_REFRESH_SEC;
             for (int i = 0; i < s_num_stops; i++) {
                 int  threshold = (i == s_active_stop) ? active_sec : inactive_sec;
                 long overdue   = (long)(now - s_stop_last_attempt[i]) - threshold;
+                if (overdue >= 0) stops_due++;
                 if (overdue > best_overdue) {
                     best_overdue = overdue;
                     fetch_idx    = i;
@@ -862,8 +908,9 @@ static void fetch_task_loop(void* /*param*/) {
         // ── Today page extras (water temperatures, quote of the day) ─────────
         if (s_today_enabled) do_fetch_today(now);
 
-        // ── Commute ───────────────────────────────────────────────────────────
-        if (s_force_commute || (now - last_commute_fetch >= COMMUTE_REFRESH_SEC)) {
+        // ── Commute (daytime only; slower while its page isn't showing) ───────
+        long commute_sec = s_commute_visible ? COMMUTE_REFRESH_SEC : COMMUTE_BG_REFRESH_SEC;
+        if (s_force_commute || (daytime() && now - last_commute_fetch >= commute_sec)) {
             s_force_commute = false;
             do_fetch_commute();
             last_commute_fetch = time(nullptr);
@@ -874,10 +921,11 @@ static void fetch_task_loop(void* /*param*/) {
         // ── Snapshot of the data, for the next start ──────────────────────────
         if (now - s_snapshot_saved >= SNAPSHOT_SAVE_SEC) snapshot_save();
 
-        // ── Pager polling ─────────────────────────────────────────────────────
-        // 15 s when pager was used in the last 5 minutes; 60 s when idle.
-        if (s_pager_ready) {
-            int poll_sec = (now - s_pager_last_activity < 300) ? 15 : 60;
+        // ── Pager polling (daytime only) ──────────────────────────────────────
+        // PAGER_ACTIVE_POLL_SEC for a while after the pager was used, else PAGER_POLL_SEC
+        if (s_pager_ready && daytime()) {
+            int poll_sec = (now - s_pager_last_activity < PAGER_ACTIVE_SEC) ? PAGER_ACTIVE_POLL_SEC
+                                                                            : PAGER_POLL_SEC;
             if (now - last_pager_poll >= poll_sec) {
                 do_poll_pager();
                 last_pager_poll = time(nullptr);
@@ -891,7 +939,7 @@ static void fetch_task_loop(void* /*param*/) {
             if (stock_batch_due(now, stocks_market_open(now))) {
                 s_stocks_force = false;
                 do_fetch_stock_batch();
-            } else {
+            } else if (s_power != FETCH_POWER_SCREEN_OFF) {
                 int i = stock_details_due(now);
                 if (i >= 0) do_fetch_stock(i);
             }
@@ -904,8 +952,9 @@ static void fetch_task_loop(void* /*param*/) {
             Log.println("[NTP] Daily resync triggered");
         }
 
-        // Idle until the next round — or earlier when the UI asks for something
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FETCH_LOOP_MS));
+        // Idle until the next round — or earlier when the UI asks for something.
+        // More stops waiting (after waking up): carry on right away.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(stops_due > 1 ? 50 : FETCH_LOOP_MS));
     }
 }
 
@@ -941,11 +990,23 @@ void fetch_task_get(int stop_idx,
 
 void fetch_task_set_active_stop(int new_idx) {
     s_active_stop = new_idx;
-    // If this stop has never been fetched, prioritise it immediately
+    // Swiped to it: fetch right away, unless its data is still fresh (quick
+    // swipes back and forth, kiosk mode)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool needs_fetch = !s_cache[new_idx].ever_fetched;
+    const StopCache& c = s_cache[new_idx];
+    bool needs_fetch = !c.ever_fetched || time(nullptr) - c.fetch_time >= SWITCH_FRESH_SEC;
     xSemaphoreGive(s_mutex);
     if (needs_fetch) { s_force_refresh = true; wake_task(); }
+}
+
+void fetch_task_set_visible(bool departures, bool commute) {
+    s_departures_visible = departures;
+    s_commute_visible    = commute;
+}
+
+void fetch_task_wake() {
+    s_wake_pending = true;
+    wake_task();
 }
 
 void fetch_task_force_refresh() {

@@ -182,6 +182,7 @@ bool api_parse_departures(
         d.delay       = delay_minutes;
         d.platform    = live.length() ? live : planned;
         d.platform_changed = live.length() && planned.length() && live != planned;
+        d.vehicle     = vehicle_from_category(category.c_str());
         results.push_back(d);
 
         if ((int)results.size() >= max_results) break;

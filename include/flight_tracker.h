@@ -39,6 +39,10 @@ void flight_tracker_init(const FlightEntry* entries, int count);
 // the UI uses fetch_task_force_flight_refresh()). Returns true if the cache was updated.
 bool flight_tracker_refresh(int slot);
 
+// From 30 min before departure until landing (best known times): refresh more
+// often then. False outside, or when the times aren't known.
+bool flight_tracker_near_flight(int slot, time_t now);
+
 // Copy cached data for one slot. Thread-safe (call from any context).
 void flight_tracker_get(int slot, FlightInfo& out);
 

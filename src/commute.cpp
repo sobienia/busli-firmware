@@ -116,6 +116,7 @@ bool commute_parse(const char* json, size_t json_len, time_t now, CommuteData& o
                 leg.line = String(jcat);            // last resort: "B", "T", …
             }
 
+            leg.vehicle  = vehicle_from_category(jcat);
             leg.from     = String(sec["departure"]["station"]["name"] | "");
             leg.to       = String(sec["arrival"]["station"]["name"]   | "");
             leg.dep_time = parse_iso8601_cm(String(sec["departure"]["departure"] | ""));

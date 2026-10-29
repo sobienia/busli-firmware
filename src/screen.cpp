@@ -150,9 +150,9 @@ bool power_tick() {
         g_last_redraw_ms = 0;
         g_pager_dirty  = true;
     }
-    // Pages becoming visible again → their data was refreshed rarely meanwhile
+    // Pages becoming visible again → nothing was fetched for them meanwhile
     static bool was_idle = false;
-    if (was_idle && !idle) fetch_task_force_refresh();
+    if (was_idle && !idle) fetch_task_wake();
     was_idle = idle;
 
     fetch_task_set_power_mode(idle  ? FETCH_POWER_SCREEN_OFF

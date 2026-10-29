@@ -14,11 +14,13 @@
 #define BOARD_VERSION 11
 
 // Transit refresh intervals (the board counts down between fetches)
-#define ACTIVE_REFRESH_SEC    30   // currently-displayed stop
-#define INACTIVE_REFRESH_SEC  90   // background stops (3× less frequent)
+#define ACTIVE_REFRESH_SEC    60   // the stop on screen
+#define INACTIVE_REFRESH_SEC  300  // other stops, and all of them while another page shows
 #define NIGHT_ACTIVE_REFRESH_SEC    120  // night hours, screen dimmed
 #define NIGHT_INACTIVE_REFRESH_SEC  600
-#define SCREEN_OFF_REFRESH_SEC      900  // screen off: all stops (refreshed on wake)
+// Night with the screen off or the clock showing: no departures are fetched at
+// all; waking the screen fetches every stop (the one on screen first).
+#define SWITCH_FRESH_SEC      60   // swiping to a stop fetches it unless its data is this fresh
 
 // Display brightness (0–100, percent)
 #define DAY_BRIGHTNESS    80
@@ -75,7 +77,9 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 #define FETCH_TASK_STACK      16384  // FreeRTOS task stack (bytes)
 #define FETCH_TASK_PRIORITY   1      // Low priority — runs on WiFi core 0
 #define FETCH_LOOP_MS         5000   // How often the background task checks for due work
-#define FLIGHT_REFRESH_SEC    300    // Flight data refresh interval (5 min)
+#define FLIGHT_REFRESH_SEC    1800   // flight lookups (only around the flight, see flight_tracker)
+#define FLIGHT_ACTIVE_REFRESH_SEC 900 // from 30 min before departure until landing
+// OpenSky allows anonymous users ~400 requests a day: 2 flights at 5 min was over it
 #define NTP_RESYNC_SEC        86400  // Re-sync NTP once per day
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -121,7 +125,8 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 #define WEATHER_LAT            47.376   // Zürich
 #define WEATHER_LON             8.541
 #define RAIN_ALERT_MINUTES     120      // footer warns about rain starting within this window
-#define WEATHER_REFRESH_SEC     900     // 15 minutes
+#define WEATHER_REFRESH_SEC     1200    // 20 minutes
+#define WEATHER_SHARE_KM        5       // places this close share one forecast
 #define WEATHER_OFF_REFRESH_SEC 3600    // while the screen is off at night
 #define WEATHER_DETAIL_REFRESH_SEC 1800 // weather page (hourly, air quality, pollen)
 // Today page water temperatures change slowly: fetched once at startup, then every
@@ -156,19 +161,22 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 // ║  COMMUTE REFRESH                                                          ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define COMMUTE_REFRESH_SEC  60    // how often the background task re-fetches commute data
+#define COMMUTE_REFRESH_SEC     60   // while a commute page is on screen (daytime only)
+#define COMMUTE_BG_REFRESH_SEC  300  // otherwise (daytime only)
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  PARCEL TRACKING (Swiss Post)                                             ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define PARCEL_REFRESH_SEC  3600   // re-check tracking status once per hour
+#define PARCEL_REFRESH_SEC  3600   // re-check tracking status once per hour (daytime,
+                                   // until delivered)
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║  STOCKS                                                                   ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-#define STOCKS_REFRESH_SEC      300  // each ticker re-fetched every 5 min while markets are open
+#define STOCKS_REFRESH_SEC      600  // prices (and an open detail chart) every 10 min while
+                                     // markets are open; paused while the screen is off
 #define STOCKS_OPEN_HOUR          9  // polling window, Zürich local time, Mon–Fri
 #define STOCKS_CLOSE_HOUR        22  //   (covers SIX/Xetra/LSE and the US session)
 #define STOCKS_ROTATE_SEC_DEFAULT 10 // page rotation when there are 2+ pages of tickers
@@ -192,7 +200,7 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.7.5"
+#define FIRMWARE_VERSION        "1.7.6"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 

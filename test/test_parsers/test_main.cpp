@@ -58,6 +58,18 @@ static void test_departures_all() {
     TEST_ASSERT_TRUE(d[1].platform_changed);
     TEST_ASSERT_EQUAL_STRING("S12", d[2].line.c_str());                  // train: category + number
     TEST_ASSERT_FALSE(d[2].platform_changed);
+    TEST_ASSERT_EQUAL(VEHICLE_TRAM,  d[0].vehicle);                      // "leaving now" icons
+    TEST_ASSERT_EQUAL(VEHICLE_BUS,   d[1].vehicle);
+    TEST_ASSERT_EQUAL(VEHICLE_TRAIN, d[2].vehicle);
+}
+
+static void test_vehicle_categories() {
+    TEST_ASSERT_EQUAL(VEHICLE_TRAIN, vehicle_from_category("IC"));
+    TEST_ASSERT_EQUAL(VEHICLE_TRAIN, vehicle_from_category("IR"));
+    TEST_ASSERT_EQUAL(VEHICLE_TRAM,  vehicle_from_category("NFT"));
+    TEST_ASSERT_EQUAL(VEHICLE_BUS,   vehicle_from_category("NFB"));
+    TEST_ASSERT_EQUAL(VEHICLE_BUS,   vehicle_from_category("BAT"));    // boat: bus icon
+    TEST_ASSERT_EQUAL(VEHICLE_BUS,   vehicle_from_category(""));
 }
 
 static void test_departures_filters() {
@@ -282,6 +294,8 @@ static void test_commute_legs() {
     TEST_ASSERT_EQUAL(2, c.connections[0].leg_count);                       // walk skipped
     TEST_ASSERT_EQUAL_STRING("IC5", c.connections[0].legs[0].line.c_str());
     TEST_ASSERT_EQUAL_STRING("10", c.connections[0].legs[1].line.c_str());  // not the trip no.
+    TEST_ASSERT_EQUAL(VEHICLE_TRAIN, c.connections[0].legs[0].vehicle);
+    TEST_ASSERT_EQUAL(VEHICLE_BUS,   c.connections[0].legs[1].vehicle);
     TEST_ASSERT_EQUAL((long)(T0 + 120), (long)c.connections[0].dep_time);
     // An hour later it has left
     TEST_ASSERT_FALSE(commute_parse(CONNECTIONS, strlen(CONNECTIONS), T0 + 3600, c));
@@ -304,6 +318,7 @@ void setup() {
     RUN_TEST(test_departures_filters);
     RUN_TEST(test_departures_past_and_limit);
     RUN_TEST(test_departures_live);
+    RUN_TEST(test_vehicle_categories);
     RUN_TEST(test_weather_values_and_codes);
     RUN_TEST(test_weather_rain_alert);
     RUN_TEST(test_weather_live);

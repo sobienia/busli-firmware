@@ -544,19 +544,35 @@ static time_t make_local_epoch(const String& date, const String& hhmm) {
 // SEARCH_BEFORE_DEP_SEC before departure until SEARCH_AFTER_ARR_SEC after arrival.
 // Best known times win: API timestamps, then entered times, then the whole
 // departure day (+ next day for overnight flights). No date → always search.
+// Best known departure/arrival (0 = unknown): API timestamps, then entered times
+static void best_times(int slot, time_t& dep, time_t& arr) {
+    const FlightEntry& e = s_entries[slot];
+    dep = s_cache[slot].dep_time;
+    if (dep == 0) dep = make_local_epoch(e.dep_date, e.dep_time_str);
+    arr = s_cache[slot].arr_time;
+    if (arr == 0) {
+        arr = make_local_epoch(e.dep_date, e.arr_time_str);
+        if (arr > 0 && dep > 0 && arr < dep) arr += 86400;  // overnight flight
+    }
+}
+
+bool flight_tracker_near_flight(int slot, time_t now) {
+    if (slot < 0 || slot >= s_count || now < 1700000000) return false;
+    time_t dep, arr;
+    best_times(slot, dep, arr);
+    if (dep == 0) return false;
+    time_t end = (arr > 0) ? arr : dep + MAX_FLIGHT_SEC;
+    return now >= dep - 1800 && now <= end;
+}
+
 static bool in_search_window(int slot, time_t now) {
     if (now < 1700000000) return true;  // clock not synced — can't judge
     const FlightEntry& e = s_entries[slot];
     time_t day_start = make_local_epoch(e.dep_date, "00:00");
     if (day_start == 0) return true;
 
-    time_t dep = s_cache[slot].dep_time;
-    if (dep == 0) dep = make_local_epoch(e.dep_date, e.dep_time_str);
-    time_t arr = s_cache[slot].arr_time;
-    if (arr == 0) {
-        arr = make_local_epoch(e.dep_date, e.arr_time_str);
-        if (arr > 0 && dep > 0 && arr < dep) arr += 86400;  // overnight flight
-    }
+    time_t dep, arr;
+    best_times(slot, dep, arr);
 
     time_t start = (dep > 0 ? dep : day_start) - SEARCH_BEFORE_DEP_SEC;
     time_t end   = (arr > 0) ? arr + SEARCH_AFTER_ARR_SEC

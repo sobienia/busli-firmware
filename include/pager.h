@@ -3,7 +3,11 @@
 #include <vector>
 
 #define PAGER_MAX_FRIENDS  5
-#define PAGER_POLL_SEC     30
+// Checking for messages: daytime only (outside the night mode hours) — what
+// arrives at night is kept by ntfy.sh for 12 h and shows up in the morning
+#define PAGER_POLL_SEC        120   // normally
+#define PAGER_ACTIVE_POLL_SEC 30    // for PAGER_ACTIVE_SEC after the pager was used
+#define PAGER_ACTIVE_SEC      300
 
 struct PagerFriend {
     String name;
@@ -15,6 +19,7 @@ struct PagerConfig {
     String      topic;                       // this device's ntfy.sh topic
     PagerFriend friends[PAGER_MAX_FRIENDS];
     int         n_friends = 0;
+    bool        enabled   = true;            // off: no checking, long press does nothing
 };
 
 struct PagerIncoming {

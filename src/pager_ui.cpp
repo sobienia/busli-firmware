@@ -29,15 +29,17 @@ void pager_ui_init() {
         g_pager_cfg.friends[g_pager_cfg.n_friends].topic = g_pager_cfg.topic;
         g_pager_cfg.n_friends++;
     }
-    fetch_task_set_pager(g_pager_cfg);
-    Log.printf("[Pager] Topic: %s  Name: %s  Friends: %d\n",
+    if (g_pager_cfg.enabled) fetch_task_set_pager(g_pager_cfg);   // off: never checks
+    Log.printf("[Pager] %s  Topic: %s  Name: %s  Friends: %d\n", g_pager_cfg.enabled ? "On" : "Off",
                   g_pager_cfg.topic.c_str(), g_pager_cfg.name.c_str(), g_pager_cfg.n_friends);
 }
 
 bool pager_ui_active() { return g_pager_state != PAGER_OFF; }
 
 // Long press on the brightness button: open the pager, or cancel it
+// (nothing while the pager is switched off in Settings)
 void pager_ui_toggle() {
+    if (!g_pager_cfg.enabled) return;
     if (g_pager_state == PAGER_OFF) {
         g_pager_state  = PAGER_ACTIVITIES;
         g_pager_act    = -1;

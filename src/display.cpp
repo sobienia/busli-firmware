@@ -443,6 +443,49 @@ static void draw_bus_icon(int x, int y, uint16_t color) {
     gfx->fillRect(x + 21, y + 25, 7,  3, color);  // right wheel
 }
 
+// ── Train icon (same footprint as the bus) ───────────────────────────────────
+static void draw_train_icon(int x, int y, uint16_t color) {
+    gfx->fillRect(x + 3,  y + 1,  22, 1,  color);  // rounded roof
+    gfx->fillRect(x + 1,  y + 2,  26, 1,  color);
+    gfx->fillRect(x,      y + 3,  28, 21, color);  // body
+    gfx->fillRect(x + 3,  y + 5,  22, 9,  BLACK);  // big windshield
+    gfx->fillRect(x + 12, y + 15, 4,  2,  BLACK);  // top light
+    gfx->fillRect(x + 3,  y + 18, 5,  3,  BLACK);  // left headlight
+    gfx->fillRect(x + 20, y + 18, 5,  3,  BLACK);  // right headlight
+    gfx->fillRect(x - 2,  y + 24, 32, 2,  color);  // buffer beam
+    gfx->fillRect(x + 3,  y + 26, 4,  1,  color);  // bogies
+    gfx->fillRect(x + 21, y + 26, 4,  1,  color);
+    gfx->fillRect(x - 4,  y + 27, 36, 1,  color);  // rail
+}
+
+// ── Tram icon (same footprint as the bus) ────────────────────────────────────
+static void draw_tram_icon(int x, int y, uint16_t color) {
+    gfx->fillRect(x + 6,  y,      16, 1,  color);  // pantograph
+    gfx->fillRect(x + 8,  y + 1,  2,  1,  color);
+    gfx->fillRect(x + 18, y + 1,  2,  1,  color);
+    gfx->fillRect(x + 10, y + 2,  2,  1,  color);
+    gfx->fillRect(x + 16, y + 2,  2,  1,  color);
+    gfx->fillRect(x + 12, y + 3,  4,  2,  color);
+    gfx->fillRect(x + 1,  y + 5,  26, 1,  color);  // roof
+    gfx->fillRect(x,      y + 6,  28, 19, color);  // body
+    gfx->fillRect(x + 3,  y + 7,  22, 3,  BLACK);  // destination sign
+    gfx->fillRect(x + 3,  y + 11, 22, 7,  BLACK);  // windshield
+    gfx->fillRect(x + 3,  y + 20, 5,  2,  BLACK);  // left headlight
+    gfx->fillRect(x + 20, y + 20, 5,  2,  BLACK);  // right headlight
+    gfx->fillRect(x + 2,  y + 25, 6,  2,  color);  // wheels
+    gfx->fillRect(x + 20, y + 25, 6,  2,  color);
+    gfx->fillRect(x - 4,  y + 27, 36, 1,  color);  // rail
+}
+
+// "Leaving now" icon for the kind of vehicle
+static void draw_vehicle_icon(Vehicle v, int x, int y, uint16_t color) {
+    switch (v) {
+        case VEHICLE_TRAIN: draw_train_icon(x, y, color); break;
+        case VEHICLE_TRAM:  draw_tram_icon(x, y, color);  break;
+        default:            draw_bus_icon(x, y, color);   break;
+    }
+}
+
 // ── Day / night brightness ───────────────────────────────────────────────────
 // Day and night each have their own level, cycled by the brightness button and
 // saved separately — adjusting at night no longer changes the daytime level.
@@ -734,6 +777,7 @@ static uint32_t rows_signature(const std::vector<Departure>& shown, int max_rows
         h = (h ^ (uint32_t)departure_minutes(shown[i], now)) * 16777619u;
         h = (h ^ (uint32_t)shown[i].delay) * 16777619u;
         h = (h ^ (uint32_t)shown[i].platform_changed) * 16777619u;
+        h = (h ^ (uint32_t)shown[i].vehicle) * 16777619u;
         for (char c : shown[i].platform)    h = (h ^ (uint8_t)c) * 16777619u;
         for (char c : shown[i].line)        h = (h ^ (uint8_t)c) * 16777619u;
         for (char c : shown[i].destination) h = (h ^ (uint8_t)c) * 16777619u;
@@ -812,10 +856,10 @@ static void draw_rows(const std::vector<Departure>& departures, time_t fetch_tim
             dest = dest.substring(0, dest.length() - 1);
         draw_text(dest, dest_start, text_y, row_fsz, c_row0);
 
-        // Time or bus icon
+        // Time or vehicle icon
         int mins = departure_minutes(dep, now);
         if (mins <= 0) {
-            draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, c_row0);
+            draw_vehicle_icon(dep.vehicle, SCREEN_W - PAD - 32, text_y - 2, c_row0);
         } else {
             char tbuf[8];
             snprintf(tbuf, sizeof(tbuf), "%d'", mins);
@@ -1067,7 +1111,7 @@ static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_
             }
             gfx->fillRect(time_col_x, y, time_col_w, mask_h, BLACK);
             if (mins == 0) {
-                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, c_row0);
+                draw_vehicle_icon(leg.vehicle, SCREEN_W - PAD - 32, text_y - 2, c_row0);
             } else {
                 char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%d'", mins);
                 String ts = tbuf;
@@ -1097,7 +1141,7 @@ static void draw_commute_rows(const CommuteData& data, int conn_idx, time_t now_
 
             gfx->fillRect(time_col_x, y, time_col_w, mask_h, BLACK);
             if (mins == 0) {
-                draw_bus_icon(SCREEN_W - PAD - 32, text_y - 2, c_row0);
+                draw_vehicle_icon(leg.vehicle, SCREEN_W - PAD - 32, text_y - 2, c_row0);
             } else {
                 char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%d'", mins);
                 String ts = tbuf;

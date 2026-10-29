@@ -100,7 +100,7 @@ void setup() {
 
     setup_pages();
     set_initial_page();
-    update_weather_place();   // before the fetch task's first weather request
+    update_fetch_focus();   // before the fetch task's first weather request
 
     http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);

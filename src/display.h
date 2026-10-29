@@ -9,6 +9,7 @@
 #include "../include/flight_tracker.h"
 #include "../include/commute.h"
 #include "../include/stocks.h"
+#include "../include/vehicle.h"
 #include "weather.h"
 
 // One transit departure (used by both display and api modules)
@@ -20,6 +21,7 @@ struct Departure {
     int    delay;       // delay in minutes (0 = on time)
     String platform;    // e.g. "3", "41/42", "C"; "" = not reported
     bool   platform_changed = false;  // differs from the timetable — highlighted
+    Vehicle vehicle = VEHICLE_BUS;    // icon when it's leaving now
 };
 
 // Initialize the display hardware (call once in setup())

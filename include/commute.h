@@ -4,13 +4,15 @@
 
 #pragma once
 #include <Arduino.h>
+#include "vehicle.h"
 
 struct CommuteLeg {
-    String line;     // e.g. "IC5", "S12", "31"
-    String from;     // departure station name
-    String to;       // arrival station name
-    time_t dep_time; // UTC epoch
-    time_t arr_time; // UTC epoch
+    String  line;     // e.g. "IC5", "S12", "31"
+    String  from;     // departure station name
+    String  to;       // arrival station name
+    time_t  dep_time; // UTC epoch
+    time_t  arr_time; // UTC epoch
+    Vehicle vehicle;  // icon when it's leaving now
 };
 
 #define COMMUTE_MAX_LEGS         4

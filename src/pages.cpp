@@ -158,10 +158,14 @@ void set_initial_page() {
     }
 }
 
-// The footer weather follows the page: a transit stop's own location, the
-// commute station you're leaving from, or (portfolio) the device's own location.
-void update_weather_place() {
+// Tell the fetch task what the page on screen needs:
+//  • which departures/commute are visible (refreshed faster than the rest);
+//  • the footer weather's place: a transit stop's own location, the commute
+//    station you're leaving from, or the device's own location.
+void update_fetch_focus() {
     const PageInfo& p = g_pages[g_current_page];
+    fetch_task_set_visible(p.type == PageInfo::TRANSIT,
+                           p.type == PageInfo::COMMUTE_HOME || p.type == PageInfo::COMMUTE_WORK);
     switch (p.type) {
         case PageInfo::TRANSIT:      fetch_task_set_weather_place(p.transit_idx);        break;
         case PageInfo::COMMUTE_WORK: fetch_task_set_weather_place(WEATHER_PLACE_HOME);   break;  // from home
@@ -204,7 +208,7 @@ void switch_page(int new_page, bool by_user) {
         g_current_stop = p.transit_idx;
         fetch_task_set_active_stop(g_current_stop);
     }
-    update_weather_place();
+    update_fetch_focus();
     // Remember the page once the user settles on it (not on every swipe —
     // each NVS write wears flash). Saved by save_page_tick().
     if (by_user) g_page_save_at_ms = millis() + PAGE_SAVE_DELAY_MS;
@@ -229,7 +233,7 @@ void restore_saved_page() {
             fetch_task_set_active_stop(g_current_stop);
         }
         Log.printf("[Page] Restored page %d from NVS\n", saved);
-        update_weather_place();
+        update_fetch_focus();
     }
 }
 

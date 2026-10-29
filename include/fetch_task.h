@@ -35,11 +35,12 @@ void fetch_task_get_source_status(SourceStatus out[SRC_COUNT]);
 void fetch_task_set_today_enabled(bool enabled);
 void fetch_task_get_today(WaterTemps& water, DailyQuote& quote);
 
-// How eagerly to refresh transit data (see TRANSIT_*_SEC in config.h)
+// How eagerly to refresh (see the *_REFRESH_SEC values in config.h). Anything
+// other than NORMAL is night: the pager, commute and parcel pause then.
 enum FetchPower {
-    FETCH_POWER_NORMAL,      // day: visible stop every 30 s
-    FETCH_POWER_NIGHT,       // night hours, screen on (dimmed)
-    FETCH_POWER_SCREEN_OFF,  // screen off: rarely — the board isn't visible
+    FETCH_POWER_NORMAL,      // day
+    FETCH_POWER_NIGHT,       // night hours, pages visible (dimmed / woken)
+    FETCH_POWER_SCREEN_OFF,  // night, screen off or clock: no departures or prices
 };
 
 // Set from the main loop whenever the screen/night state changes.
@@ -67,9 +68,19 @@ void fetch_task_get(int stop_idx,
                     time_t& out_fetch_time,
                     bool&   out_from_cache);
 
-// Tell the fetch task which stop is currently displayed.
-// It will prioritize fetching that stop after a stop switch.
+// Tell the fetch task which stop is currently displayed. Switching to it
+// fetches it right away, unless its data is under SWITCH_FRESH_SEC old.
 void fetch_task_set_active_stop(int new_idx);
+
+// What the page on screen shows. While neither departures nor a commute is
+// visible, the last stop drops to the background rate (INACTIVE_REFRESH_SEC)
+// and the commute to COMMUTE_BG_REFRESH_SEC.
+void fetch_task_set_visible(bool departures, bool commute);
+
+// Pages visible again after the screen was off / the night clock showed: every
+// stop (the one on screen first), the weather on screen and the portfolio are
+// refreshed at once — nothing is fetched for them meanwhile.
+void fetch_task_wake();
 
 // Request an immediate re-fetch of the active stop (long-press action).
 void fetch_task_force_refresh();

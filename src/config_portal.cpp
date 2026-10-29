@@ -243,8 +243,9 @@ bool config_load_pager(PagerConfig& out) {
     if (!json.isEmpty()) {
         JsonDocument doc;
         if (!deserializeJson(doc, json)) {
-            out.name  = doc["n"] | "";
-            out.topic = doc["t"] | "";
+            out.name    = doc["n"] | "";
+            out.topic   = doc["t"] | "";
+            out.enabled = doc["on"] | true;
             out.n_friends = 0;
             JsonArray fa = doc["f"].as<JsonArray>();
             for (JsonObject fo : fa) {
@@ -267,8 +268,9 @@ bool config_load_pager(PagerConfig& out) {
 
 void config_save_pager(const PagerConfig& cfg) {
     JsonDocument doc;
-    doc["n"] = cfg.name;
-    doc["t"] = cfg.topic;
+    doc["n"]  = cfg.name;
+    doc["t"]  = cfg.topic;
+    doc["on"] = cfg.enabled;
     JsonArray fa = doc["f"].to<JsonArray>();
     for (int i = 0; i < cfg.n_friends; i++) {
         JsonObject fo = fa.add<JsonObject>();
@@ -835,6 +837,12 @@ static String build_page(String ssids[], String passes[], String users[],
            "Long-press the brightness button to open the send screen. "
            "Share your Topic ID with friends so they can message you.</p>");
     h += "<div class='card'><div class='ct'>This device</div>";
+    h += "<label style='display:flex;align-items:center;gap:10px;cursor:pointer'>"
+         "<input type='checkbox' name='pg_on' value='1'";
+    if (pager.enabled) h += " checked";
+    h += F("><span>Pager on</span></label>"
+           "<p class='hint' style='margin:4px 0 10px'>Checks for messages every 2 minutes during "
+           "the day (not in the night mode hours). Off: no checking, and the long press does nothing.</p>");
     h += "<label>Your name <span class='hint'>shown to friends when you send a message</span></label>"
          "<input type='text' name='pg_n' placeholder='e.g. AJ' maxlength='20' value='"
          + html_encode(pager.name) + "'>";
@@ -1263,6 +1271,7 @@ static void handle_save() {
     new_pager.name  = s_server.arg("pg_n"); new_pager.name.trim();
     new_pager.topic = s_server.arg("pg_t"); new_pager.topic.trim();
     if (new_pager.topic.isEmpty()) new_pager.topic = s_pager.topic;  // keep existing
+    new_pager.enabled = s_server.hasArg("pg_on");
     new_pager.n_friends = 0;
     for (int i = 0; i < PAGER_MAX_FRIENDS; i++) {
         String fn = s_server.arg("pf" + String(i) + "n"); fn.trim();
