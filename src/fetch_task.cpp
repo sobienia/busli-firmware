@@ -25,6 +25,8 @@
 #include "commute.h"
 #include "../include/geo.h"
 #include "../include/today_data.h"
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -62,6 +64,7 @@ struct PlaceWeather {
 };
 static PlaceWeather   s_places[MAX_PLACES];
 static volatile int   s_weather_place = 0;
+static bool           s_here_stale    = false;   // remembered location > 1 day old
 
 // Commute cache
 static String      s_home_station;
@@ -87,13 +90,19 @@ static bool   s_parcel_changed     = false;
 static bool   s_parcel_ok          = false;  // at least one fetch succeeded
 static time_t s_parcel_delivered_at = 0;     // epoch when "Delivered" was first recorded
 
-// Stocks — s_stock_quotes[] is protected by s_mutex; scheduling state is core-0 only
-// except s_stock_forced[], which the main loop sets via fetch_task_force_stocks_refresh().
+// Stocks — s_stock_quotes[] is protected by s_mutex; scheduling state is core-0
+// only except the volatile flags, which the main loop sets.
+//   Prices: one batch request for all tickers (stocks_fetch_batch), every
+//           STOCKS_REFRESH_SEC while markets are open + one pass after close.
+//   Details (name, ranges, currency/pence scale): per ticker, once a day,
+//           staggered one per loop iteration (stocks_fetch_quote).
 static StockQuote    s_stock_quotes[STOCKS_MAX];
 static volatile int  s_stock_count = 0;
-static time_t        s_stock_last_attempt[STOCKS_MAX] = {};
-static bool          s_stock_need_close[STOCKS_MAX]   = {};  // last fetch was during market hours
-static volatile bool s_stock_forced[STOCKS_MAX]       = {};
+static time_t        s_stock_last_attempt[STOCKS_MAX] = {};   // details fetch attempts
+static time_t        s_stock_batch_last       = 0;            // last batch attempt
+static bool          s_stock_batch_need_close = false;        // last batch was during market hours
+static volatile bool s_stocks_force           = false;        // long press / remote refresh
+static const long    STOCK_DETAILS_SEC        = 86400;        // details are refreshed daily
 
 // Detail-view chart — fetched on demand for the ticker the user opened
 static volatile int  s_chart_request = -1;   // ticker index wanted; -1 = detail view closed
@@ -233,7 +242,19 @@ static void place_coords(int place, float& lat, float& lon) {
     PlaceWeather& pw = s_places[place];
     time_t now = time(nullptr);
 
-    // Find where the place is (stations: once, NVS-cached; "here": once per boot)
+    // Find where the place is. Stations: once, NVS-cached forever. "Here": the
+    // location remembered for this Wi-Fi network if there is one (no request —
+    // saves ~3 s at boot; a stale one is refreshed later), else an IP lookup.
+    if (!pw.geo.valid && place == place_here()) {
+        GeoPlace g;
+        bool stale = false;
+        if (geo_here_cached(g, stale)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            pw.geo = g;
+            xSemaphoreGive(s_mutex);
+            s_here_stale = stale;
+        }
+    }
     if (!pw.geo.valid && (pw.geo_tried == 0 || now - pw.geo_tried >= 3600)) {
         pw.geo_tried = now;
         GeoPlace g;
@@ -371,20 +392,66 @@ static void do_fetch_parcel() {
         Serial.printf("[Parcel] Status changed → '%s'\n", new_status.c_str());
 }
 
-// A ticker is due when its refresh interval has passed and either the market is
-// open, it has no result yet, or it still needs the closing price (its last fetch
-// happened during market hours). A forced refresh skips all of that.
-static bool stock_due(int i, time_t now, bool market_open) {
-    if (s_stock_forced[i]) return true;
-    if (s_stock_last_attempt[i] != 0 && now - s_stock_last_attempt[i] < STOCKS_REFRESH_SEC)
-        return false;
-    if (market_open) return true;
+// The price batch is due when its interval has passed and either the market is
+// open, a ticker has no price yet, or the closing price is still missing (the
+// last batch ran during market hours). A forced refresh skips all of that.
+static bool stock_batch_due(time_t now, bool market_open) {
+    if (s_stocks_force) return true;
+    if (s_stock_batch_last != 0 && now - s_stock_batch_last < STOCKS_REFRESH_SEC) return false;
+    if (market_open || s_stock_batch_need_close) return true;
+    bool pending = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool pending = (s_stock_quotes[i].status == STOCK_PENDING);
+    for (int i = 0; i < s_stock_count; i++) pending |= (s_stock_quotes[i].status == STOCK_PENDING);
     xSemaphoreGive(s_mutex);
-    return pending || s_stock_need_close[i];
+    return pending;
 }
 
+// Ticker whose details are due (never fetched → soon; otherwise daily), or -1
+static int stock_details_due(time_t now) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int pick = -1;
+    for (int i = 0; i < s_stock_count && pick < 0; i++) {
+        time_t dt = s_stock_quotes[i].detail_time, la = s_stock_last_attempt[i];
+        bool never = dt == 0 && (la == 0 || now - la >= 120);
+        bool old   = dt != 0 && now - dt >= STOCK_DETAILS_SEC && now - la >= 600;
+        if (never || old) pick = i;
+    }
+    xSemaphoreGive(s_mutex);
+    return pick;
+}
+
+static void do_fetch_stock_batch() {
+    static StockQuote q[STOCKS_MAX];   // static: ~5 KB, too big for the task stack
+    bool found[STOCKS_MAX];
+    int n = s_stock_count;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < n; i++) q[i] = s_stock_quotes[i];
+    xSemaphoreGive(s_mutex);
+
+    http_lock_take();
+    StockFetchResult r = stocks_fetch_batch(q, n, found);
+    http_lock_give();
+    note_result(SRC_STOCKS, r == STOCK_FETCH_OK);
+
+    time_t now = time(nullptr);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < n; i++) {
+        if (!found[i]) continue;
+        StockQuote& c = s_stock_quotes[i];
+        c.status     = STOCK_OK;
+        c.price      = q[i].price;
+        c.change_pct = q[i].change_pct;
+        c.prev_close = q[i].prev_close;
+        c.spark_n    = q[i].spark_n;
+        memcpy(c.spark, q[i].spark, sizeof(float) * q[i].spark_n);
+        c.fetch_time = now;
+    }
+    xSemaphoreGive(s_mutex);
+    s_stock_batch_last       = now;
+    s_stock_batch_need_close = stocks_market_open(now);
+}
+
+// Full quote + details for one ticker (also learns the pence/pound scale)
 static void do_fetch_stock(int i) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     String symbol = s_stock_quotes[i].symbol;
@@ -412,13 +479,15 @@ static void do_fetch_stock(int i) {
         c.open       = q.open;
         c.day_low    = q.day_low;   c.day_high  = q.day_high;
         c.year_low   = q.year_low;  c.year_high = q.year_high;
-        s_stock_need_close[i] = stocks_market_open(now);
+        c.price_scale = q.price_scale;
+        c.detail_time = q.detail_time;
     } else if (r == STOCK_FETCH_NOT_FOUND) {
-        c.status = STOCK_NOT_FOUND;
-        s_stock_need_close[i] = false;
+        c.status      = STOCK_NOT_FOUND;
+        c.detail_time = now;   // don't keep asking; re-checked with the daily details
     }
-    // STOCK_FETCH_ERROR: keep the last good quote; retried after STOCKS_REFRESH_SEC
+    // STOCK_FETCH_ERROR: keep what we have; details are retried after 2 minutes
     xSemaphoreGive(s_mutex);
+    s_stock_last_attempt[i] = now;
 }
 
 // Weather interval for a place: retry failures after 60 s; slower with the screen off
@@ -430,6 +499,221 @@ static long weather_interval(const PlaceWeather& pw) {
 static bool weather_due(int place, time_t now) {
     const PlaceWeather& pw = s_places[place];
     return pw.last_attempt == 0 || now - pw.last_attempt >= weather_interval(pw);
+}
+
+// ── Snapshot: last known data across restarts ────────────────────────────────
+// Saved to LittleFS (the 3.4 MB data partition, wear-levelled) every
+// SNAPSHOT_SAVE_SEC and after the startup batch; loaded at the next start so
+// the first page can show remembered data at once while fresh data loads.
+// Entries are matched by station / symbol name, so changed settings simply
+// don't find their old entries.
+static const char* SNAPSHOT_FILE = "/snapshot.json";
+static bool   s_fs_ok           = false;
+static time_t s_snapshot_age    = -1;    // seconds old when loaded; -1 = none
+static time_t s_snapshot_saved  = 0;
+
+static String place_key(int place) {
+    return (place == place_here()) ? String("@here") : place_station(place);
+}
+
+static void snapshot_save() {
+    if (!s_fs_ok) return;
+    JsonDocument doc;
+    time_t now = time(nullptr);
+    doc["t"] = (long)now;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    JsonArray stops = doc["stops"].to<JsonArray>();
+    for (int i = 0; i < s_num_stops; i++) {
+        if (!s_cache[i].ever_fetched) continue;
+        JsonObject o = stops.add<JsonObject>();
+        o["s"] = s_stops[i].station;
+        o["f"] = (long)s_cache[i].fetch_time;
+        JsonArray deps = o["d"].to<JsonArray>();
+        for (const Departure& d : s_cache[i].departures) {
+            JsonArray a = deps.add<JsonArray>();
+            a.add(d.line); a.add(d.destination); a.add((long)d.dep_time);
+            a.add(d.delay); a.add(d.platform); a.add(d.platform_changed);
+        }
+    }
+    JsonArray wx = doc["wx"].to<JsonArray>();
+    for (int p = 0; p < place_count() && p < MAX_PLACES; p++) {
+        const PlaceWeather& pw = s_places[p];
+        if (!pw.ok) continue;
+        JsonObject o = wx.add<JsonObject>();
+        o["k"] = place_key(p);
+        o["c"] = pw.geo.city;
+        o["la"] = pw.geo.lat; o["lo"] = pw.geo.lon; o["gv"] = pw.geo.valid;
+        o["at"] = (long)pw.last_attempt;
+        const WeatherData& w = pw.wx;
+        o["tc"] = w.temp_c; o["tm"] = w.temp_max_c; o["uv"] = w.uv_index; o["um"] = w.uv_index_max;
+        o["pp"] = w.precip_prob_pct; o["rt"] = w.rain_today; o["st"] = w.snow_today;
+        o["ct"] = w.clear_today; o["rn"] = w.raining_now;
+        o["rs"] = (long)w.rain_start; o["re"] = (long)w.rain_end;
+    }
+    if (!isnan(s_water.lake_c) || !isnan(s_water.river_c)) {
+        JsonObject o = doc["water"].to<JsonObject>();
+        if (!isnan(s_water.lake_c))  o["l"] = s_water.lake_c;
+        if (!isnan(s_water.river_c)) o["r"] = s_water.river_c;
+        o["f"] = (long)s_water.fetched;
+    }
+    if (s_quote.valid) {
+        JsonObject o = doc["quote"].to<JsonObject>();
+        o["q"] = s_quote.text; o["a"] = s_quote.author; o["d"] = s_quote.date;
+    }
+    JsonArray st = doc["stocks"].to<JsonArray>();
+    for (int i = 0; i < s_stock_count; i++) {
+        const StockQuote& q = s_stock_quotes[i];
+        if (q.status == STOCK_PENDING) continue;
+        JsonObject o = st.add<JsonObject>();
+        o["s"] = q.symbol; o["st"] = (int)q.status;
+        o["p"] = q.price; o["c"] = q.change_pct; o["pc"] = q.prev_close; o["cu"] = q.currency;
+        o["ft"] = (long)q.fetch_time; o["sc"] = q.price_scale; o["dt"] = (long)q.detail_time;
+        o["n"] = q.name; o["o"] = q.open;
+        o["dl"] = q.day_low; o["dh"] = q.day_high; o["yl"] = q.year_low; o["yh"] = q.year_high;
+        JsonArray sp = o["sp"].to<JsonArray>();
+        for (int k = 0; k < q.spark_n; k++) sp.add(q.spark[k]);
+    }
+    xSemaphoreGive(s_mutex);
+
+    File f = LittleFS.open(SNAPSHOT_FILE, "w");
+    if (!f) { Serial.println("[Snapshot] can't write"); return; }
+    size_t bytes = serializeJson(doc, f);
+    f.close();
+    s_snapshot_saved = now;
+    Serial.printf("[Snapshot] saved %u bytes\n", (unsigned)bytes);
+}
+
+static void snapshot_load() {
+    if (!s_fs_ok || !LittleFS.exists(SNAPSHOT_FILE)) return;
+    File f = LittleFS.open(SNAPSHOT_FILE, "r");
+    if (!f) return;
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) { Serial.printf("[Snapshot] unreadable (%s)\n", err.c_str()); return; }
+
+    time_t now = time(nullptr), saved = doc["t"] | 0L;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (JsonObject o : doc["stops"].as<JsonArray>()) {
+        String station = o["s"] | "";
+        for (int i = 0; i < s_num_stops; i++) {
+            if (station != s_stops[i].station) continue;
+            s_cache[i].departures.clear();
+            for (JsonArray a : o["d"].as<JsonArray>()) {
+                Departure d;
+                d.line = String(a[0] | ""); d.destination = String(a[1] | "");
+                d.dep_time = (time_t)(a[2] | 0L); d.delay = a[3] | 0;
+                d.platform = String(a[4] | ""); d.platform_changed = a[5] | false;
+                s_cache[i].departures.push_back(d);
+            }
+            s_cache[i].fetch_time   = (time_t)(o["f"] | 0L);
+            s_cache[i].ever_fetched = true;
+            s_cache[i].from_cache   = true;    // footer says "cached" until refreshed
+        }
+    }
+    for (JsonObject o : doc["wx"].as<JsonArray>()) {
+        String key = o["k"] | "";
+        for (int p = 0; p < place_count() && p < MAX_PLACES; p++) {
+            if (key != place_key(p) || key.isEmpty()) continue;
+            PlaceWeather& pw = s_places[p];
+            pw.geo.city = String(o["c"] | ""); pw.geo.lat = o["la"] | 0.0f; pw.geo.lon = o["lo"] | 0.0f;
+            pw.geo.valid = o["gv"] | false;
+            WeatherData& w = pw.wx;
+            w.temp_c = o["tc"] | 0.0f; w.temp_max_c = o["tm"] | 0.0f;
+            w.uv_index = o["uv"] | 0; w.uv_index_max = o["um"] | 0; w.precip_prob_pct = o["pp"] | 0;
+            w.rain_today = o["rt"] | false; w.snow_today = o["st"] | false; w.clear_today = o["ct"] | false;
+            w.raining_now = o["rn"] | false;
+            w.rain_start = (time_t)(o["rs"] | 0L); w.rain_end = (time_t)(o["re"] | 0L);
+            w.valid = true;
+            pw.ok = true;
+            pw.last_attempt = (time_t)(o["at"] | 0L);   // refreshed on its normal schedule
+        }
+    }
+    if (!doc["water"].isNull()) {
+        JsonObject o = doc["water"];
+        s_water.lake_c  = o["l"].isNull() ? NAN : o["l"].as<float>();
+        s_water.river_c = o["r"].isNull() ? NAN : o["r"].as<float>();
+        s_water.fetched = (time_t)(o["f"] | 0L);
+    }
+    if (!doc["quote"].isNull()) {
+        s_quote.text   = String(doc["quote"]["q"] | "");
+        s_quote.author = String(doc["quote"]["a"] | "");
+        s_quote.date   = String(doc["quote"]["d"] | "");
+        s_quote.valid  = s_quote.text.length() > 0;
+    }
+    for (JsonObject o : doc["stocks"].as<JsonArray>()) {
+        String sym = o["s"] | "";
+        for (int i = 0; i < s_stock_count; i++) {
+            StockQuote& q = s_stock_quotes[i];
+            if (sym != q.symbol) continue;
+            q.status = (StockStatus)(o["st"] | 0);
+            q.price = o["p"] | 0.0f; q.change_pct = o["c"] | 0.0f; q.prev_close = o["pc"] | 0.0f;
+            q.currency = String(o["cu"] | ""); q.fetch_time = (time_t)(o["ft"] | 0L);
+            q.price_scale = o["sc"] | 0.0f; q.detail_time = (time_t)(o["dt"] | 0L);
+            q.name = String(o["n"] | ""); q.open = o["o"] | 0.0f;
+            q.day_low = o["dl"] | 0.0f; q.day_high = o["dh"] | 0.0f;
+            q.year_low = o["yl"] | 0.0f; q.year_high = o["yh"] | 0.0f;
+            JsonArray sp = o["sp"];
+            q.spark_n = 0;
+            for (JsonVariant v : sp) if (q.spark_n < STOCK_SPARK_POINTS) q.spark[q.spark_n++] = v.as<float>();
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    s_snapshot_age = (now > 1700000000 && saved > 0) ? now - saved : -1;
+    Serial.printf("[Snapshot] loaded (%ld s old)\n", (long)s_snapshot_age);
+}
+
+// ── Slow lane ────────────────────────────────────────────────────────────────
+// Flights (up to a 1 MB download), the parcel check (4 requests) and update
+// checks run in their own task with their own HTTP lane (see http_lock.h), so
+// they never delay departures, weather or stocks in fetch_task_loop.
+static TaskHandle_t s_slow_task = nullptr;
+static void wake_slow_task() { if (s_slow_task) xTaskNotifyGive(s_slow_task); }
+
+static void slow_task_loop(void* /*param*/) {
+    while (!s_config_done) vTaskDelay(pdMS_TO_TICKS(20));
+
+    // Parcel status right away (the Today page and footer show it)
+    time_t last_parcel_fetch = 0;
+    if (!s_parcel_tracking.isEmpty()) {
+        do_fetch_parcel();
+        last_parcel_fetch = time(nullptr);
+    }
+    // First update check at boot + 2 min, then every OTA_CHECK_INTERVAL_SEC
+    time_t last_ota_check = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 120;
+
+    for (;;) {
+        time_t now = time(nullptr);
+
+        // Flights: one slot per round to avoid back-to-back long downloads
+        for (int i = 0; i < s_flight_count; i++) {
+            if (s_flight_forced[i] || now - s_flight_last_fetch[i] >= FLIGHT_REFRESH_SEC) {
+                s_flight_forced[i] = false;
+                flight_tracker_refresh(i);
+                s_flight_last_fetch[i] = time(nullptr);
+                break;
+            }
+        }
+
+        // Firmware update check
+        if (s_ota_enabled && now - last_ota_check >= OTA_CHECK_INTERVAL_SEC && !g_ota_pending) {
+            String url;
+            if (ota_check(url)) {
+                g_ota_url     = url;
+                g_ota_pending = true;
+            }
+            last_ota_check = time(nullptr);
+        }
+
+        // Parcel tracking
+        if (!s_parcel_tracking.isEmpty() && now - last_parcel_fetch >= PARCEL_REFRESH_SEC) {
+            do_fetch_parcel();
+            last_parcel_fetch = time(nullptr);
+        }
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FETCH_LOOP_MS));
+    }
 }
 
 static void fetch_task_loop(void* /*param*/) {
@@ -455,23 +739,23 @@ static void fetch_task_loop(void* /*param*/) {
         do_fetch_today(time(nullptr));   // water temperatures
         do_fetch_today(time(nullptr));   // quote of the day
     }
-    time_t last_parcel_fetch;
-    if (!s_parcel_tracking.isEmpty()) {
-        do_fetch_parcel();
-        last_parcel_fetch = time(nullptr);
-    } else {
-        last_parcel_fetch = 0;
-    }
-    for (int i = 0; i < s_stock_count; i++) {
-        do_fetch_stock(i);
-        s_stock_last_attempt[i] = time(nullptr);
+    // (the parcel status loads in parallel on the slow lane)
+    // Stocks: one batch request for all prices; tickers it couldn't price (no
+    // pence/pound scale yet, unknown symbol) get an individual request now
+    if (s_stock_count > 0) {
+        do_fetch_stock_batch();
+        for (int i = 0; i < s_stock_count; i++) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            bool pending = s_stock_quotes[i].status == STOCK_PENDING;
+            xSemaphoreGive(s_mutex);
+            if (pending) do_fetch_stock(i);
+        }
     }
     s_startup_done = true;
     Serial.println("[Fetch] Startup batch done");
+    snapshot_save();
 
     time_t last_commute_fetch = time(nullptr);
-    // First OTA check fires at boot+2min, then every OTA_CHECK_INTERVAL_SEC after that.
-    time_t last_ota_check     = time(nullptr) - OTA_CHECK_INTERVAL_SEC + 120;
     time_t last_ntp_sync      = time(nullptr);
     // First pager poll fires at boot+15s.
     time_t last_pager_poll    = time(nullptr) - PAGER_POLL_SEC + 15;
@@ -499,7 +783,11 @@ static void fetch_task_loop(void* /*param*/) {
                 else                     s_chart.n = 0;   // show "no chart" rather than another ticker's
                 s_chart_idx  = want;
                 s_chart_time = time(nullptr);
+                time_t details_age = s_chart_time - s_stock_quotes[want].detail_time;
                 xSemaphoreGive(s_mutex);
+                // The detail view shows day range/open/52 w — refresh them if they're
+                // more than half an hour old (same kept-alive Yahoo connection)
+                if (details_age > 1800) do_fetch_stock(want);
             }
         }
 
@@ -559,6 +847,17 @@ static void fetch_task_loop(void* /*param*/) {
             }
         }
 
+        // ── Refresh a day-old remembered "here" location (in the background) ──
+        if (s_here_stale) {
+            s_here_stale = false;
+            GeoPlace g;
+            if (geo_resolve_here(g)) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                s_places[place_here()].geo = g;
+                xSemaphoreGive(s_mutex);
+            }
+        }
+
         // ── Today page extras (water temperatures, quote of the day) ─────────
         if (s_today_enabled) do_fetch_today(now);
 
@@ -569,32 +868,10 @@ static void fetch_task_loop(void* /*param*/) {
             last_commute_fetch = time(nullptr);
         }
 
-        // ── Flights ───────────────────────────────────────────────────────────
-        // Refresh one slot per loop iteration to avoid back-to-back blocking calls.
-        for (int i = 0; i < s_flight_count; i++) {
-            if (s_flight_forced[i] || now - s_flight_last_fetch[i] >= FLIGHT_REFRESH_SEC) {
-                s_flight_forced[i] = false;
-                flight_tracker_refresh(i);
-                s_flight_last_fetch[i] = time(nullptr);
-                break;
-            }
-        }
+        // (Flights, parcel and update checks run in slow_task_loop)
 
-        // ── OTA ───────────────────────────────────────────────────────────────
-        if (s_ota_enabled && now - last_ota_check >= OTA_CHECK_INTERVAL_SEC && !g_ota_pending) {
-            String url;
-            if (ota_check(url)) {
-                g_ota_url     = url;
-                g_ota_pending = true;
-            }
-            last_ota_check = time(nullptr);
-        }
-
-        // ── Parcel tracking ───────────────────────────────────────────────────
-        if (!s_parcel_tracking.isEmpty() && now - last_parcel_fetch >= PARCEL_REFRESH_SEC) {
-            do_fetch_parcel();
-            last_parcel_fetch = time(nullptr);
-        }
+        // ── Snapshot of the data, for the next start ──────────────────────────
+        if (now - s_snapshot_saved >= SNAPSHOT_SAVE_SEC) snapshot_save();
 
         // ── Pager polling ─────────────────────────────────────────────────────
         // 15 s when pager was used in the last 5 minutes; 60 s when idle.
@@ -607,19 +884,15 @@ static void fetch_task_loop(void* /*param*/) {
         }
 
         // ── Stocks ────────────────────────────────────────────────────────────
-        // At most one ticker per iteration so transit refreshes stay responsive.
-        // Picks the ticker that has waited longest.
+        // Prices: one batch request for all tickers. Details: at most one
+        // ticker per iteration so transit refreshes stay responsive.
         if (s_stock_count > 0) {
-            bool open = stocks_market_open(now);
-            int  pick = -1;
-            for (int i = 0; i < s_stock_count; i++) {
-                if (!stock_due(i, now, open)) continue;
-                if (pick < 0 || s_stock_last_attempt[i] < s_stock_last_attempt[pick]) pick = i;
-            }
-            if (pick >= 0) {
-                s_stock_forced[pick] = false;
-                do_fetch_stock(pick);
-                s_stock_last_attempt[pick] = time(nullptr);
+            if (stock_batch_due(now, stocks_market_open(now))) {
+                s_stocks_force = false;
+                do_fetch_stock_batch();
+            } else {
+                int i = stock_details_due(now);
+                if (i >= 0) do_fetch_stock(i);
             }
         }
 
@@ -646,6 +919,12 @@ void fetch_task_start(const StopConfig* stops, int num_stops) {
         FETCH_TASK_STACK, nullptr, FETCH_TASK_PRIORITY,
         &s_task, 0   // pin to core 0 (WiFi core)
     );
+    xTaskCreatePinnedToCore(
+        slow_task_loop, "fetch_slow",
+        FETCH_TASK_STACK, nullptr, FETCH_TASK_PRIORITY,
+        &s_slow_task, 0
+    );
+    http_lock_set_slow_task(s_slow_task);   // its HTTP calls use the slow lane
 }
 
 void fetch_task_get(int stop_idx,
@@ -760,8 +1039,20 @@ void fetch_task_init_flights(const FlightEntry* entries, int count) {
     for (int i = 0; i < count; i++) s_flight_last_fetch[i] = 0; // trigger immediate fetch
 }
 
-void fetch_task_config_done() { s_config_done = true; }
+void fetch_task_config_done() {
+    // Remembered data first, so the pages can show it before anything is fetched.
+    // The first mount formats the partition (a few seconds, once ever).
+    s_fs_ok = LittleFS.begin(true);
+    if (!s_fs_ok) Serial.println("[Snapshot] LittleFS not available");
+    snapshot_load();
+    s_config_done = true;
+}
+
 bool fetch_task_startup_done() { return s_startup_done; }
+
+bool fetch_task_snapshot_fresh() {
+    return s_snapshot_age >= 0 && s_snapshot_age < SNAPSHOT_FRESH_SEC;
+}
 
 void fetch_task_set_today_enabled(bool enabled) {
     s_today_enabled = enabled;
@@ -788,7 +1079,7 @@ void fetch_task_set_power_mode(FetchPower mode) {
 }
 
 void fetch_task_force_flight_refresh(int slot) {
-    if (slot >= 0 && slot < 2) { s_flight_forced[slot] = true; wake_task(); }
+    if (slot >= 0 && slot < 2) { s_flight_forced[slot] = true; wake_slow_task(); }
 }
 
 void fetch_task_set_weather_locations(const WeatherLocations& wl) {
@@ -854,9 +1145,10 @@ void fetch_task_set_stocks(const String symbols[], int count) {
     for (int i = 0; i < count; i++) {
         s_stock_quotes[i]        = StockQuote();
         s_stock_quotes[i].symbol = symbols[i];
-        s_stock_last_attempt[i]  = 0;   // fetch everything once at boot
-        s_stock_need_close[i]    = false;
+        s_stock_last_attempt[i]  = 0;
     }
+    s_stock_batch_last       = 0;       // prices: fetched once at startup
+    s_stock_batch_need_close = false;
     s_stock_count = count;
     xSemaphoreGive(s_mutex);
 }
@@ -870,7 +1162,7 @@ int fetch_task_get_stocks(StockQuote out[]) {
 }
 
 void fetch_task_force_stocks_refresh() {
-    for (int i = 0; i < STOCKS_MAX; i++) s_stock_forced[i] = true;
-    s_chart_time = 0;   // detail chart too, if one is open
+    s_stocks_force = true;
+    s_chart_time   = 0;   // detail chart too, if one is open
     wake_task();
 }

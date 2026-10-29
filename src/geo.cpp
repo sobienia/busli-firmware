@@ -8,6 +8,7 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <WiFi.h>
 
 static const char* NVS_NS     = "geo";
 static const char* USER_AGENT = "Busli/1.6 (github.com/sobienia/busli-firmware)";  // Nominatim policy
@@ -152,6 +153,42 @@ bool geo_resolve_city(const String& name, GeoPlace& out) {
     return true;
 }
 
+// "Here" cache: {"a","o","c", "w": Wi-Fi name it was found on, "t": epoch}
+static const char* HERE_KEY = "here";
+
+bool geo_here_cached(GeoPlace& out, bool& stale) {
+    Preferences prefs;
+    prefs.begin(NVS_NS, true);
+    String json = prefs.getString(HERE_KEY, "");
+    prefs.end();
+    if (json.isEmpty()) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return false;
+    if (String(doc["w"] | "") != WiFi.SSID()) return false;   // other network → other place
+    out.lat   = doc["a"] | 0.0f;
+    out.lon   = doc["o"] | 0.0f;
+    out.city  = String(doc["c"] | "");
+    out.valid = true;
+    time_t t = doc["t"] | 0L, now = time(nullptr);
+    stale = now > 1700000000 && now - t > 86400;
+    return true;
+}
+
+static void here_cache_put(const GeoPlace& p) {
+    JsonDocument doc;
+    doc["a"] = p.lat;
+    doc["o"] = p.lon;
+    doc["c"] = p.city;
+    doc["w"] = WiFi.SSID();
+    doc["t"] = (long)time(nullptr);
+    String json;
+    serializeJson(doc, json);
+    Preferences prefs;
+    prefs.begin(NVS_NS, false);
+    prefs.putString(HERE_KEY, json);
+    prefs.end();
+}
+
 bool geo_resolve_here(GeoPlace& out) {
     HTTPClient http;
     http.setTimeout(TIMEOUT_MS);
@@ -171,6 +208,7 @@ bool geo_resolve_here(GeoPlace& out) {
     // Name the town the same way as the stops (OpenStreetMap, local spelling:
     // "Zürich", not ip-api's English "Zurich"); ip-api's name is the fallback
     if (!fetch_town(out.lat, out.lon, out.city)) out.city = String(doc["city"] | "");
+    here_cache_put(out);
     Serial.printf("[Geo] here → %.4f,%.4f '%s'\n", out.lat, out.lon, out.city.c_str());
     return true;
 }

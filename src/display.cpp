@@ -273,7 +273,7 @@ void display_init() {
         49, 0          // col_offset2, row_offset2 (rotation 1 and 2)
     );
 
-    gfx->begin();
+    gfx->begin(DISPLAY_SPI_HZ);
     gfx->setRotation(3);    // landscape, USB-C on the left — confirmed correct
     // Note: ips=true in the constructor already handles color inversion for
     // this IPS panel. Do NOT call invertDisplay() — it would double-invert.

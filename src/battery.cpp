@@ -85,11 +85,13 @@ bool battery_init() {
 
 void battery_update() {
     if (!s_ok) { s_status = BatteryStatus(); return; }
+    bool usb = s_pmu.isVbusIn();
     uint16_t mv = s_pmu.getBattVoltage();
     // getBattVoltage() returns 0 until the ADC has produced a reading
-    if (mv == 0) { s_status = BatteryStatus(); return; }
+    if (mv == 0) { s_status = BatteryStatus(); s_status.usb_power = usb; return; }
 
     bool charging = s_pmu.isCharging();
+    s_status.usb_power = usb;
     float resting = charging ? mv - CHARGING_OFFSET_MV : mv;
 
     // Smooth out load spikes (WiFi TX, backlight); restart on plug/unplug

@@ -19,11 +19,12 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <algorithm>
 
 static const char* BASE_URL   = "https://query1.finance.yahoo.com/v8/finance/chart/";
 static const char* USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
                                 "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-static const int   TIMEOUT_MS = 10000;
+static const int   TIMEOUT_MS = 8000;
 
 // Symbols can contain '^' (indices) or '=' (FX), which must be escaped in the path.
 static String url_encode(const String& s) {
@@ -43,37 +44,53 @@ static String url_encode(const String& s) {
     return out;
 }
 
+// ── One kept-alive connection to Yahoo ───────────────────────────────────────
+// Consecutive requests (startup, details, detail chart) reuse the open HTTPS
+// connection instead of a new TLS handshake (~1.5–3 s each). All callers hold
+// http_lock, so the shared client is never used concurrently. If Yahoo closed
+// the idle connection, the request is retried once on a fresh one.
+static WiFiClientSecure* s_wc   = nullptr;
+static HTTPClient*       s_http = nullptr;
+
+static int yahoo_get(const String& url, String& body) {
+    if (!s_wc) {
+        s_wc = new WiFiClientSecure();
+        s_wc->setInsecure();
+        s_http = new HTTPClient();
+        s_http->setReuse(true);
+        s_http->setTimeout(TIMEOUT_MS);
+    }
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!s_http->begin(*s_wc, url)) return -1;
+        s_http->addHeader("User-Agent", USER_AGENT);
+        s_http->addHeader("Accept",     "application/json");
+        int code = s_http->GET();
+        if (code > 0) {
+            body = (code == 200) ? s_http->getString() : "";
+            s_http->end();               // keeps the connection open for the next request
+            return code;
+        }
+        s_http->end();
+        s_wc->stop();                    // stale keep-alive socket — start fresh
+    }
+    return -1;
+}
+
 // GET the chart endpoint at the given resolution ("15m", "5m") and parse the
-// fields we use into doc. Shared by the list quote and the detail chart.
+// fields we use into doc. Shared by the details fetch and the detail chart.
 static StockFetchResult fetch_chart_doc(const String& symbol, const char* interval,
                                         JsonDocument& doc) {
     String url = String(BASE_URL) + url_encode(symbol) + "?range=1d&interval=" + interval;
-
-    WiFiClientSecure wc;
-    wc.setInsecure();
-    HTTPClient http;
-    http.setTimeout(TIMEOUT_MS);
-    http.setReuse(false);
-    if (!http.begin(wc, url)) {
-        Serial.printf("[Stocks] %s: http.begin() failed\n", symbol.c_str());
-        return STOCK_FETCH_ERROR;
-    }
-    http.addHeader("User-Agent", USER_AGENT);
-    http.addHeader("Accept",     "application/json");
-
-    int code = http.GET();
+    String body;   // ~3 KB (15m) / ~8 KB (5m), String is fine here
+    int code = yahoo_get(url, body);
     if (code == 404) {
-        http.end();
         Serial.printf("[Stocks] %s: not found\n", symbol.c_str());
         return STOCK_FETCH_NOT_FOUND;
     }
     if (code != 200) {
-        http.end();
         Serial.printf("[Stocks] %s: HTTP %d\n", symbol.c_str(), code);
         return STOCK_FETCH_ERROR;
     }
-    String body = http.getString();  // ~3 KB (15m) / ~8 KB (5m), String is fine here
-    http.end();
 
     // Only keep the fields we need — keeps the JSON document small.
     JsonDocument filter;
@@ -152,10 +169,73 @@ StockFetchResult stocks_fetch_quote(const String& symbol, StockQuote& out) {
 
     out.spark_n = downsample(quote["close"], scale, prev > 0 ? prev : price,
                              out.spark, STOCK_SPARK_POINTS);
+    out.price_scale = scale;
+    out.detail_time = time(nullptr);
 
     Serial.printf("[Stocks] %s: %.2f %s (%+.2f%%)\n",
                   symbol.c_str(), out.price, out.currency.c_str(), out.change_pct);
     return STOCK_FETCH_OK;
+}
+
+// ── Batch: many tickers per request ──────────────────────────────────────────
+// /v8/finance/spark?symbols=A,B,…&range=1d&interval=15m returns, per symbol,
+// "close" (15-min bars) and "chartPreviousClose" — ~0.7 KB per ticker, no
+// currency/name. Unknown symbols are simply missing. London tickers need their
+// pence/pound scale from an earlier details fetch, so they wait for that.
+
+static const int BATCH_SIZE = 10;
+
+static bool needs_scale(const StockQuote& q) {
+    return q.price_scale == 0 && q.symbol.endsWith(".L");
+}
+
+StockFetchResult stocks_fetch_batch(StockQuote quotes[], int n, bool found[]) {
+    for (int i = 0; i < n; i++) found[i] = false;
+    bool any_ok = false;
+
+    for (int start = 0; start < n; start += BATCH_SIZE) {
+        int end = std::min(n, start + BATCH_SIZE);
+        String syms;
+        for (int i = start; i < end; i++) {
+            if (needs_scale(quotes[i])) continue;
+            if (syms.length()) syms += ",";
+            syms += url_encode(quotes[i].symbol);
+        }
+        if (syms.isEmpty()) continue;
+
+        String body;
+        int code = yahoo_get("https://query1.finance.yahoo.com/v8/finance/spark?range=1d&interval=15m&symbols="
+                             + syms, body);
+        if (code != 200) { Serial.printf("[Stocks] batch HTTP %d\n", code); continue; }
+        JsonDocument doc;
+        if (deserializeJson(doc, body)) { Serial.println("[Stocks] batch JSON error"); continue; }
+
+        for (int i = start; i < end; i++) {
+            StockQuote& q = quotes[i];
+            JsonObject o = doc[q.symbol];
+            if (o.isNull() || needs_scale(q)) continue;
+            float scale = q.price_scale > 0 ? q.price_scale : 1.0f;
+            JsonArray closes = o["close"];
+            float prev = o["chartPreviousClose"] | 0.0f;
+            if (prev <= 0) prev = o["previousClose"] | 0.0f;
+            prev *= scale;
+            // Current price = latest bar's close (skipping empty bars)
+            float price = 0;
+            for (int k = (int)closes.size() - 1; k >= 0; k--)
+                if (!closes[k].isNull()) { price = closes[k].as<float>() * scale; break; }
+            if (price <= 0) continue;
+            q.price      = price;
+            q.prev_close = prev;
+            q.change_pct = (prev > 0) ? (price - prev) / prev * 100.0f : 0.0f;
+            q.spark_n    = downsample(closes, scale, prev > 0 ? prev : price, q.spark, STOCK_SPARK_POINTS);
+            found[i] = true;
+            any_ok   = true;
+        }
+    }
+    int got = 0;
+    for (int i = 0; i < n; i++) got += found[i];
+    Serial.printf("[Stocks] batch: %d of %d tickers\n", got, n);
+    return any_ok ? STOCK_FETCH_OK : STOCK_FETCH_ERROR;
 }
 
 StockFetchResult stocks_fetch_chart(const String& symbol, StockChart& out) {

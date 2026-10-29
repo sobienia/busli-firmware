@@ -12,6 +12,7 @@
 struct BatteryStatus {
     int   pct        = -1;     // 0–100; -1 = no battery / no reading yet
     bool  charging   = false;
+    bool  usb_power  = false;  // USB connected (also when the battery is full and not charging)
     float hours_left = -1;     // estimated runtime; -1 = unknown (charging or not enough data)
 };
 

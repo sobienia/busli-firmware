@@ -26,8 +26,13 @@ bool geo_resolve_station(const String& station, GeoPlace& out);
 // Approximate location of the device itself, from its internet connection's IP
 // (ip-api.com, free, no key), named via OpenStreetMap like the stops. Usually
 // right to the city; a VPN or company proxy can report somewhere else.
-// Blocking HTTP — call from the fetch task.
+// Blocking HTTP — call from the fetch task. The result is remembered in NVS
+// together with the Wi-Fi network it was found on.
 bool geo_resolve_here(GeoPlace& out);
+
+// The remembered location, if it was found on the Wi-Fi network we're on now
+// (no network request). stale = older than a day — refresh it when convenient.
+bool geo_here_cached(GeoPlace& out, bool& stale);
 
 // Coordinates of a town typed by the user ("Bern", "Genève"), via Open-Meteo's
 // geocoding (free, no key); NVS-cached. out.city is the name as typed.

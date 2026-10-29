@@ -57,6 +57,10 @@ void fetch_task_config_done();
 // animation waits for it so the first page appears fully populated).
 bool fetch_task_startup_done();
 
+// True if recent data from the previous run (< SNAPSHOT_FRESH_SEC old) was
+// loaded at startup — then the pages can be shown right away.
+bool fetch_task_snapshot_fresh();
+
 // Read the cached data for a stop. Takes the mutex briefly; never blocks.
 void fetch_task_get(int stop_idx,
                     std::vector<Departure>& out_departures,

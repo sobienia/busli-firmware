@@ -34,11 +34,15 @@ struct StockQuote {
     float       prev_close = 0;
     float       spark[STOCK_SPARK_POINTS];
     uint8_t     spark_n    = 0;
-    // Detail view figures (0 = unknown)
+    // Detail view figures (0 = unknown) — from stocks_fetch_quote() ("details")
     String      name;               // e.g. "Vanguard FTSE All-World U.ETF"
     float       open       = 0;
     float       day_low    = 0, day_high  = 0;
     float       year_low   = 0, year_high = 0;   // 52-week range
+    // Provider units → major currency (London pence: 0.01). 0 = not known yet;
+    // learned by stocks_fetch_quote(), needed by stocks_fetch_batch()
+    float       price_scale = 0;
+    time_t      detail_time = 0;    // when the figures above were last fetched
 };
 
 // Higher-resolution intraday chart for the detail view (fetched on demand)
@@ -72,6 +76,13 @@ StockFetchResult stocks_fetch_quote(const String& symbol, StockQuote& out);
 // Fetch today's (or the last session's) fine-grained chart for the detail view.
 // Blocking HTTPS call — the caller must hold http_lock.
 StockFetchResult stocks_fetch_chart(const String& symbol, StockChart& out);
+
+// Prices for many tickers in one request: fills price, change_pct, prev_close
+// and the mini chart of each quotes[i] the provider knows (found[i] = true).
+// Uses quotes[i].price_scale (from an earlier stocks_fetch_quote()); entries
+// whose scale isn't known yet are skipped where the provider needs it.
+// Blocking HTTPS call — the caller must hold http_lock.
+StockFetchResult stocks_fetch_batch(StockQuote quotes[], int n, bool found[]);
 
 // ── Generic helpers (stocks.cpp) ─────────────────────────────────────────────
 

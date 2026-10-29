@@ -214,6 +214,26 @@ static uint32_t   g_overlay_until_ms = 0;
 // ignored until released, so it doesn't also tap/swipe the page underneath.
 static bool       g_input_swallowed  = false;
 
+// ── Power profile ────────────────────────────────────────────────────────────
+// On USB power the device runs at full speed: CPU 240 MHz (HTTPS handshakes
+// ~2× faster, quicker redraws) and Wi-Fi power saving off (no 100–300 ms nap
+// delay per request). On battery: 80 MHz + modem sleep. Checked with the
+// battery reading (once a minute), which also debounces a wobbly cable.
+static bool g_perf_mode = false;
+
+static void apply_wifi_power_save() {
+    esp_wifi_set_ps(g_perf_mode ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+}
+
+static void set_power_profile(bool usb) {
+    if (usb == g_perf_mode) return;
+    g_perf_mode = usb;
+    setCpuFrequencyMhz(usb ? 240 : 80);
+    if (WiFi.status() == WL_CONNECTED) apply_wifi_power_save();
+    Serial.printf("[Power] %s\n", usb ? "USB: 240 MHz, Wi-Fi power saving off"
+                                      : "Battery: 80 MHz, Wi-Fi power saving on");
+}
+
 // Button debounce state — BOOT button
 static bool     button_was_pressed    = false;
 static uint32_t button_press_start_ms = 0;
@@ -430,7 +450,7 @@ static void wifi_reconnect_tick() {
         if (g_wifi_try >= 0) {
             wifi_end_attempt();
             g_wifi_try = -1;
-            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+            apply_wifi_power_save();
             configTzTime(POSIX_TZ, "pool.ntp.org", "time.nist.gov");
             Serial.printf("[WiFi] Reconnected, IP: %s\n", WiFi.localIP().toString().c_str());
         }
@@ -561,6 +581,7 @@ static bool portal_cancel_requested() {
 // cancelled it until it's released
 static void run_setup_portal() {
     config_portal_run(PORTAL_TIMEOUT_MS, portal_cancel_requested);   // reboots on save
+    if (WiFi.status() == WL_CONNECTED) apply_wifi_power_save();      // portal changed it
     if (any_input_down()) g_input_swallowed = true;
     last_redraw_ms = 0;
     g_pager_dirty  = true;
@@ -622,6 +643,7 @@ static void update_battery() {
     const BatteryStatus& b = battery_status();
     g_battery_pct      = b.pct;
     g_battery_charging = b.charging;
+    set_power_profile(b.usb_power);
     display_set_battery_estimate(b.hours_left);
 
     // Low-battery warning, once per level while unplugged. Not while the screen
@@ -1259,10 +1281,13 @@ static void draw_device_info_page() {
         left[nl++] = { "Wi-Fi", "not connected", 2 };
     }
 
+    // Uptime + CPU speed (240 MHz = USB performance mode, 80 MHz = battery saving)
     uint32_t up = millis() / 1000;
-    char upbuf[24];
-    if (up >= 86400) snprintf(upbuf, sizeof(upbuf), "%lud %luh", (unsigned long)(up / 86400), (unsigned long)(up % 86400 / 3600));
-    else             snprintf(upbuf, sizeof(upbuf), "%luh %lum", (unsigned long)(up / 3600), (unsigned long)(up % 3600 / 60));
+    char upbuf[32];
+    if (up >= 86400) snprintf(upbuf, sizeof(upbuf), "%lud %luh, %lu MHz", (unsigned long)(up / 86400),
+                              (unsigned long)(up % 86400 / 3600), (unsigned long)getCpuFrequencyMhz());
+    else             snprintf(upbuf, sizeof(upbuf), "%luh %lum, %lu MHz", (unsigned long)(up / 3600),
+                              (unsigned long)(up % 3600 / 60), (unsigned long)getCpuFrequencyMhz());
     left[nl++] = { "Uptime", upbuf };
 
     const BatteryStatus& b = battery_status();
@@ -1488,10 +1513,10 @@ void setup() {
         delay(4000);
         display_invalidate();
     }
-    // Enable modem sleep: WiFi radio powers down between beacon intervals.
-    // Cuts idle WiFi draw ~30-40%. Note: may occasionally increase latency on
-    // the first HTTP request after a long idle; disable if connection drops occur.
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    // Modem sleep (battery profile): the radio powers down between beacon
+    // intervals, cutting idle WiFi draw ~30-40% at the cost of some latency.
+    // Switched off on USB power — see set_power_profile().
+    apply_wifi_power_save();
 
     sync_clock();
 
@@ -1616,19 +1641,29 @@ void setup() {
     // Never stuck here: at most BOOT_WAIT_MAX_MS (no internet, a slow source …),
     // and any touch or button skips the wait — data still loading fills in later.
     setCpuFrequencyMhz(240);
-    fetch_task_config_done();
+    fetch_task_config_done();   // also loads the data remembered from the last run
+    // Recent remembered data → show the pages almost at once; it's refreshed in
+    // the background (departures within a second or two)
+    uint32_t max_wait = fetch_task_snapshot_fresh() ? BOOT_WAIT_CACHED_MS : BOOT_WAIT_MAX_MS;
     uint32_t wait_start = millis();
     bool skipped = false;
-    while (!fetch_task_startup_done() && millis() - wait_start < BOOT_WAIT_MAX_MS) {
+    while (!fetch_task_startup_done() && millis() - wait_start < max_wait) {
         touch_poll();
         if (any_input_down()) { skipped = true; break; }
         delay(50);
     }
-    Serial.printf("[Boot] Data %s after %lu ms\n",
-                  fetch_task_startup_done() ? "ready" : skipped ? "wait skipped" : "wait timed out",
+    Serial.printf("[Boot] %s after %lu ms\n",
+                  fetch_task_startup_done()   ? "Data ready"
+                  : skipped                   ? "Wait skipped"
+                  : fetch_task_snapshot_fresh() ? "Showing remembered data, refreshing"
+                                              : "Wait timed out",
                   (unsigned long)(millis() - wait_start));
     if (skipped) g_input_swallowed = true;   // the skipping press does nothing else
+    // End of the boot boost: the normal profile for the power source takes over
     setCpuFrequencyMhz(80);
+    g_perf_mode = false;
+    battery_update();
+    set_power_profile(battery_status().usb_power);
 
     g_setup_done_ms = millis();
     display_boot_animation_stop();

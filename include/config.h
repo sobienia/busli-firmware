@@ -58,6 +58,11 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 #define SCREEN_W   480
 #define SCREEN_H   222
 
+// Display SPI clock. 80 MHz halves full-screen transfer time vs the library's
+// 40 MHz default (213 KB frame ≈ 22 ms instead of 43 ms). If the screen ever
+// shows garbled pixels or wrong colours, go back to 40000000.
+#define DISPLAY_SPI_HZ  80000000
+
 #define HEADER_H   36       // top bar (stop name, clock, dots)
 #define FOOTER_H   34       // bottom bar (weather, rain, UV, refresh age)
 #define ROW_COUNT  4        // number of departure rows
@@ -105,7 +110,7 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
 #define API_BASE_URL       "http://transport.opendata.ch/v1/stationboard"
-#define API_TIMEOUT_MS     15000
+#define API_TIMEOUT_MS     8000   // responses are ~3 KB; a dead server shouldn't hold others up
 #define API_FETCH_LIMIT    20    // entries requested per stop
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -127,6 +132,13 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 
 // Boot: the animation runs until the first round of data is loaded, at most this long
 #define BOOT_WAIT_MAX_MS  25000
+// …or this long when recent data from the last run was remembered (shown at
+// once and refreshed in the background)
+#define BOOT_WAIT_CACHED_MS  2500
+
+// Last known data, saved to flash for the next start
+#define SNAPSHOT_SAVE_SEC   900     // save every 15 min
+#define SNAPSHOT_FRESH_SEC  21600   // younger than 6 h → show it right away at boot
 
 // Kiosk mode: pages turn by themselves; any touch or button pauses it this long
 #define KIOSK_PAUSE_SEC  60
@@ -180,7 +192,7 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.7.3"
+#define FIRMWARE_VERSION        "1.7.4"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 
