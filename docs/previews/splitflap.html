@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Split-flap clock</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#1b1b1b; --fg:#ddd; --muted:#999; }
+  body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg);
+         font:15px/1.5 system-ui, sans-serif; display:flex; flex-direction:column; align-items:center; gap:14px; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  p { margin:0; color:var(--muted); max-width:960px; text-align:center; }
+  .frame { padding:14px; background:#000; border-radius:10px; box-shadow:0 0 0 6px #2a2a2a; max-width:100%; overflow:hidden; }
+  canvas { display:block; width:960px; max-width:calc(100vw - 60px); height:auto; image-rendering:pixelated; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  button { background:#2b2b2b; color:#eee; border:1px solid #444; border-radius:6px; padding:8px 14px; font:inherit; cursor:pointer; }
+  button.on { border-color:#f09000; color:#f09000; }
+</style></head><body>
+<h1>Split-flap clock (device preview, 480 × 222 px shown at 2×)</h1>
+<p>Amber digits on dark flaps, like the old Bahnhof departure boards. Text is drawn 1-bit (no smoothing), exactly as the device fonts are.</p>
+<div class="frame"><canvas id="c" width="480" height="222"></canvas></div>
+<div class="row">
+  <button id="flip">Flip to next minute</button>
+  <button id="demo" class="on">Demo: a minute every 3 s</button>
+  <button id="real">Real time</button>
+</div>
+<script>
+const W = 480, H = 222;
+const AMBER = "rgb(240,144,0)", AMBER_DIM = "rgb(120,72,0)";
+const FLAP_TOP = "#262626", FLAP_BOT = "#1c1c1c", SPLIT = "#000";
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+
+// Layout: date row on top, 4 flaps with a colon in the middle
+const CW = 92, CH = 150, GAP = 8, COLON = 34, TOP = 50;
+const total = 4 * CW + 2 * GAP + COLON;
+const X0 = Math.round((W - total) / 2);
+const cardX = [X0, X0 + CW + GAP, X0 + 2 * CW + GAP + COLON, X0 + 3 * CW + 2 * GAP + COLON];
+
+// One digit as a 1-bit bitmap (like a generated GFX font), cached
+const glyphs = {};
+function glyph(d) {
+  if (glyphs[d]) return glyphs[d];
+  const o = document.createElement("canvas"); o.width = CW; o.height = CH;
+  const x = o.getContext("2d");
+  x.fillStyle = "#fff"; x.textAlign = "center"; x.textBaseline = "middle";
+  x.font = "600 150px 'Barlow Condensed', 'Bahnschrift', 'Arial Narrow', sans-serif";
+  x.fillText(d, CW / 2, CH / 2 + 8);
+  const img = x.getImageData(0, 0, CW, CH), out = x.createImageData(CW, CH);
+  for (let i = 0; i < img.data.length; i += 4) {
+    if (img.data[i + 3] > 110) { out.data[i] = 240; out.data[i + 1] = 144; out.data[i + 2] = 0; out.data[i + 3] = 255; }
+  }
+  x.clearRect(0, 0, CW, CH); x.putImageData(out, 0, 0);
+  return (glyphs[d] = o);
+}
+
+function roundRect(x, y, w, h, r, color) {
+  g.fillStyle = color; g.beginPath(); g.roundRect(x, y, w, h, r); g.fill();
+}
+
+// Static card showing digit d (top and bottom halves)
+function halfCard(x, d, top, squash = 1, shade = 0) {
+  // squash: 1 = flat on the board, 0 = edge-on; drawn around the split line
+  const half = CH / 2, y0 = TOP + (top ? half * (1 - squash) : half);
+  const h = Math.max(1, Math.round(half * squash));
+  g.save();
+  g.beginPath(); g.rect(x, top ? TOP + half - h : TOP + half, CW, h); g.clip();
+  roundRect(x, TOP, CW, CH, 6, top ? FLAP_TOP : FLAP_BOT);
+  if (d !== null) {
+    g.translate(x, top ? TOP + half - h : TOP + half);
+    g.scale(1, squash);
+    g.drawImage(glyph(d), 0, top ? 0 : -half, CW, CH);
+  }
+  g.restore();
+  if (shade > 0) { g.fillStyle = `rgba(0,0,0,${shade})`; g.fillRect(x, top ? TOP + half - h : TOP + half, CW, h); }
+}
+
+function splitLine(x) {
+  g.fillStyle = SPLIT; g.fillRect(x, TOP + CH / 2 - 1, CW, 2);
+  g.fillStyle = "#000"; g.fillRect(x - 1, TOP + CH / 2 - 4, 3, 8); g.fillRect(x + CW - 2, TOP + CH / 2 - 4, 3, 8);   // hinges
+}
+
+// Per card: shown digit, and an ongoing flip
+const cards = [0, 1, 2, 3].map(() => ({ d: "0", from: null, t: 1 }));
+const FLIP_MS = 420;
+
+function setTime(hh, mm, animate = true) {
+  const s = String(hh).padStart(2, "0") + String(mm).padStart(2, "0");
+  [...s].forEach((d, i) => {
+    const c = cards[i];
+    if (c.d === d) return;
+    if (animate) { c.from = c.d; c.t = 0; c.start = performance.now() + i * 60; }
+    c.d = d;
+  });
+}
+
+function draw(now) {
+  g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+  // Date + temperature on top
+  g.fillStyle = AMBER_DIM; g.font = "600 17px 'Barlow Condensed', 'Bahnschrift', sans-serif";
+  g.textAlign = "center"; g.textBaseline = "top";
+  g.fillText(dateText, W / 2, 14);
+
+  cards.forEach((c, i) => {
+    const x = cardX[i];
+    if (c.from !== null) c.t = Math.min(1, Math.max(0, (now - c.start) / FLIP_MS));
+    const t = c.t;
+    if (c.from === null || t >= 1) {
+      c.from = null;
+      halfCard(x, c.d, true); halfCard(x, c.d, false);
+    } else if (t < 0.5) {
+      // Phase 1: the old top flap folds down, the new top shows behind it
+      const k = 1 - t / 0.5;
+      halfCard(x, c.d, true);
+      halfCard(x, c.from, false);
+      halfCard(x, c.from, true, k, (1 - k) * 0.6);
+    } else {
+      // Phase 2: the new bottom flap swings down over the old bottom
+      const k = (t - 0.5) / 0.5;
+      halfCard(x, c.d, true);
+      halfCard(x, c.from, false);
+      halfCard(x, c.d, false, k, (1 - k) * 0.6);
+    }
+    splitLine(x);
+  });
+
+  // Colon: two square studs
+  const cx = X0 + 2 * CW + GAP + COLON / 2;
+  roundRect(cx - 5, TOP + CH / 3 - 5, 10, 10, 2, AMBER);
+  roundRect(cx - 5, TOP + 2 * CH / 3 - 5, 10, 10, 2, AMBER);
+  requestAnimationFrame(draw);
+}
+
+let mode = "demo", demoMin = 12 * 60 + 58, dateText = "";
+function updateDate() {
+  const d = new Date();
+  dateText = d.toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "short" }) + "    8°C";
+}
+function tick() {
+  if (mode === "real") { const d = new Date(); setTime(d.getHours(), d.getMinutes()); }
+}
+document.getElementById("flip").onclick = () => { demoMin = (demoMin + 1) % 1440; setTime(Math.floor(demoMin / 60), demoMin % 60); };
+document.getElementById("demo").onclick = (e) => { mode = "demo"; mark(e.target); };
+document.getElementById("real").onclick = (e) => { mode = "real"; mark(e.target); tick(); };
+function mark(b) { document.querySelectorAll(".row button").forEach(x => x.classList.toggle("on", x === b)); }
+setInterval(() => { if (mode === "demo") { demoMin = (demoMin + 1) % 1440; setTime(Math.floor(demoMin / 60), demoMin % 60); } tick(); }, 3000);
+
+updateDate();
+document.fonts.load("600 150px 'Barlow Condensed'").finally(() => {
+  for (const k in glyphs) delete glyphs[k];
+  setTime(Math.floor(demoMin / 60), demoMin % 60, false);
+  requestAnimationFrame(draw);
+});
+</script>
+</body></html>

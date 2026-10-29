@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Boot animation</title>
+<style>
+  body { margin:0; padding:20px 16px; background:#1b1b1b; color:#ddd; font:15px/1.5 system-ui, sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:12px; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  h2 { font-size:15px; margin:6px 0 0; font-weight:600; color:#f09000; }
+  p { margin:0; color:#999; max-width:960px; text-align:center; }
+  .frame { padding:12px; background:#000; border-radius:10px; box-shadow:0 0 0 6px #2a2a2a; max-width:100%; }
+  canvas { display:block; width:960px; max-width:calc(100vw - 56px); height:auto; image-rendering:pixelated; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; align-items:center; }
+  button, input { background:#2b2b2b; color:#eee; border:1px solid #444; border-radius:6px; padding:8px 14px; font:inherit; }
+  button { cursor:pointer; }
+  input { width:120px; }
+</style></head><body>
+<h1>Boot animation (device preview, 480 × 222 px shown at 2×)</h1>
+<p>Same font and cell size as the device (MS Gothic half-width katakana, 8 × 17 px, 1-bit). The "boot" is simulated: 5 s of loading, then the ending.</p>
+<div class="row">
+  <button id="replay">Replay both</button>
+  <label>Name from Settings: <input id="name" value="AJ" maxlength="20"></label>
+</div>
+<h2>New</h2>
+<div class="frame"><canvas id="cNew" width="480" height="222"></canvas></div>
+<h2>Old (now on the device)</h2>
+<div class="frame"><canvas id="cOld" width="480" height="222"></canvas></div>
+<script>
+const W = 480, H = 222, CW = 8, CH = 17, COLS = 60, ROWS = 13;
+const BOOT_MS = 5000;
+const AMBER = [240, 144, 0];
+// Katakana ｦ–ﾝ plus a few digits, as in the device's font
+const CHARS = [];
+for (let c = 0xFF66; c <= 0xFF9D; c++) CHARS.push(String.fromCharCode(c));
+"0123456789".split("").forEach(d => CHARS.push(d));
+
+// 1-bit glyph masks (optionally mirrored), then coloured copies per shade
+function makeMask(ch, mirror) {
+  const o = document.createElement("canvas"); o.width = CW; o.height = CH;
+  const x = o.getContext("2d");
+  x.font = "16px 'MS Gothic', 'MS UI Gothic', monospace"; x.textBaseline = "alphabetic"; x.fillStyle = "#fff";
+  if (mirror) { x.translate(CW, 0); x.scale(-1, 1); }
+  x.fillText(ch, 0, 14);
+  const img = x.getImageData(0, 0, CW, CH);
+  const bits = new Uint8Array(CW * CH);
+  for (let i = 0; i < CW * CH; i++) bits[i] = img.data[i * 4 + 3] > 100 ? 1 : 0;
+  return bits;
+}
+const cache = new Map();
+function glyph(idx, rgb, mirror) {
+  const key = idx + "|" + rgb.join(",") + "|" + mirror;
+  let c = cache.get(key);
+  if (c) return c;
+  const bits = (mirror ? masksM : masks)[idx];
+  c = document.createElement("canvas"); c.width = CW; c.height = CH;
+  const x = c.getContext("2d"), img = x.createImageData(CW, CH);
+  for (let i = 0; i < CW * CH; i++) if (bits[i]) {
+    img.data[i * 4] = rgb[0]; img.data[i * 4 + 1] = rgb[1]; img.data[i * 4 + 2] = rgb[2]; img.data[i * 4 + 3] = 255;
+  }
+  x.putImageData(img, 0, 0);
+  cache.set(key, c);
+  return c;
+}
+let masks, masksM;
+const shade = k => AMBER.map(v => Math.round(v * k / 15));   // 16 levels, like RGB565 blending
+const rnd = n => Math.floor(Math.random() * n);
+
+// ── New ─────────────────────────────────────────────────────────────────────
+function NewRain(cv) {
+  const g = cv.getContext("2d");
+  let cols, t0, phase, text, typed, phaseT;
+  this.start = (name) => {
+    t0 = performance.now(); phase = "rain"; typed = 0;
+    text = name ? `Wake up, ${name}...` : "Wake up...";
+    cols = [];
+    for (let i = 0; i < COLS; i++) cols.push(newCol(true));
+  };
+  function newCol(initial) {
+    const depth = Math.random();                        // 0 far … 1 near
+    return {
+      head: initial ? -Math.random() * ROWS * 1.5 : -Math.random() * 6,
+      speed: 7 + depth * 16,                            // rows per second
+      len: Math.round(6 + depth * 14),                  // trail length
+      bright: 0.45 + depth * 0.55,
+      chars: Array.from({ length: ROWS }, () => rnd(CHARS.length)),
+    };
+  }
+  let last = performance.now();
+  this.frame = (now) => {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    const el = now - t0;
+    if (phase === "rain" && el > BOOT_MS) { phase = "drain"; phaseT = now; }
+    g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+    let alive = 0;
+    cols.forEach((c, ci) => {
+      const prev = Math.floor(c.head);
+      c.head += c.speed * dt;
+      const hr = Math.floor(c.head);
+      for (let r = prev + 1; r <= hr; r++) if (r >= 0 && r < ROWS) c.chars[r] = rnd(CHARS.length);   // new symbol where the head lands
+      if (hr - c.len > ROWS) {                           // fallen off the bottom
+        if (phase === "rain") Object.assign(c, newCol(false)); else return;
+      }
+      alive++;
+      const x = ci * CW;
+      for (let d = 1; d <= c.len; d++) {                 // trail fading over 16 shades
+        const r = hr - d;
+        if (r < 0 || r >= ROWS) continue;
+        if (Math.random() < 0.02) c.chars[r] = rnd(CHARS.length);   // now and then a symbol changes
+        const k = Math.max(1, Math.round(15 * c.bright * (1 - d / (c.len + 1))));
+        g.drawImage(glyph(c.chars[r], shade(k), true), x, r * CH);
+      }
+      if (hr >= 0 && hr < ROWS) {                        // glowing white head
+        const halo = shade(Math.round(6 * c.bright));
+        for (const [ox, oy] of [[-1,0],[1,0],[0,-1],[0,1]]) g.drawImage(glyph(c.chars[hr], halo, true), x + ox, hr * CH + oy);
+        g.drawImage(glyph(c.chars[hr], [255, 240, 220], true), x, hr * CH);
+      }
+    });
+
+    // Ending: the rain drains away while "Wake up, <name>..." is typed
+    if (phase !== "rain") {
+      const pt = now - phaseT;
+      typed = Math.min(text.length, Math.floor(Math.max(0, pt - 300) / 75));
+      const s = text.slice(0, typed);
+      g.font = "bold 22px Consolas, 'Courier New', monospace"; g.textBaseline = "middle";
+      const tw = g.measureText(text).width, x0 = (W - tw) / 2, y = H / 2;
+      g.fillStyle = "#000"; g.fillRect(x0 - 12, y - 18, tw + 30, 36);
+      g.fillStyle = `rgb(${AMBER})`; g.fillText(s, x0, y);
+      const cx = x0 + g.measureText(s).width + 2;
+      if (Math.floor(pt / 400) % 2 === 0 || typed < text.length) g.fillRect(cx, y - 11, 11, 22);   // block cursor
+      if (typed === text.length && pt > 300 + text.length * 75 + 1400) { g.fillStyle = "#000"; g.fillRect(0, 0, W, H); phase = "done"; }
+    }
+    if (phase === "done") { g.fillStyle = "#000"; g.fillRect(0, 0, W, H); g.fillStyle = "#555"; g.font = "16px system-ui";
+      g.textAlign = "center"; g.fillText("(first page appears here)", W / 2, H / 2); g.textAlign = "start"; }
+  };
+}
+
+// ── Old (the device today) ─────────────────────────────────────────────────
+function OldRain(cv) {
+  const g = cv.getContext("2d");
+  const TRAIL = [[240,144,0],[192,116,0],[120,72,0],[72,44,0]];
+  let heads, next, extra, t0, wipe;
+  this.start = () => {
+    t0 = performance.now(); wipe = null;
+    g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+    heads = []; next = []; extra = [];
+    for (let i = 0; i < COLS; i++) { heads.push(-rnd(ROWS * 2)); extra.push(rnd(36)); next.push(t0 + rnd(87)); }
+  };
+  this.frame = (now) => {
+    if (now - t0 > BOOT_MS) {
+      if (!wipe) { wipe = { order: [...Array(COLS).keys()].sort(() => Math.random() - 0.5), i: 0, t: now }; }
+      while (wipe.i < COLS && now - wipe.t > wipe.i * 8) { g.fillStyle = "#000"; g.fillRect(wipe.order[wipe.i++] * CW, 0, CW, H); }
+      if (wipe.i >= COLS && now - wipe.t > 900) { g.fillStyle = "#555"; g.font = "16px system-ui"; g.textAlign = "center";
+        g.fillText("(first page appears here)", W / 2, H / 2); g.textAlign = "start"; }
+      return;
+    }
+    for (let c = 0; c < COLS; c++) {
+      if (now < next[c]) continue;
+      const x = c * CW;
+      for (let t = 0; t < 4; t++) {
+        const row = heads[c] - 1 - t;
+        if (row >= 0 && row < ROWS) { g.fillStyle = "#000"; g.fillRect(x, row * CH, CW, CH); g.drawImage(glyph(rnd(CHARS.length), TRAIL[t], false), x, row * CH); }
+      }
+      const pe = heads[c] - 6;
+      if (pe >= 0 && pe < ROWS) { g.fillStyle = "#000"; g.fillRect(x, pe * CH, CW, CH); }
+      if (heads[c] >= 0 && heads[c] < ROWS) { g.fillStyle = "#000"; g.fillRect(x, heads[c] * CH, CW, CH); g.drawImage(glyph(rnd(CHARS.length), [255,255,255], false), x, heads[c] * CH); }
+      if (++heads[c] > ROWS + 6) { heads[c] = -rnd(ROWS / 2); extra[c] = rnd(36); }
+      next[c] = now + 52 + extra[c];
+    }
+  };
+}
+
+const nw = new NewRain(document.getElementById("cNew")), od = new OldRain(document.getElementById("cOld"));
+function replay() { nw.start(document.getElementById("name").value.trim()); od.start(); }
+function loop(now) { nw.frame(now); od.frame(now); requestAnimationFrame(loop); }
+document.getElementById("replay").onclick = replay;
+document.fonts.ready.then(() => {
+  masks = CHARS.map(ch => makeMask(ch, false));
+  masksM = CHARS.map(ch => makeMask(ch, true));
+  replay(); requestAnimationFrame(loop);
+});
+</script>
+</body></html>

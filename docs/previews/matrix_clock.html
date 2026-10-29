@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Matrix clock</title>
+<style>
+  body { margin:0; padding:20px 16px; background:#1b1b1b; color:#ddd; font:15px/1.5 system-ui, sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:12px; }
+  h1 { font-size:18px; margin:0; font-weight:600; }
+  p { margin:0; color:#999; max-width:960px; text-align:center; }
+  .frame { padding:12px; background:#000; border-radius:10px; box-shadow:0 0 0 6px #2a2a2a; max-width:100%; }
+  canvas { display:block; width:960px; max-width:calc(100vw - 56px); height:auto; image-rendering:pixelated; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  button { background:#2b2b2b; color:#eee; border:1px solid #444; border-radius:6px; padding:8px 14px; font:inherit; cursor:pointer; }
+  button.on { border-color:#f09000; color:#f09000; }
+</style></head><body>
+<h1>Matrix clock (device preview, 480 × 222 px shown at 2×)</h1>
+<p>The time made of the rain's own symbols; a new minute simply appears. Slowed-down, dimmed rain behind it.</p>
+<div class="frame"><canvas id="c" width="480" height="222"></canvas></div>
+<div class="row">
+  <button id="fast" class="on">Show a minute change every 4 s</button>
+  <button id="once">Next minute now</button>
+  <button id="night">Night (dim)</button>
+</div>
+<script>
+const W = 480, H = 222, CW = 8, CH = 17, COLS = 60, ROWS = 13;
+const AMBER = [240, 144, 0];
+const CHARS = [];
+for (let c = 0xFF66; c <= 0xFF9D; c++) CHARS.push(String.fromCharCode(c));
+"0123456789".split("").forEach(d => CHARS.push(d));
+const rnd = n => Math.floor(Math.random() * n);
+let dim = 1, demo = true, demoMin = 12 * 60 + 57;
+
+let masks;
+function makeMask(ch) {
+  const o = document.createElement("canvas"); o.width = CW; o.height = CH;
+  const x = o.getContext("2d");
+  x.font = "16px 'MS Gothic', 'MS UI Gothic', monospace"; x.fillStyle = "#fff";
+  x.translate(CW, 0); x.scale(-1, 1); x.fillText(ch, 0, 14);
+  const d = x.getImageData(0, 0, CW, CH).data, bits = new Uint8Array(CW * CH);
+  for (let i = 0; i < CW * CH; i++) bits[i] = d[i * 4 + 3] > 100 ? 1 : 0;
+  return bits;
+}
+const cache = new Map();
+function glyph(idx, rgb) {
+  const key = idx + "|" + rgb.join(",");
+  let c = cache.get(key); if (c) return c;
+  c = document.createElement("canvas"); c.width = CW; c.height = CH;
+  const x = c.getContext("2d"), img = x.createImageData(CW, CH);
+  masks[idx].forEach((b, i) => { if (b) img.data.set([rgb[0], rgb[1], rgb[2], 255], i * 4); });
+  x.putImageData(img, 0, 0); cache.set(key, c); return c;
+}
+const shade = k => AMBER.map(v => Math.round(v * Math.max(0, Math.min(15, k)) / 15));
+const scale = (rgb, f) => rgb.map(v => Math.round(v * f));
+const DIGIT = [240 + (255 - 240) * 0.25, 144 + (232 - 144) * 0.25, 170 * 0.25].map(Math.round);
+const FLASH = [255, 240, 220];
+
+const FONT = {
+  "0": [".###.","#...#","#..##","#.#.#","##..#","#...#",".###."],
+  "1": ["..#..",".##..","..#..","..#..","..#..","..#..",".###."],
+  "2": [".###.","#...#","....#","...#.","..#..",".#...","#####"],
+  "3": ["#####","...#.","..#..","...#.","....#","#...#",".###."],
+  "4": ["...#.","..##.",".#.#.","#..#.","#####","...#.","...#."],
+  "5": ["#####","#....","####.","....#","....#","#...#",".###."],
+  "6": ["..##.",".#...","#....","####.","#...#","#...#",".###."],
+  "7": ["#####","....#","...#.","..#..",".#...",".#...",".#..."],
+  "8": [".###.","#...#","#...#",".###.","#...#","#...#",".###."],
+  "9": [".###.","#...#","#...#",".####","....#","...#.",".##.."],
+};
+const D_ROW0 = 3, DIG_COL = [5, 17, 33, 45], COLON_COL = 29, COLON_ROWS = [D_ROW0 + 2, D_ROW0 + 4];
+const DROP_SPEED = 25;          // rows per second, the drops that write a digit
+const DROP_START = D_ROW0 - 4;  // they start a little above the digit
+const SCRAMBLE_MS = 250, FADE_MS = 500, STAGGER_MS = 250, DIGIT_STAGGER_MS = 150;
+
+function timeDigits() {
+  if (demo) { const m = demoMin % 1440; return (String(Math.floor(m / 60)).padStart(2, "0") + String(m % 60).padStart(2, "0")).split(""); }
+  const d = new Date(); return (String(d.getHours()).padStart(2, "0") + String(d.getMinutes()).padStart(2, "0")).split("");
+}
+const on = (d, r, c) => d !== null && FONT[d][r][c >> 1] === "#";   // c: grid column within the digit (0–9)
+
+// Each digit: what it shows, and a change in progress
+const digits = [0, 1, 2, 3].map(() => ({ d: null, from: null, start: 0, off: [] }));
+function updateDigits(now) {
+  let k = 0;
+  timeDigits().forEach((d, i) => {
+    const s = digits[i];
+    if (s.d === d) return;
+    s.d = d;   // the new digit appears at once (no writing drops)
+  });
+}
+
+// What a digit cell shows now: {mode: "digit" | "scramble" | "fade", k} or null
+function cellState(s, r, c, now) {
+  if (s.from === null) return on(s.d, r, c) ? { mode: "digit" } : null;
+  const head = DROP_START + Math.max(0, now - s.start - s.off[c]) / 1000 * DROP_SPEED;
+  const row = D_ROW0 + r;
+  const inNew = on(s.d, r, c), inOld = on(s.from, r, c);
+  if (head < row) return inOld ? { mode: "digit" } : null;
+  const since = (head - row) / DROP_SPEED * 1000;
+  if (inNew) return since < SCRAMBLE_MS ? { mode: "scramble" } : { mode: "digit" };
+  if (inOld && since < FADE_MS) return { mode: "fade", k: 1 - since / FADE_MS };
+  return null;
+}
+
+const cols = [];
+function newCol(initial) {
+  const depth = Math.random();
+  return { head: initial ? -Math.random() * ROWS * 2 : -Math.random() * 8,
+           speed: (7 + depth * 16) * 0.2, len: Math.round(6 + depth * 12), bright: 0.45 + depth * 0.55 };
+}
+const chars = Array.from({ length: COLS * ROWS }, () => rnd(CHARS.length));
+const cellChange = Array.from({ length: COLS * ROWS }, () => Math.random() * 3000);
+
+const g = document.getElementById("c").getContext("2d");
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  updateDigits(now);
+  g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+
+  // Background rain, slowed and dim
+  const lit = new Float32Array(COLS * ROWS);
+  cols.forEach((c, ci) => {
+    const prev = Math.floor(c.head); c.head += c.speed * dt; const hr = Math.floor(c.head);
+    for (let r = prev + 1; r <= hr; r++) if (r >= 0 && r < ROWS) chars[r * COLS + ci] = rnd(CHARS.length);
+    if (hr - c.len > ROWS) Object.assign(c, newCol(false));
+    for (let d = 0; d <= c.len; d++) {
+      const r = hr - d; if (r < 0 || r >= ROWS) continue;
+      lit[r * COLS + ci] = Math.max(lit[r * COLS + ci], d === 0 ? 2 : c.bright * (1 - d / (c.len + 1)));
+    }
+  });
+
+  // The time's cells
+  const clock = new Map();
+  digits.forEach((s, i) => {
+    for (let r = 0; r < 7; r++) for (let c = 0; c < 10; c++) {
+      const st = cellState(s, r, c, now);
+      if (st) clock.set((D_ROW0 + r) * COLS + DIG_COL[i] + c, st);
+    }
+  });
+  for (const r of COLON_ROWS) for (const c of [0, 1]) clock.set(r * COLS + COLON_COL + c, { mode: "digit" });
+
+  for (let i = 0; i < COLS * ROWS; i++) {
+    const x = (i % COLS) * CW, y = Math.floor(i / COLS) * CH, st = clock.get(i);
+    if (st && st.mode === "digit") {
+      if (now > cellChange[i]) { chars[i] = rnd(CHARS.length); cellChange[i] = now + 600 + Math.random() * 2400; }
+      const halo = shade(5 * dim), col = scale(lit[i] >= 2 ? FLASH : DIGIT, dim);
+      g.drawImage(glyph(chars[i], halo), x - 1, y); g.drawImage(glyph(chars[i], halo), x + 1, y);
+      g.drawImage(glyph(chars[i], col), x, y);
+    } else if (st && st.mode === "scramble") {        // decoding: a new symbol every frame, near-white
+      chars[i] = rnd(CHARS.length);
+      g.drawImage(glyph(chars[i], scale(FLASH, dim)), x, y);
+    } else if (st && st.mode === "fade") {            // the old digit's leftovers trail away
+      g.drawImage(glyph(chars[i], shade(Math.max(1, Math.round(13 * st.k)) * dim)), x, y);
+    } else if (lit[i] > 0) {
+      if (Math.random() < 0.003) chars[i] = rnd(CHARS.length);
+      const k = lit[i] >= 2 ? 7 : Math.max(1, Math.round(6 * lit[i]));
+      g.drawImage(glyph(chars[i], shade(k * dim)), x, y);
+    }
+  }
+
+  // The drops writing a digit: a white head with a short trail, per digit column
+  digits.forEach((s, i) => {
+    if (s.from === null) return;
+    let done = true;
+    for (let c = 0; c < 10; c++) {
+      const t = now - s.start - s.off[c];
+      if (t < 0) { done = false; continue; }
+      const head = Math.floor(DROP_START + t / 1000 * DROP_SPEED);
+      if (head - 3 <= D_ROW0 + 7) done = false;
+      const x = (DIG_COL[i] + c) * CW;
+      for (let d = 0; d <= 3; d++) {
+        const r = head - d;
+        if (r < 0 || r >= ROWS || r < DROP_START + 1) continue;
+        if (d === 0 && r < D_ROW0 + 7) { g.fillStyle = "#000"; g.fillRect(x, r * CH, CW, CH); g.drawImage(glyph(rnd(CHARS.length), scale(FLASH, dim)), x, r * CH); }
+        else if (d > 0 && r < D_ROW0 || r >= D_ROW0 + 7) { g.drawImage(glyph(rnd(CHARS.length), shade((12 - d * 3) * dim)), x, r * CH); }
+      }
+    }
+    if (done && now - s.start > STAGGER_MS + FADE_MS + 600) s.from = null;
+  });
+  requestAnimationFrame(frame);
+}
+document.getElementById("night").onclick = (e) => { dim = dim === 1 ? 0.5 : 1; e.target.classList.toggle("on", dim < 1); cache.clear(); };
+document.getElementById("fast").onclick = (e) => {
+  demo = !demo; e.target.classList.toggle("on", demo);
+  if (demo) { const d = new Date(); demoMin = d.getHours() * 60 + d.getMinutes(); }
+};
+document.getElementById("once").onclick = () => {
+  if (!demo) { demo = true; document.getElementById("fast").classList.add("on"); const d = new Date(); demoMin = d.getHours() * 60 + d.getMinutes(); }
+  demoMin++;
+};
+setInterval(() => { if (demo) demoMin++; }, 4000);
+document.fonts.ready.then(() => {
+  masks = CHARS.map(makeMask);
+  for (let i = 0; i < COLS; i++) cols.push(newCol(true));
+  requestAnimationFrame(frame);
+});
+</script>
+</body></html>
