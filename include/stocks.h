@@ -27,7 +27,7 @@ struct StockQuote {
     StockStatus status     = STOCK_PENDING;
     float       price      = 0;    // major currency units (pence already converted to pounds)
     float       change_pct = 0;    // % change vs previous close
-    String      currency;          // e.g. "CHF" — shown in the portal Check only
+    String      currency;          // e.g. "USD" — shown next to the price (after CHF conversion)
     time_t      fetch_time = 0;    // epoch of last successful fetch (0 = never)
     // Mini chart: today's (or the last session's) prices, oldest first, plus the
     // previous close as the zero line. spark_n = 0 → no chart.
@@ -43,6 +43,12 @@ struct StockQuote {
     // learned by stocks_fetch_quote(), needed by stocks_fetch_batch()
     float       price_scale = 0;
     time_t      detail_time = 0;    // when the figures above were last fetched
+    // Regular trading session, in the exchange's local time (with the details):
+    // minutes after midnight, -1 = not known yet. 24/7 for coins.
+    int16_t     session_open  = -1;
+    int16_t     session_close = -1;
+    int32_t     gmt_offset    = 0;      // exchange local time - UTC, seconds (incl. DST)
+    bool        always_open   = false;  // trades around the clock, also on weekends (coins)
 };
 
 // Higher-resolution intraday chart for the detail view (fetched on demand)
@@ -86,8 +92,30 @@ StockFetchResult stocks_fetch_batch(StockQuote quotes[], int n, bool found[]);
 
 // ── Generic helpers (stocks.cpp) ─────────────────────────────────────────────
 
-// Ticker without exchange suffix for display: "NESN.SW" → "NESN", "CHFEUR=X" → "CHFEUR".
+// Name shown for a ticker: short names for metals and coins ("GC=F" → "Gold",
+// "BTC-USD" → "Bitcoin", other coins → "SOL"), otherwise the ticker without its
+// exchange suffix ("NESN.SW" → "NESN", "CHFEUR=X" → "CHFEUR").
 String stocks_display_symbol(const String& symbol);
+
+// Cryptocurrency ("BTC-USD", …): trades around the clock, also on weekends
+bool stocks_is_crypto(const String& symbol);
+
+// Is this ticker's market trading right now (regular session, weekdays; coins
+// always)? 1 = open, 0 = closed, -1 = not known yet. Public holidays aren't known.
+int stocks_session_state(const StockQuote& q, time_t now);
+
+// ── Showing prices in another currency ───────────────────────────────────────
+// Each ticker can be shown in a chosen currency (Settings → Portfolio): its
+// prices are converted with the exchange rate, which is fetched together with
+// the prices. Exchange rates themselves ("CHFEUR=X") stay as they are. The
+// % change is the market's own move, unaffected by the conversion.
+
+// Yahoo symbol of the rate "to per unit of from": ("USD", "PLN") → "USDPLN=X"
+String stocks_fx_symbol(const String& from, const String& to);
+
+// Multiply all price figures by rate and set the currency (q in place)
+void stocks_convert(StockQuote& q, float rate, const char* currency);
+void stocks_convert_chart(StockChart& c, float rate);
 
 // True on weekdays between STOCKS_OPEN_HOUR and STOCKS_CLOSE_HOUR local time.
 // Returns false while the clock isn't synced yet.

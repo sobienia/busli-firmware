@@ -53,6 +53,8 @@
 #define NVS_KEY_WX_PAGE     "wx_page"
 #define NVS_KEY_WX_LOCS     "wx_locs"
 #define NVS_KEY_INFO_PAGE   "info_page"
+#define NVS_KEY_HINTS       "hints"
+#define NVS_KEY_CLOCK_STYLE "clock_style"
 #define NVS_KEY_TODAY_PAGE  "today_page"
 #define NVS_KEY_KIOSK       "kiosk"
 #define MAX_WIFI        3
@@ -323,6 +325,29 @@ void config_save_kiosk(const KioskConfig& cfg) {
     prefs.end();
 }
 
+int config_load_clock_style() {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    int style = prefs.getInt(NVS_KEY_CLOCK_STYLE, CLOCK_DIGITAL);
+    prefs.end();
+    return (style >= CLOCK_DIGITAL && style < CLOCK_STYLE_COUNT) ? style : CLOCK_DIGITAL;
+}
+
+void config_save_clock_style(int style) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putInt(NVS_KEY_CLOCK_STYLE, style);
+    prefs.end();
+}
+
+int config_load_hints() {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, true);
+    int mode = prefs.getInt(NVS_KEY_HINTS, HINTS_ALWAYS);
+    prefs.end();
+    return constrain(mode, (int)HINTS_OFF, (int)HINTS_ALWAYS);
+}
+
 bool config_load_info_page() {
     Preferences prefs;
     prefs.begin(NVS_NAMESPACE, true);
@@ -404,9 +429,15 @@ bool config_load_stocks(StocksConfig& out) {
     if (json.isEmpty()) return false;
     JsonDocument doc;
     if (deserializeJson(doc, json)) return false;
+    JsonArray ca = doc["c"];   // currencies, parallel to "t" (missing before v1.7.7)
+    int k = 0;
     for (const char* sym : doc["t"].as<JsonArray>()) {
         if (out.count >= STOCKS_MAX) break;
-        if (sym && *sym) out.symbols[out.count++] = sym;
+        const char* cur = ca[k++] | "";
+        if (sym && *sym) {
+            out.currencies[out.count] = cur;
+            out.symbols[out.count++]  = sym;
+        }
     }
     out.layout     = constrain(doc["l"] | (int)STOCKS_LAYOUT_AUTO, 0, 2);
     out.rotate_sec = constrain(doc["r"] | STOCKS_ROTATE_SEC_DEFAULT, 3, 300);
@@ -419,7 +450,8 @@ void config_save_stocks(const StocksConfig& cfg) {
     if (cfg.count > 0) {
         JsonDocument doc;
         JsonArray ta = doc["t"].to<JsonArray>();
-        for (int i = 0; i < cfg.count; i++) ta.add(cfg.symbols[i]);
+        JsonArray ca = doc["c"].to<JsonArray>();
+        for (int i = 0; i < cfg.count; i++) { ta.add(cfg.symbols[i]); ca.add(cfg.currencies[i]); }
         doc["l"] = cfg.layout;
         doc["r"] = cfg.rotate_sec;
         String json;
@@ -797,15 +829,23 @@ static String build_page(String ssids[], String passes[], String users[],
     h += F("<h2>Portfolio</h2>"
            "<p class='hint' style='margin:-4px 0 10px'>Adds a <b>Portfolio</b> page to the rotation showing "
            "price and daily % change. Use Yahoo symbols: <b>AAPL</b> (US), <b>NESN.SW</b> (SIX), "
-           "<b>VWCE.DE</b> (Xetra), <b>VWRL.L</b> (London). Tap <b>Check</b> to verify a symbol.</p>"
+           "<b>VWCE.DE</b> (Xetra), <b>VWRL.L</b> (London), <b>GC=F</b> (gold), <b>BTC-USD</b>. "
+           "Tap <b>Check</b> to verify a symbol.<br><b>Currency</b>: shows the price in another "
+           "currency, e.g. <b>CHF</b> or <b>PLN</b> (converted at the current rate). Empty = the "
+           "ticker's own currency; Check fills that in.</p>"
            "<div class='card'><div class='ct'>Tickers <span style='font-weight:normal;color:#666'>(up to 20)</span></div>");
     for (int i = 0; i < STOCKS_MAX; i++) {
         String sym = (i < stocks.count) ? stocks.symbols[i] : "";
+        String cur = (i < stocks.count) ? stocks.currencies[i] : "";
         h += "<div style='display:flex;gap:8px;margin-top:6px;align-items:center'>"
              "<span style='width:20px;color:#666;font-size:12px'>" + String(i + 1) + "</span>"
              "<input type='text' name='st" + String(i) + "' id='st" + String(i) + "' value='"
              + html_encode(sym) + "' placeholder='e.g. NESN.SW' autocomplete='off' "
              "spellcheck='false' autocapitalize='characters' style='flex:1;margin-top:0'>"
+             "<input type='text' name='sc" + String(i) + "' id='sc" + String(i) + "' value='"
+             + html_encode(cur) + "' placeholder='CUR' maxlength='3' autocomplete='off' "
+             "spellcheck='false' autocapitalize='characters' title='Currency' "
+             "style='width:58px;margin-top:0;text-align:center'>"
              "<button type='button' class='tbtn' onclick='checkStock(this," + String(i) + ")'>Check</button>"
              "<span id='sr" + String(i) + "' style='width:110px;font-size:12px;color:#999'></span>"
              "</div>";
@@ -928,6 +968,33 @@ static String build_page(String ssids[], String passes[], String users[],
          "<p class='hint' style='margin-top:6px'>Firmware, Wi-Fi signal, address, battery, uptime "
          "and whether each data source is working &mdash; handy when something doesn't update.</p></div>";
 
+    // ── Clock style ──────────────────────────────────────────────────────────
+    {
+        int style = config_load_clock_style();
+        h += "<h2>Clock</h2><div class='card'><label>Style</label>"
+             "<select name='clock_style' style='width:100%;padding:9px 10px;margin-top:3px;background:#1a1a1a;"
+             "color:#eee;border:1px solid #383838;border-radius:5px;font-size:14px'>"
+             "<option value='0'" + String(style == CLOCK_DIGITAL ? " selected" : "") + ">Digital</option>"
+             "<option value='1'" + String(style == CLOCK_FLAP ? " selected" : "") + ">Split-flap (station board)</option>"
+             "<option value='2'" + String(style == CLOCK_MATRIX ? " selected" : "") + ">Matrix (digital rain)</option>"
+             "</select><p class='hint' style='margin-top:6px'>For the night clock and the clock on the "
+             "Today page (tap Today). On the Today clock, swipe left or right to switch.</p></div>";
+    }
+
+    // ── Gesture hints ────────────────────────────────────────────────────────
+    {
+        static const char* const NAMES[] = { "Off", "First 3 times per page", "Always" };
+        int mode = config_load_hints();
+        h += "<h2>Gesture hints</h2><div class='card'>"
+             "<select name='hints' style='width:100%;padding:9px 10px;background:#1a1a1a;"
+             "color:#eee;border:1px solid #383838;border-radius:5px;font-size:14px'>";
+        for (int i = 2; i >= 0; i--)
+            h += "<option value='" + String(i) + "'" + (mode == i ? " selected" : "") + ">" + NAMES[i] + "</option>";
+        h += F("</select><p class='hint' style='margin-top:6px'>When a page opens, its footer shows what "
+               "it can do for 5 seconds (e.g. <i>Tap: details &middot; Double tap: 5 or 10 per page</i>). "
+               "Changing this starts the count again.</p></div>");
+    }
+
     // ── Night mode section ───────────────────────────────────────────────────
     h += F("<h2>Night mode</h2><div class='card'>"
            "<p class='hint' style='margin:0 0 8px'>During these hours the screen is dimmed, "
@@ -1046,7 +1113,9 @@ static String build_page(String ssids[], String passes[], String users[],
                ".then(function(d){"
                  "btn.disabled=false;"
                  "if(d.ok){r.style.color=d.pct<0?'#f55':'#4c4';"
-                   "r.textContent=d.price+' '+d.cur+' '+(d.pct>=0?'+':'')+d.pct.toFixed(2)+'%';}"
+                   "r.textContent=d.price+' '+d.cur+' '+(d.pct>=0?'+':'')+d.pct.toFixed(2)+'%';"
+                   // the ticker's own currency, unless one was chosen already
+                   "var c=document.getElementById('sc'+i);if(!c.value.trim())c.value=d.cur;}"
                  "else{r.style.color='#f55';r.textContent='\\u2717 '+d.msg;}"
                "})"
                ".catch(function(){btn.disabled=false;r.style.color='#f55';r.textContent='\\u2717 error';});"
@@ -1288,7 +1357,12 @@ static void handle_save() {
     StocksConfig new_stocks;
     for (int i = 0; i < STOCKS_MAX; i++) {
         String sym = s_server.arg("st" + String(i)); sym.trim(); sym.toUpperCase();
-        if (sym.length() > 0) new_stocks.symbols[new_stocks.count++] = sym;
+        String cur = s_server.arg("sc" + String(i)); cur.trim(); cur.toUpperCase();
+        if (cur.length() != 3) cur = "";   // ISO code ("PLN") or the ticker's own
+        if (sym.length() > 0) {
+            new_stocks.currencies[new_stocks.count] = cur;
+            new_stocks.symbols[new_stocks.count++]  = sym;
+        }
     }
     new_stocks.layout     = constrain(s_server.arg("st_l").toInt(), 0, 2);
     new_stocks.rotate_sec = constrain(s_server.arg("st_r").toInt(), 3, 300);
@@ -1306,7 +1380,18 @@ static void handle_save() {
         prefs.putBool(NVS_KEY_WX_PAGE, s_server.arg("wx_page") == "1");
         prefs.putBool(NVS_KEY_INFO_PAGE, s_server.arg("info_page") == "1");
         prefs.putBool(NVS_KEY_TODAY_PAGE, s_server.arg("today_page") == "1");
+        prefs.putInt(NVS_KEY_CLOCK_STYLE,
+                     constrain(s_server.arg("clock_style").toInt(), (int)CLOCK_DIGITAL, (int)CLOCK_STYLE_COUNT - 1));
+        int hints = constrain(s_server.arg("hints").toInt(), (int)HINTS_OFF, (int)HINTS_ALWAYS);
+        bool hints_changed = hints != config_load_hints();
+        prefs.putInt(NVS_KEY_HINTS, hints);
         prefs.end();
+        if (hints_changed) {   // start counting the "first 3 times" again
+            Preferences t;
+            t.begin("tramli", false);
+            for (int i = 0; i < 16; i++) t.remove(("hint" + String(i)).c_str());
+            t.end();
+        }
     }
     {
         KioskConfig k;
@@ -1490,6 +1575,20 @@ a{color:#999;font-size:13px}
 <button onclick="cmd('refresh')">Refresh</button><button onclick="cmd('next')">Next &#9654;</button></div>
 <div class='row'><button onclick="cmd('wake')">Wake screen</button>
 <button onclick="cmd('bright')">Brightness</button><button id='kiosk'>Kiosk</button></div>
+<p class='now' style='margin:20px 0 0'>Weather animations (preview)</p>
+<div class='row' style='margin-top:6px'><button onclick="cmd('anim',0)">Rain</button>
+<button onclick="cmd('anim',1)">Snow</button><button onclick="cmd('anim',2)">Storm</button></div>
+<p class='now' style='margin:16px 0 0'>Clock with weather (preview, 20 s)</p>
+<div class='row' style='margin-top:6px'><button onclick="cmd('clock',0)">Rain</button>
+<button onclick="cmd('clock',1)">Snow</button><button onclick="cmd('clock',2)">Storm</button></div>
+<div class='row' style='margin-top:6px'><button onclick="cmd('clock',3)">Sunny</button>
+<button onclick="cmd('clock',5)">Partly cloudy</button><button onclick="cmd('clock',4)">Cloudy</button></div>
+<div class='row' style='margin-top:6px'><button onclick="cmd('clock',11)">Fog</button>
+<button onclick="cmd('clock',13)">Sunny showers</button></div>
+<div class='row' style='margin-top:6px'><button onclick="cmd('clock',6)">Clear night</button>
+<button onclick="cmd('clock',7)">Cloudy night</button><button onclick="cmd('clock',12)">Foggy night</button></div>
+<div class='row' style='margin-top:6px'><button onclick="cmd('clock',8)">Rainy night</button>
+<button onclick="cmd('clock',9)">Snowy night</button><button onclick="cmd('clock',10)">Stormy night</button></div>
 <p style='margin-top:24px'><a href='/'>&#8592; Settings</a></p>
 <script>
 var kiosk=false;

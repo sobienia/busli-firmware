@@ -106,8 +106,9 @@ static StockFetchResult parse_chart_doc(const String& body, const String& symbol
     JsonObject fm = filter["chart"]["result"][0]["meta"].to<JsonObject>();
     for (const char* k : { "regularMarketPrice", "chartPreviousClose", "currency", "shortName",
                            "regularMarketDayHigh", "regularMarketDayLow",
-                           "fiftyTwoWeekHigh", "fiftyTwoWeekLow" })
+                           "fiftyTwoWeekHigh", "fiftyTwoWeekLow", "instrumentType" })
         fm[k] = true;
+    fm["currentTradingPeriod"]["regular"] = true;   // session hours → open/closed dot
     filter["chart"]["result"][0]["indicators"]["quote"][0]["close"] = true;
     filter["chart"]["result"][0]["indicators"]["quote"][0]["open"]  = true;
     filter["chart"]["error"]["code"] = true;
@@ -194,6 +195,18 @@ static void fill_quote(JsonDocument& doc, StockQuote& out) {
     out.spark_n = downsample(quote["close"], scale, prev > 0 ? prev : price,
                              out.spark, STOCK_SPARK_POINTS);
     out.price_scale = scale;
+
+    // Regular session, as minutes after midnight on the exchange's own clock
+    // (Yahoo gives today's start/end as UTC epochs plus the exchange's offset)
+    JsonObject reg = meta["currentTradingPeriod"]["regular"];
+    if (!reg.isNull()) {
+        long off = reg["gmtoffset"] | 0L;
+        long st  = reg["start"] | 0L, en = reg["end"] | 0L;
+        out.gmt_offset    = off;
+        out.session_open  = (int16_t)(((st + off) % 86400 + 86400) % 86400 / 60);
+        out.session_close = (int16_t)(((en + off) % 86400 + 86400) % 86400 / 60);
+    }
+    out.always_open = String(meta["instrumentType"] | "") == "CRYPTOCURRENCY";
 }
 
 // ── Batch: many tickers per request ──────────────────────────────────────────
@@ -259,8 +272,12 @@ StockFetchResult stocks_fetch_batch(StockQuote quotes[], int n, bool found[]) {
         any_ok |= got > 0;
     }
     int got = 0;
-    for (int i = 0; i < n; i++) got += found[i];
-    Log.printf("[Stocks] batch: %d of %d tickers\n", got, n);
+    String prices;
+    for (int i = 0; i < n; i++) {
+        got += found[i];
+        if (found[i]) prices += " " + quotes[i].symbol + "=" + String(quotes[i].price, 4);
+    }
+    Log.printf("[Stocks] batch: %d of %d tickers:%s\n", got, n, prices.c_str());
     return any_ok ? STOCK_FETCH_OK : STOCK_FETCH_ERROR;
 }
 

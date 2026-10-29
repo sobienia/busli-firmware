@@ -77,6 +77,19 @@ void display_set_battery_estimate(float hours_left);
 // Show a centered message (used during boot, errors)
 void display_show_status(const char* message);
 
+// Gesture hint: replaces the footer of the page on screen for duration_ms.
+// display_hint_tick() (every loop) restores the footer afterwards.
+void display_show_hint(const char* text, uint32_t duration_ms);
+void display_hint_tick();
+
+// Weather animation over the whole screen for a few seconds, with a message
+// ("Rain in 10 min"). While active, call display_weather_anim_tick() instead of
+// drawing the page; it returns false once finished (the page then repaints).
+enum WeatherAnim { WX_ANIM_RAIN, WX_ANIM_SNOW, WX_ANIM_STORM };
+void display_weather_anim_start(WeatherAnim kind, const char* text);
+bool display_weather_anim_tick();
+bool display_weather_anim_active();
+
 // Show an OTA update prompt with No (left) and Yes (right) tap zones.
 void display_show_ota_prompt(const char* cur_ver, const char* new_ver);
 
@@ -225,17 +238,40 @@ void display_show_settings_qr(const char* url, const char* hostname, const char*
 void display_draw_today(const char* label, int page_idx, int page_count,
                         const InfoRow* rows, int n_rows,
                         const String& quote, const String& author,
-                        const FooterInfo& footer);
+                        const char* bottom_hint, const FooterInfo& footer);
 
-// Night clock: large dim HH:MM with a small line underneath (e.g. date + temp).
-// Repaints once a minute.
-void display_draw_night_clock(const char* subtitle);
+// Clock: large HH:MM with a small line underneath (e.g. date + temp), on a
+// scene for the weather outside (-1 = none). animate: the scene moves (call
+// every loop, ~15 frames/s); otherwise one still frame a minute. bright: day
+// clock (Today page) instead of the dim night clock.
+enum ClockScene {
+    SCENE_RAIN = WX_ANIM_RAIN, SCENE_SNOW = WX_ANIM_SNOW, SCENE_STORM = WX_ANIM_STORM,
+    SCENE_SUN, SCENE_CLOUDS, SCENE_PARTLY_SUN, SCENE_MOON, SCENE_PARTLY_MOON,
+    SCENE_RAIN_NIGHT, SCENE_SNOW_NIGHT, SCENE_STORM_NIGHT,   // moon behind a cloud
+    SCENE_FOG, SCENE_FOG_NIGHT,                              // drifting mist (+ moon glow)
+    SCENE_SHOWERS,                                           // sun behind a rain cloud
+    SCENE_COUNT
+};
+void display_draw_night_clock(const char* subtitle, int scene, bool animate, bool bright);
+
+// Clock style (stored as an int in Settings — keep values): seven-segment digits,
+// a split-flap board whose cards flip when the time changes, or the Matrix rain
+// with the time made of its symbols (no weather)
+enum ClockStyle { CLOCK_DIGITAL = 0, CLOCK_FLAP = 1, CLOCK_MATRIX = 2, CLOCK_STYLE_COUNT };
+void display_set_clock_style(int style);
+// A line at the bottom of the clock for duration_ms ("Swipe: clock style · Tap: back")
+void display_clock_hint(const char* text, uint32_t duration_ms);
 
 // Boot animation (Matrix-style cascading characters).
 // Start it before the blocking setup steps; update the status text as each
 // phase begins; stop it when the board is ready to appear.
 void display_boot_animation_start();
-void display_boot_animation_stop();
+// Name for the ending ("Wake up, AJ..."); "" = "Wake up..."
+void display_boot_animation_set_name(const String& name);
+// Blocks until the animation is gone. ending = play "Wake up, …" first (~2.5 s;
+// skip_requested() returning true cuts it short — e.g. a touch).
+void display_boot_animation_stop(bool ending = false, bool (*skip_requested)() = nullptr);
+bool display_boot_animation_skipped();
 
 // ── Pager UI screens ──────────────────────────────────────────────────────────
 // All pager screens fill the full 480×222 display (no external footer/header).

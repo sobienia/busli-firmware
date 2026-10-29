@@ -38,6 +38,7 @@ void setup() {
     config_web_set_pairing_callback(on_pairing_code);
     load_theme();
     load_display_prefs();
+    display_set_clock_style(config_load_clock_style());
     Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
     touch_init();
     battery_init();
@@ -64,6 +65,7 @@ void setup() {
     apply_wifi_power_save();
 
     sync_clock();
+    battery_life_boot();
 
     {
         String cd_label, cd_target_str;
@@ -105,7 +107,7 @@ void setup() {
     http_lock_init();
     fetch_task_start(g_stop_configs, g_num_stops);
     fetch_task_set_ota_enabled(config_load_ota_enabled());
-    fetch_task_set_stocks(g_stocks_cfg.symbols, g_stocks_cfg.count);
+    fetch_task_set_stocks(g_stocks_cfg.symbols, g_stocks_cfg.currencies, g_stocks_cfg.count);
     fetch_task_set_today_enabled(config_load_today_page());
     config_load_kiosk(g_kiosk);
     {
@@ -172,10 +174,14 @@ void setup() {
                                               : "Wait timed out",
                   (unsigned long)(millis() - wait_start));
     if (skipped) g_input_swallowed = true;   // the skipping press does nothing else
-    power_end_boot_boost();
+
+    // "Wake up, <name>..." — unless the wait was skipped; a touch cuts it short
+    display_boot_animation_set_name(pager_ui_name());
+    display_boot_animation_stop(!skipped, []() { touch_poll(); return any_input_down(); });
+    if (display_boot_animation_skipped()) g_input_swallowed = true;
+    power_end_boot_boost();   // after the animation: it's drawn at full speed
 
     g_setup_done_ms = millis();
-    display_boot_animation_stop();
     ota_report_rollback();
 }
 
@@ -190,6 +196,7 @@ void loop() {
         check_btn_zoom();
         check_btn_theme();
         check_touch(gesture);
+        check_wave();
     }
     save_page_tick();
     kiosk_tick();
@@ -198,10 +205,12 @@ void loop() {
     battery_tick();
     ota_prompt_tick();
 
-    // The pager owns the screen while it's open
+    display_hint_tick();
+
+    // The pager owns the screen while it's open; a weather animation for a few seconds
     if (!pager_ui_tick(swallow_input)) {
         views_pull_data();
-        draw_current_page(millis());
+        if (!display_weather_anim_tick()) draw_current_page(millis());
     }
     delay(20);
 }

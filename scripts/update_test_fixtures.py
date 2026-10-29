@@ -30,7 +30,7 @@ SOURCES = {
     "FX_STATIONBOARD": "http://transport.opendata.ch/v1/stationboard?station=Z%C3%BCrich%20HB&limit=20" + SB_FIELDS,
     "FX_CONNECTIONS":  "http://transport.opendata.ch/v1/connections?from=Z%C3%BCrich%20HB&to=Bern&limit=5" + CN_FIELDS,
     "FX_WEATHER": ("http://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f"
-                   "&current=temperature_2m,weather_code,uv_index,precipitation"
+                   "&current=temperature_2m,weather_code,uv_index,precipitation,is_day"
                    "&daily=weather_code,precipitation_probability_max,temperature_2m_max,uv_index_max"
                    "&minutely_15=precipitation&forecast_minutely_15=9"
                    "&timezone=Europe%%2FZurich&timeformat=unixtime&forecast_days=1") % (LAT, LON),

@@ -201,10 +201,46 @@ void check_btn_theme() {
     s_btn_theme_was_pressed = pressed;
 }
 
+// ── Wave: a hand passing in front of the screen turns to the next page ───────
+// Near, then gone again within WAVE_MAX_MS, without touching anything. Reaching
+// for the screen to tap doesn't count (the touch cancels it), and neither does
+// the wave that just woke the screen (the pages weren't visible when it began).
+static const uint32_t WAVE_MAX_MS      = 1200;
+static const uint32_t WAVE_COOLDOWN_MS = 1500;
+
+static bool pages_showing() {
+    return display_screen_on() && !g_clock_showing && !pager_ui_active() &&
+           g_overlay_until_ms == 0 && g_config_hint_stage == 0;
+}
+
+void check_wave() {
+    static uint32_t near_since = 0, last_wave = 0;
+    static bool     cancelled  = false;
+    if (!light_available()) return;
+    uint32_t now = millis();
+    if (light_near()) {
+        if (near_since == 0) { near_since = now; cancelled = !pages_showing(); }
+        if (any_input_down()) cancelled = true;
+        return;
+    }
+    if (near_since == 0) return;
+    uint32_t held = now - near_since;
+    near_since = 0;
+    if (cancelled || held > WAVE_MAX_MS || now - last_wave < WAVE_COOLDOWN_MS || !pages_showing()) return;
+    last_wave = now;
+    Log.printf("[Light] Wave (%lu ms) → next page\n", (unsigned long)held);
+    switch_page((g_current_page + 1) % g_num_pages);
+}
+
 // gesture comes from touch_poll() in loop(). While the pager is open its own
 // tap handling owns the screen, so gestures are ignored here.
 void check_touch(TouchGesture gesture) {
     if (pager_ui_active()) return;
+    // On the Today clock a sideways swipe changes the clock's style instead
+    if ((gesture == TOUCH_SWIPE_LEFT || gesture == TOUCH_SWIPE_RIGHT) && today_clock_showing()) {
+        switch_clock_style(gesture == TOUCH_SWIPE_LEFT ? 1 : -1);
+        return;
+    }
     switch (gesture) {
         case TOUCH_SWIPE_LEFT:
             Log.println("[Touch] Swipe left → next page");
@@ -220,8 +256,8 @@ void check_touch(TouchGesture gesture) {
             break;
         case TOUCH_DOUBLE_TAP:
             // Font size only applies to the departure board; on the portfolio a
-            // quick double tap is just an impatient tap
-            if (g_pages[g_current_page].type == PageInfo::STOCKS) { handle_stock_tap(); break; }
+            // double tap switches between 5 and 10 tickers per page
+            if (g_pages[g_current_page].type == PageInfo::STOCKS) { handle_stock_double_tap(); break; }
             Log.println("[Touch] Double tap → toggle font size");
             g_large_font = !g_large_font;
             {
@@ -297,6 +333,7 @@ void check_touch(TouchGesture gesture) {
         case TOUCH_TAP:
             if (g_pages[g_current_page].type == PageInfo::STOCKS) handle_stock_tap();
             if (g_pages[g_current_page].type == PageInfo::DEVICE) show_settings_qr();
+            if (g_pages[g_current_page].type == PageInfo::TODAY)  toggle_today_clock();
             break;
         default:
             break;

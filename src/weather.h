@@ -14,8 +14,14 @@ struct WeatherData {
     bool   raining_now;      // precipitation right now
     time_t rain_start;       // dry now: when rain starts (0 = none expected)
     time_t rain_end;         // raining: when it stops (0 = not within the window)
+    int   code_now;          // WMO weather code right now (snow 71–77/85–86, storm 95–99)
+    bool  is_day;            // the sun is up there (night clock: sun or moon)
     bool  valid;             // false until at least one successful fetch
 };
+
+// Kind of weather by WMO code
+inline bool weather_code_snow(int c)  { return (c >= 71 && c <= 77) || c == 85 || c == 86; }
+inline bool weather_code_storm(int c) { return c >= 95 && c <= 99; }
 
 // Fetch current weather, today's outlook and the short-term rain forecast for
 // a location from Open-Meteo. Returns true on success; `out` is unchanged on failure.

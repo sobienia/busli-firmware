@@ -168,7 +168,7 @@ bool weather_fetch(float lat, float lon, WeatherData& out) {
     snprintf(url, sizeof(url),
         "http://api.open-meteo.com/v1/forecast"
         "?latitude=%.3f&longitude=%.3f"
-        "&current=temperature_2m,weather_code,uv_index,precipitation"
+        "&current=temperature_2m,weather_code,uv_index,precipitation,is_day"
         "&daily=weather_code,precipitation_probability_max,temperature_2m_max,uv_index_max"
         "&minutely_15=precipitation&forecast_minutely_15=%d"
         "&timezone=Europe%%2FZurich&timeformat=unixtime"
@@ -211,6 +211,8 @@ bool weather_parse(const String& body, time_t now, WeatherData& out) {
     out.temp_c       = doc["current"]["temperature_2m"]                  | 0.0f;
     out.temp_max_c   = doc["daily"]["temperature_2m_max"][0]             | out.temp_c;
     out.uv_index     = (int)roundf(doc["current"]["uv_index"]            | 0.0f);
+    out.code_now     = doc["current"]["weather_code"]                    | 0;
+    out.is_day       = (doc["current"]["is_day"] | 1) != 0;
     out.uv_index_max = (int)roundf(doc["daily"]["uv_index_max"][0]       | 0.0f);
 
     int daily_code      = doc["daily"]["weather_code"][0]                  | 0;

@@ -135,6 +135,10 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 #define WATER_FROM_HOUR            6
 #define WATER_UNTIL_HOUR           18
 
+// Boot animation: 0 = digital rain with "Wake up, <name>..." (default),
+// 1 = the original version (short trails, column wipe)
+#define BOOT_ANIM_CLASSIC 0
+
 // Boot: the animation runs until the first round of data is loaded, at most this long
 #define BOOT_WAIT_MAX_MS  25000
 // …or this long when recent data from the last run was remembered (shown at
@@ -200,7 +204,7 @@ static const int BATTERY_WARN_LEVELS[] = { 10, 20 };
 //     Every device — including a friend's — picks it up on the next hourly check.
 //
 // Leave OTA_VERSION_URL as "" to disable OTA checking entirely.
-#define FIRMWARE_VERSION        "1.7.6"
+#define FIRMWARE_VERSION        "1.7.7"
 #define OTA_VERSION_URL         "https://raw.githubusercontent.com/sobienia/busli-firmware/master/ota/version.json"
 #define OTA_CHECK_INTERVAL_SEC  86400
 

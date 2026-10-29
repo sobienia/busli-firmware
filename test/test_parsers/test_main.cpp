@@ -203,6 +203,9 @@ static void test_stock_chart_live() {
     TEST_ASSERT_TRUE(q.year_low > 0 && q.year_low <= q.year_high);
     TEST_ASSERT_GREATER_THAN(1, q.spark_n);
     TEST_ASSERT_FLOAT_WITHIN(0.0001, 1.0, q.price_scale);
+    TEST_ASSERT_EQUAL(540, q.session_open);    // SIX: 09:00–17:30 Zürich
+    TEST_ASSERT_EQUAL(1050, q.session_close);
+    TEST_ASSERT_FALSE(q.always_open);
 }
 
 static void test_stock_chart_pence_live() {
@@ -253,6 +256,49 @@ static void test_stock_spark_logic() {
     TEST_ASSERT_EQUAL(2, stocks_yahoo_parse_spark(body, q, 0, 2, found));
     TEST_ASSERT_FLOAT_WITHIN(0.001, 1.12, q[1].price);
     TEST_ASSERT_FLOAT_WITHIN(0.01, 12, q[1].change_pct);
+}
+
+static void test_stock_names_and_chf() {
+    TEST_ASSERT_EQUAL_STRING("Gold",     stocks_display_symbol("GC=F").c_str());
+    TEST_ASSERT_EQUAL_STRING("Silver",   stocks_display_symbol("SI=F").c_str());
+    TEST_ASSERT_EQUAL_STRING("BTC",      stocks_display_symbol("BTC-USD").c_str());
+    TEST_ASSERT_EQUAL_STRING("ETH",      stocks_display_symbol("ETH-USD").c_str());
+    TEST_ASSERT_EQUAL_STRING("XRP",      stocks_display_symbol("XRP-USD").c_str());
+    TEST_ASSERT_EQUAL_STRING("SOL",      stocks_display_symbol("SOL-USD").c_str());   // other coins
+    TEST_ASSERT_EQUAL_STRING("BRK-B",    stocks_display_symbol("BRK-B").c_str());     // a share
+    TEST_ASSERT_EQUAL_STRING("CHFEUR",   stocks_display_symbol("CHFEUR=X").c_str());
+    TEST_ASSERT_EQUAL_STRING("VWCE",     stocks_display_symbol("VWCE.DE").c_str());
+    TEST_ASSERT_TRUE(stocks_is_crypto("BTC-USD"));
+    TEST_ASSERT_FALSE(stocks_is_crypto("BRK-B"));
+    TEST_ASSERT_FALSE(stocks_is_crypto("GC=F"));
+    TEST_ASSERT_EQUAL_STRING("USDPLN=X", stocks_fx_symbol("USD", "PLN").c_str());
+
+    StockQuote q;
+    q.price = 100; q.prev_close = 95; q.change_pct = 5.26f; q.spark_n = 1; q.spark[0] = 98;
+    stocks_convert(q, 0.8f, "CHF");
+    TEST_ASSERT_FLOAT_WITHIN(0.001, 80, q.price);
+    TEST_ASSERT_FLOAT_WITHIN(0.001, 76, q.prev_close);
+    TEST_ASSERT_FLOAT_WITHIN(0.001, 78.4, q.spark[0]);
+    TEST_ASSERT_FLOAT_WITHIN(0.001, 5.26, q.change_pct);   // the market's own move
+    TEST_ASSERT_EQUAL_STRING("CHF", q.currency.c_str());
+}
+
+static void test_stock_session() {
+    // AAPL: 09:30–16:00 New York (UTC-4). T0 = Thu 17:00 UTC = 13:00 in New York
+    StockQuote q;
+    TEST_ASSERT_EQUAL(-1, stocks_session_state(q, T0));            // not known yet
+    q.session_open = 570; q.session_close = 960; q.gmt_offset = -4 * 3600;
+    TEST_ASSERT_EQUAL(1, stocks_session_state(q, T0));             // trading
+    TEST_ASSERT_EQUAL(0, stocks_session_state(q, T0 - 4 * 3600));  // 09:00: not yet
+    TEST_ASSERT_EQUAL(0, stocks_session_state(q, T0 + 3 * 3600));  // 16:00: closed
+    TEST_ASSERT_EQUAL(0, stocks_session_state(q, T0 + 2 * 86400)); // Saturday
+    // Gold / currencies: 00:00–23:59 → all weekday long, closed on Saturday
+    q.session_open = 0; q.session_close = 1439;
+    TEST_ASSERT_EQUAL(1, stocks_session_state(q, T0 + 7 * 3600));  // 20:00 New York
+    TEST_ASSERT_EQUAL(0, stocks_session_state(q, T0 + 2 * 86400));
+    // Coins: always
+    q.always_open = true;
+    TEST_ASSERT_EQUAL(1, stocks_session_state(q, T0 + 2 * 86400));
 }
 
 // ── Today page ───────────────────────────────────────────────────────────────
@@ -330,6 +376,8 @@ void setup() {
     RUN_TEST(test_stock_not_found);
     RUN_TEST(test_stock_spark_live);
     RUN_TEST(test_stock_spark_logic);
+    RUN_TEST(test_stock_names_and_chf);
+    RUN_TEST(test_stock_session);
     RUN_TEST(test_water_live);
     RUN_TEST(test_quote_live);
     RUN_TEST(test_commute_legs);

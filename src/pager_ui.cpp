@@ -36,6 +36,8 @@ void pager_ui_init() {
 
 bool pager_ui_active() { return g_pager_state != PAGER_OFF; }
 
+String pager_ui_name() { return g_pager_cfg.name; }
+
 // Long press on the brightness button: open the pager, or cancel it
 // (nothing while the pager is switched off in Settings)
 void pager_ui_toggle() {

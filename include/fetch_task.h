@@ -74,8 +74,9 @@ void fetch_task_set_active_stop(int new_idx);
 
 // What the page on screen shows. While neither departures nor a commute is
 // visible, the last stop drops to the background rate (INACTIVE_REFRESH_SEC)
-// and the commute to COMMUTE_BG_REFRESH_SEC.
-void fetch_task_set_visible(bool departures, bool commute);
+// and the commute to COMMUTE_BG_REFRESH_SEC. With the portfolio on screen,
+// coins are also refreshed outside market hours.
+void fetch_task_set_visible(bool departures, bool commute, bool portfolio);
 
 // Pages visible again after the screen was off / the night clock showed: every
 // stop (the one on screen first), the weather on screen and the portfolio are
@@ -145,9 +146,10 @@ void fetch_task_notify_pager_activity();
 // One ticker is fetched per loop iteration (staggered), each every STOCKS_REFRESH_SEC
 // while markets are open. Outside market hours only missing quotes and one final
 // closing-price pass are fetched.
-void fetch_task_set_stocks(const String symbols[], int count);
+void fetch_task_set_stocks(const String symbols[], const String currencies[], int count);
 
-// Copy the quote cache into out[] (must hold STOCKS_MAX entries). Returns the ticker count.
+// Copy the quote cache into out[] (must hold STOCKS_MAX entries), prices in each
+// ticker's chosen currency once its rate is known (see stocks.h). Returns the count.
 int  fetch_task_get_stocks(StockQuote out[]);
 
 // Re-fetch all tickers (staggered), even outside market hours.

@@ -85,6 +85,7 @@ int  stock_sub_page_count();
 void set_stock_sub_page(int idx);
 void set_stock_detail(int idx);
 void handle_stock_tap();
+void handle_stock_double_tap();
 
 // Weather page location (slot)
 extern int g_wx_slot, g_wx_count;
@@ -118,13 +119,19 @@ extern bool        g_large_font;
 extern time_t      g_countdown_target;
 extern int         g_countdown_icon;
 extern uint32_t    g_last_redraw_ms;     // 0 = redraw on the next loop()
-void views_pull_data();
+void views_pull_data();               // also starts weather animations when due
 void draw_current_page(uint32_t now_ms);
+void weather_anim_preview(int kind);  // 0 rain, 1 snow, 2 storm (Remote page)
+void toggle_today_clock();            // Today page tap: clock ⇄ Today
+void today_clock_off();               // leaving the Today page
+bool today_clock_showing();
+void switch_clock_style(int step);    // swipe on the Today clock: +1 next style, -1 previous
 
 // ── pager_ui.cpp ─────────────────────────────────────────────────────────────
 extern bool g_pager_dirty;               // pager screen needs repainting
 void pager_ui_init();
 bool pager_ui_active();
+String pager_ui_name();               // "Your name" from Settings → Pager
 void pager_ui_toggle();
 bool pager_ui_tick(bool swallow_input);
 
@@ -138,6 +145,7 @@ void check_btn_bright();
 void check_btn_zoom();
 void check_btn_theme();
 void check_touch(TouchGesture gesture);
+void check_wave();                    // hand passing in front → next page
 
 // ── screen.cpp ───────────────────────────────────────────────────────────────
 extern uint32_t    g_overlay_until_ms;
@@ -154,6 +162,8 @@ void on_pairing_code(const char* code);
 bool overlay_active();
 void run_setup_portal();
 bool power_tick();
+void clock_preview(int kind);   // the clock with a ClockScene (display.h) for 20 s
+int  clock_preview_kind();      // -1 = no preview running
 
 // ── power.cpp ────────────────────────────────────────────────────────────────
 extern int  g_battery_pct;
@@ -163,6 +173,8 @@ void set_power_profile(bool usb);
 void update_battery();
 void battery_tick();
 void power_end_boot_boost();
+void  battery_life_boot();               // after the clock is set: did the battery run out?
+float battery_life_hours(int& runs);     // average per full charge, -1 = not measured yet
 
 // ── wifi_conn.cpp ────────────────────────────────────────────────────────────
 bool connect_wifi();

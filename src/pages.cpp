@@ -146,6 +146,18 @@ void handle_stock_tap() {
     if (idx >= 0 && idx < g_stocks_cfg.count) set_stock_detail(idx);
 }
 
+// Portfolio double tap: 5 ⇄ 10 tickers per page, remembered (Settings → Layout
+// shows the choice). In the detail view it just closes the details, like a tap.
+void handle_stock_double_tap() {
+    if (g_stock_detail >= 0) { set_stock_detail(-1); return; }
+    bool big_now = stocks_per_page(g_stocks_cfg.layout, g_stocks_cfg.count) <= 5;
+    g_stocks_cfg.layout = big_now ? STOCKS_LAYOUT_COMPACT : STOCKS_LAYOUT_BIG;
+    config_save_stocks(g_stocks_cfg);
+    set_stock_sub_page(0);
+    display_invalidate();
+    Log.printf("[Stocks] Layout → %d per page\n", big_now ? 10 : 5);
+}
+
 // Set initial page based on time: morning → work commute, afternoon/evening → home commute.
 void set_initial_page() {
     time_t now_t = time(nullptr);
@@ -165,7 +177,8 @@ void set_initial_page() {
 void update_fetch_focus() {
     const PageInfo& p = g_pages[g_current_page];
     fetch_task_set_visible(p.type == PageInfo::TRANSIT,
-                           p.type == PageInfo::COMMUTE_HOME || p.type == PageInfo::COMMUTE_WORK);
+                           p.type == PageInfo::COMMUTE_HOME || p.type == PageInfo::COMMUTE_WORK,
+                           p.type == PageInfo::STOCKS);
     switch (p.type) {
         case PageInfo::TRANSIT:      fetch_task_set_weather_place(p.transit_idx);        break;
         case PageInfo::COMMUTE_WORK: fetch_task_set_weather_place(WEATHER_PLACE_HOME);   break;  // from home
@@ -193,6 +206,46 @@ void force_refresh_current_page() {
     }
 }
 
+// ── Gesture hints ────────────────────────────────────────────────────────────
+// When a page is opened, its footer shows what it can do for a few seconds —
+// always, only the first HINT_TIMES times per kind of page (counted in NVS),
+// or never (Settings → Gesture hints).
+static int s_hints_mode = -1;   // read from Settings once
+static const int      HINT_TIMES = 3;
+static const uint32_t HINT_MS    = 5000;
+
+static const char* page_hint(const PageInfo& p) {
+    switch (p.type) {
+        case PageInfo::TRANSIT:
+            return g_flight_count > 0 ? "Swipe up/down: flights  \xC2\xB7  Double tap: big text"
+                                      : "Double tap: big text  \xC2\xB7  Hold: refresh";
+        case PageInfo::STOCKS:       return "Tap: details  \xC2\xB7  Double tap: 5 or 10 per page";
+        case PageInfo::WEATHER:
+            return g_wx_count > 1 ? "Swipe up/down: other towns  \xC2\xB7  Hold: refresh" : "Hold: refresh";
+        case PageInfo::COMMUTE_HOME:
+        case PageInfo::COMMUTE_WORK: return "Swipe up/down: other connections";
+        case PageInfo::TODAY:        return nullptr;   // its bottom line says "Tap to show a clock"
+        case PageInfo::DEVICE:       return "Tap: settings QR code";
+    }
+    return nullptr;
+}
+
+static void show_page_hint(const PageInfo& p) {
+    const char* hint = page_hint(p);
+    if (!hint) return;
+    if (s_hints_mode < 0) s_hints_mode = config_load_hints();
+    if (s_hints_mode == HINTS_OFF) return;
+    if (s_hints_mode == HINTS_ALWAYS) { display_show_hint(hint, HINT_MS); return; }
+    char key[8];
+    snprintf(key, sizeof(key), "hint%d", (int)p.type);
+    Preferences prefs;
+    prefs.begin("tramli", false);
+    int shown = prefs.getInt(key, 0);
+    if (shown < HINT_TIMES) prefs.putInt(key, shown + 1);
+    prefs.end();
+    if (shown < HINT_TIMES) display_show_hint(hint, HINT_MS);
+}
+
 // by_user = false for kiosk rotation: those pages aren't saved (a write every
 // few seconds would wear the flash) and don't count as interaction
 void switch_page(int new_page, bool by_user) {
@@ -202,6 +255,7 @@ void switch_page(int new_page, bool by_user) {
     g_stock_sub_page   = 0;
     g_stock_rotate_ms  = millis();
     if (g_stock_detail >= 0) { g_stock_detail = -1; fetch_task_request_stock_chart(-1); }
+    today_clock_off();
     g_last_redraw_ms     = 0;   // force immediate redraw
     PageInfo& p = g_pages[new_page];
     if (p.type == PageInfo::TRANSIT) {
@@ -213,6 +267,7 @@ void switch_page(int new_page, bool by_user) {
     // each NVS write wears flash). Saved by save_page_tick().
     if (by_user) g_page_save_at_ms = millis() + PAGE_SAVE_DELAY_MS;
     display_invalidate();
+    if (by_user) show_page_hint(p);
 }
 
 // Come back on the page that was showing before the restart
@@ -300,6 +355,8 @@ bool remote_command(const String& cmd, int arg) {
     else if (cmd == "wake")    { /* woken above */ }
     else if (cmd == "bright")  display_step_brightness();
     else if (cmd == "kiosk")   { g_kiosk.enabled = arg != 0; config_save_kiosk(g_kiosk); }
+    else if (cmd == "anim")    weather_anim_preview(arg);
+    else if (cmd == "clock")   clock_preview(arg);
     else return false;
     g_last_redraw_ms = 0;
     Log.printf("[Remote] %s %d\n", cmd.c_str(), arg);

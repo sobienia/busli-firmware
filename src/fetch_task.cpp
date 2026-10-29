@@ -110,6 +110,41 @@ static time_t        s_stock_batch_last       = 0;            // last batch atte
 static bool          s_stock_batch_need_close = false;        // last batch was during market hours
 static volatile bool s_stocks_force           = false;        // long press / remote refresh
 static const long    STOCK_DETAILS_SEC        = 86400;        // details are refreshed daily
+static volatile bool s_portfolio_visible      = false;        // Portfolio page on screen
+static bool          s_has_crypto             = false;        // a coin among the tickers
+
+// Showing tickers in a chosen currency (Settings → Portfolio). The rates
+// ("USDPLN=X", …) are fetched in the same request as the prices.
+static String        s_show_cur[STOCKS_MAX];                  // "" = the ticker's own
+struct FxRate { String pair; float rate; };
+static FxRate        s_fx[STOCKS_MAX];                        // guarded by s_mutex
+static int           s_fx_n = 0;
+
+// The rate symbol ticker i needs ("" = none: own currency, or an exchange rate itself)
+static String fx_pair_for(int i) {
+    const StockQuote& q = s_stock_quotes[i];
+    const String& to = s_show_cur[i];
+    if (to.isEmpty() || q.currency.isEmpty() || q.currency == to || q.symbol.endsWith("=X")) return "";
+    return stocks_fx_symbol(q.currency, to);
+}
+
+static float fx_rate(const String& pair) {
+    for (int k = 0; k < s_fx_n; k++) if (s_fx[k].pair == pair) return s_fx[k].rate;
+    return 0;
+}
+
+static void fx_store(const String& pair, float rate) {
+    for (int k = 0; k < s_fx_n; k++) if (s_fx[k].pair == pair) { s_fx[k].rate = rate; return; }
+    if (s_fx_n < STOCKS_MAX) s_fx[s_fx_n++] = { pair, rate };
+}
+
+// Ticker i as shown: in its chosen currency once the rate is known
+static void to_show_currency(int i, StockQuote& q) {
+    if (q.status != STOCK_OK) return;
+    String pair = fx_pair_for(i);
+    float rate = pair.isEmpty() ? 0 : fx_rate(pair);
+    if (rate > 0) stocks_convert(q, rate, s_show_cur[i].c_str());
+}
 
 // Detail-view chart — fetched on demand for the ticker the user opened
 static volatile int  s_chart_request = -1;   // ticker index wanted; -1 = detail view closed
@@ -428,6 +463,9 @@ static bool stock_batch_due(time_t now, bool market_open) {
     if (s_power == FETCH_POWER_SCREEN_OFF) return false;   // nobody's looking; caught up on wake
     if (s_stock_batch_last != 0 && now - s_stock_batch_last < STOCKS_REFRESH_SEC) return false;
     if (market_open || s_stock_batch_need_close) return true;
+    // Coins trade around the clock: outside market hours they're refreshed
+    // only while the Portfolio page is on screen
+    if (s_has_crypto && s_portfolio_visible) return true;
     bool pending = false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_stock_count; i++) pending |= (s_stock_quotes[i].status == STOCK_PENDING);
@@ -440,9 +478,12 @@ static int stock_details_due(time_t now) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     int pick = -1;
     for (int i = 0; i < s_stock_count && pick < 0; i++) {
-        time_t dt = s_stock_quotes[i].detail_time, la = s_stock_last_attempt[i];
-        bool never = dt == 0 && (la == 0 || now - la >= 120);
-        bool old   = dt != 0 && now - dt >= STOCK_DETAILS_SEC && now - la >= 600;
+        const StockQuote& q = s_stock_quotes[i];
+        time_t dt = q.detail_time, la = s_stock_last_attempt[i];
+        // Never fetched, or fetched by firmware that didn't keep the session hours
+        bool unknown = dt == 0 || (q.status == STOCK_OK && q.session_open < 0 && !q.always_open);
+        bool never = unknown && (la == 0 || now - la >= 120);
+        bool old   = !unknown && now - dt >= STOCK_DETAILS_SEC && now - la >= 600;
         if (never || old) pick = i;
     }
     xSemaphoreGive(s_mutex);
@@ -450,20 +491,33 @@ static int stock_details_due(time_t now) {
 }
 
 static void do_fetch_stock_batch() {
-    static StockQuote q[STOCKS_MAX];   // static: ~5 KB, too big for the task stack
-    bool found[STOCKS_MAX];
-    int n = s_stock_count;
+    // The tickers, then the exchange rates their chosen currencies need (same request)
+    static StockQuote q[2 * STOCKS_MAX];   // static: too big for the task stack
+    bool found[2 * STOCKS_MAX];
+    int n = s_stock_count, m = n;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < n; i++) q[i] = s_stock_quotes[i];
+    for (int i = 0; i < n; i++) {
+        String pair = fx_pair_for(i);
+        bool dup = pair.isEmpty();
+        for (int k = n; k < m && !dup; k++) dup = (q[k].symbol == pair);
+        if (dup) continue;
+        q[m] = StockQuote();
+        q[m].symbol      = pair;
+        q[m].price_scale = 1.0f;
+        m++;
+    }
     xSemaphoreGive(s_mutex);
 
     http_lock_take();
-    StockFetchResult r = stocks_fetch_batch(q, n, found);
+    StockFetchResult r = stocks_fetch_batch(q, m, found);
     http_lock_give();
     note_result(SRC_STOCKS, r == STOCK_FETCH_OK);
 
     time_t now = time(nullptr);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int k = n; k < m; k++)
+        if (found[k] && q[k].price > 0) fx_store(q[k].symbol, q[k].price);
     for (int i = 0; i < n; i++) {
         if (!found[i]) continue;
         StockQuote& c = s_stock_quotes[i];
@@ -510,6 +564,13 @@ static void do_fetch_stock(int i) {
         c.year_low   = q.year_low;  c.year_high = q.year_high;
         c.price_scale = q.price_scale;
         c.detail_time = q.detail_time;
+        c.session_open  = q.session_open;
+        c.session_close = q.session_close;
+        c.gmt_offset    = q.gmt_offset;
+        c.always_open   = q.always_open;
+        // Now that its currency is known: fetch the rate for its chosen currency soon
+        String pair = fx_pair_for(i);
+        if (!pair.isEmpty() && fx_rate(pair) == 0) s_stocks_force = true;
     } else if (r == STOCK_FETCH_NOT_FOUND) {
         c.status      = STOCK_NOT_FOUND;
         c.detail_time = now;   // don't keep asking; re-checked with the daily details
@@ -578,7 +639,8 @@ static void snapshot_save() {
         o["tc"] = w.temp_c; o["tm"] = w.temp_max_c; o["uv"] = w.uv_index; o["um"] = w.uv_index_max;
         o["pp"] = w.precip_prob_pct; o["rt"] = w.rain_today; o["st"] = w.snow_today;
         o["ct"] = w.clear_today; o["rn"] = w.raining_now;
-        o["rs"] = (long)w.rain_start; o["re"] = (long)w.rain_end;
+        o["rs"] = (long)w.rain_start; o["re"] = (long)w.rain_end; o["cn"] = w.code_now;
+        o["dy"] = w.is_day;
     }
     if (!isnan(s_water.lake_c) || !isnan(s_water.river_c)) {
         JsonObject o = doc["water"].to<JsonObject>();
@@ -600,9 +662,13 @@ static void snapshot_save() {
         o["ft"] = (long)q.fetch_time; o["sc"] = q.price_scale; o["dt"] = (long)q.detail_time;
         o["n"] = q.name; o["o"] = q.open;
         o["dl"] = q.day_low; o["dh"] = q.day_high; o["yl"] = q.year_low; o["yh"] = q.year_high;
+        o["so"] = q.session_open; o["se"] = q.session_close; o["go"] = q.gmt_offset;
+        o["ao"] = q.always_open;
         JsonArray sp = o["sp"].to<JsonArray>();
         for (int k = 0; k < q.spark_n; k++) sp.add(q.spark[k]);
     }
+    JsonObject fx = doc["fx"].to<JsonObject>();   // exchange rates: {"USDPLN=X": 3.62, …}
+    for (int k = 0; k < s_fx_n; k++) fx[s_fx[k].pair] = s_fx[k].rate;
     xSemaphoreGive(s_mutex);
 
     File f = LittleFS.open(SNAPSHOT_FILE, "w");
@@ -655,6 +721,8 @@ static void snapshot_load() {
             w.rain_today = o["rt"] | false; w.snow_today = o["st"] | false; w.clear_today = o["ct"] | false;
             w.raining_now = o["rn"] | false;
             w.rain_start = (time_t)(o["rs"] | 0L); w.rain_end = (time_t)(o["re"] | 0L);
+            w.code_now = o["cn"] | 0;
+            w.is_day   = o["dy"] | true;
             w.valid = true;
             pw.ok = true;
             pw.last_attempt = (time_t)(o["at"] | 0L);   // refreshed on its normal schedule
@@ -684,11 +752,14 @@ static void snapshot_load() {
             q.name = String(o["n"] | ""); q.open = o["o"] | 0.0f;
             q.day_low = o["dl"] | 0.0f; q.day_high = o["dh"] | 0.0f;
             q.year_low = o["yl"] | 0.0f; q.year_high = o["yh"] | 0.0f;
+            q.session_open  = o["so"] | -1; q.session_close = o["se"] | -1;
+            q.gmt_offset    = o["go"] | 0;  q.always_open   = o["ao"] | false;
             JsonArray sp = o["sp"];
             q.spark_n = 0;
             for (JsonVariant v : sp) if (q.spark_n < STOCK_SPARK_POINTS) q.spark[q.spark_n++] = v.as<float>();
         }
     }
+    for (JsonPair p : doc["fx"].as<JsonObject>()) fx_store(p.key().c_str(), p.value() | 0.0f);
     xSemaphoreGive(s_mutex);
     s_snapshot_age = (now > 1700000000 && saved > 0) ? now - saved : -1;
     Log.printf("[Snapshot] loaded (%ld s old)\n", (long)s_snapshot_age);
@@ -999,9 +1070,11 @@ void fetch_task_set_active_stop(int new_idx) {
     if (needs_fetch) { s_force_refresh = true; wake_task(); }
 }
 
-void fetch_task_set_visible(bool departures, bool commute) {
+void fetch_task_set_visible(bool departures, bool commute, bool portfolio) {
     s_departures_visible = departures;
     s_commute_visible    = commute;
+    s_portfolio_visible  = portfolio;
+    if (portfolio) wake_task();   // coins outside market hours: refresh if due
 }
 
 void fetch_task_wake() {
@@ -1192,7 +1265,13 @@ void fetch_task_request_stock_chart(int idx) {
 bool fetch_task_get_stock_chart(int idx, StockChart& out) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool ok = (idx >= 0 && idx == s_chart_idx);
-    if (ok) out = s_chart;
+    if (ok) {
+        out = s_chart;
+        // Same currency as the quote it belongs to (see fetch_task_get_stocks)
+        String pair = fx_pair_for(idx);
+        float rate  = pair.isEmpty() ? 0 : fx_rate(pair);
+        if (rate > 0) stocks_convert_chart(out, rate);
+    }
     xSemaphoreGive(s_mutex);
     return ok;
 }
@@ -1201,24 +1280,30 @@ void fetch_task_notify_pager_activity() {
     s_pager_last_activity = time(nullptr);
 }
 
-void fetch_task_set_stocks(const String symbols[], int count) {
+void fetch_task_set_stocks(const String symbols[], const String currencies[], int count) {
     if (count > STOCKS_MAX) count = STOCKS_MAX;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < count; i++) {
         s_stock_quotes[i]        = StockQuote();
         s_stock_quotes[i].symbol = symbols[i];
+        s_show_cur[i]            = currencies[i];
         s_stock_last_attempt[i]  = 0;
     }
     s_stock_batch_last       = 0;       // prices: fetched once at startup
     s_stock_batch_need_close = false;
     s_stock_count = count;
+    s_has_crypto  = false;
+    for (int i = 0; i < count; i++) s_has_crypto |= stocks_is_crypto(symbols[i]);
     xSemaphoreGive(s_mutex);
 }
 
 int fetch_task_get_stocks(StockQuote out[]) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     int n = s_stock_count;
-    for (int i = 0; i < n; i++) out[i] = s_stock_quotes[i];
+    for (int i = 0; i < n; i++) {
+        out[i] = s_stock_quotes[i];
+        to_show_currency(i, out[i]);
+    }
     xSemaphoreGive(s_mutex);
     return n;
 }

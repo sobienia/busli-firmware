@@ -70,6 +70,7 @@ void config_save_pager(const PagerConfig& cfg);
 
 struct StocksConfig {
     String symbols[STOCKS_MAX];  // Yahoo format, e.g. "NESN.SW"; only [0, count) are used
+    String currencies[STOCKS_MAX];   // shown in this currency, e.g. "PLN"; "" = the ticker's own
     int    count      = 0;
     int    layout     = STOCKS_LAYOUT_AUTO;
     int    rotate_sec = STOCKS_ROTATE_SEC_DEFAULT;  // sub-page rotation interval
@@ -95,6 +96,14 @@ bool config_load_weather_page();
 
 // Show the device info page in the page cycle? (default: yes)
 bool config_load_info_page();
+
+// Gesture hints in the footer when a page opens (stored as an int — keep values)
+enum HintsMode { HINTS_OFF = 0, HINTS_FIRST = 1, HINTS_ALWAYS = 2 };
+int config_load_hints();   // default HINTS_ALWAYS
+
+// Clock style for the night clock and the Today clock (ClockStyle in display.h)
+int  config_load_clock_style();
+void config_save_clock_style(int style);
 
 // Show the Today page (first in the cycle)? (default: yes)
 bool config_load_today_page();

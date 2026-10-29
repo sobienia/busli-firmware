@@ -167,7 +167,7 @@ static void draw_device_info_page() {
     static const char* NAMES[SRC_COUNT] = { "Departures", "Weather", "Commute", "Stocks", "Parcel", "Pager" };
     SourceStatus st[SRC_COUNT];
     fetch_task_get_source_status(st);
-    InfoRow right[SRC_COUNT + 1];
+    InfoRow right[SRC_COUNT + 2];
     int nr = 0;
     for (int i = 0; i < SRC_COUNT; i++) {
         if (!st[i].used) continue;
@@ -181,6 +181,12 @@ static void draw_device_info_page() {
     if (light_available() && light_lux() >= 0)
         right[nr++] = { "Light", String(light_lux(), light_lux() < 10 ? 2 : 0) + " lux" +
                                  (display_auto_brightness() ? ", auto" : "") };
+    // Battery life: average of the last runs until empty, per full charge
+    int runs;
+    float life = battery_life_hours(runs);
+    right[nr++] = { "Battery life", life < 0 ? String("not measured yet")
+                                             : "~" + String((int)lroundf(life)) + " h (" + runs +
+                                               (runs == 1 ? " run)" : " runs)") };
 
     String footer_left = String("Tap to configure  -  ") + WEB_HOSTNAME + ".local";
     FooterInfo f;
@@ -259,7 +265,52 @@ static void draw_today_page() {
     FooterInfo f;
     f.battery_pct      = g_battery_pct;
     f.battery_charging = g_battery_charging;
-    display_draw_today(label, g_current_page, g_num_pages, rows, n, quote.text, quote.author, f);
+    display_draw_today(label, g_current_page, g_num_pages, rows, n, quote.text, quote.author,
+                       "Tap to show a clock", f);
+}
+
+// ── Weather animations ───────────────────────────────────────────────────────
+// For the place on screen: rain/snow 15 min before it starts ("Rain in 12 min"),
+// rain/snow that starts without warning ("Raining"), and a thunderstorm (at most
+// hourly). Only while the pages are visible — what happened meanwhile plays when
+// the screen wakes.
+static time_t s_anim_rain_at  = 0;      // rain start (or start time) already shown
+static bool   s_anim_was_wet  = false;
+static time_t s_anim_storm_at = 0;
+
+static bool pages_visible() {
+    return display_screen_on() && !g_clock_showing && g_overlay_until_ms == 0 &&
+           g_config_hint_stage == 0 && !pager_ui_active() && !display_weather_anim_active();
+}
+
+void weather_anim_preview(int kind) {
+    static const char* const TEXT[] = { "Rain in 10 min", "Snow in 10 min", "Thunderstorm" };
+    if (kind < 0 || kind > 2) return;
+    display_weather_anim_start((WeatherAnim)kind, TEXT[kind]);
+}
+
+static void weather_anim_check() {
+    time_t now = time(nullptr);
+    if (!g_weather.valid || now < 1700000000 || !pages_visible()) return;
+    const WeatherData& w = g_weather;
+    bool storm = weather_code_storm(w.code_now);
+    bool snowy = weather_code_snow(w.code_now) || (w.snow_today && w.temp_c <= 2.0f);
+    bool wet   = w.raining_now;
+    char msg[32];
+    if (storm && (s_anim_storm_at == 0 || now - s_anim_storm_at >= 3600)) {
+        s_anim_storm_at = now;
+        display_weather_anim_start(WX_ANIM_STORM, "Thunderstorm");
+    } else if (!wet && w.rain_start > 0 && w.rain_start - now <= 900 &&
+               (s_anim_rain_at == 0 || labs((long)(w.rain_start - s_anim_rain_at)) > 1800)) {
+        s_anim_rain_at = w.rain_start;
+        int mins = std::max(1, (int)((w.rain_start - now + 59) / 60));
+        snprintf(msg, sizeof(msg), "%s in %d min", snowy ? "Snow" : "Rain", mins);
+        display_weather_anim_start(snowy ? WX_ANIM_SNOW : WX_ANIM_RAIN, msg);
+    } else if (wet && !s_anim_was_wet && (s_anim_rain_at == 0 || now - s_anim_rain_at > 1800)) {
+        s_anim_rain_at = now;
+        display_weather_anim_start(snowy ? WX_ANIM_SNOW : WX_ANIM_RAIN, snowy ? "Snowing" : "Raining");
+    }
+    s_anim_was_wet = wet;
 }
 
 void views_pull_data() {
@@ -288,6 +339,7 @@ void views_pull_data() {
 
     // Pull latest weather + commute from background cache once per second
     fetch_task_get_weather(g_weather, g_weather_city);
+    weather_anim_check();
     if (commute_configured()) {
         CommuteData new_home, new_work;
         if (fetch_task_get_commute(new_home, new_work)) {
@@ -305,7 +357,68 @@ void views_pull_data() {
 
 // ── One function per page ────────────────────────────────────────────────────
 
-// Night clock: date, plus the temperature of the last place shown
+// The scene behind the clock for the weather outside (-1 = none). At night the
+// forecast is refreshed only hourly, so the expected rain start and end times
+// tell whether it's wet at this moment; otherwise the current weather code:
+// 0–1 clear, 2 partly cloudy, 3 overcast, 45/48 fog, 80–82 showers — each by
+// day (sun) or night (moon).
+static int clock_scene() {
+    int preview = clock_preview_kind();
+    if (preview >= 0) return preview;
+    if (!g_weather.valid) return -1;
+    const WeatherData& w = g_weather;
+    time_t now = time(nullptr);
+    int  code  = w.code_now;
+    bool day   = w.is_day;
+    bool wet   = w.raining_now ? (w.rain_end == 0 || now < w.rain_end)
+                               : (w.rain_start > 0 && now >= w.rain_start);
+    if (weather_code_storm(code)) return day ? SCENE_STORM : SCENE_STORM_NIGHT;
+    if (wet || (code >= 51 && code <= 86)) {
+        bool snowy = weather_code_snow(code) || (w.snow_today && w.temp_c <= 2.0f);
+        if (snowy) return day ? SCENE_SNOW : SCENE_SNOW_NIGHT;
+        if (day && code >= 80 && code <= 82) return SCENE_SHOWERS;
+        return day ? SCENE_RAIN : SCENE_RAIN_NIGHT;
+    }
+    if (code == 45 || code == 48) return day ? SCENE_FOG : SCENE_FOG_NIGHT;
+    if (code == 3) return SCENE_CLOUDS;
+    if (code == 2) return day ? SCENE_PARTLY_SUN : SCENE_PARTLY_MOON;
+    return day ? SCENE_SUN : SCENE_MOON;
+}
+
+// Moving scenes only on USB power — on battery the same scene, still, redrawn
+// once a minute (15 frames a second would drain it overnight)
+static bool clock_animated() {
+    return clock_preview_kind() >= 0 || battery_status().usb_power;
+}
+
+// Today page: a tap shows the clock, another tap goes back
+static bool s_today_clock = false;
+void toggle_today_clock() {
+    s_today_clock = !s_today_clock;
+    g_last_redraw_ms = 0;
+    display_invalidate();
+    if (s_today_clock) display_clock_hint("Swipe: clock style  \xC2\xB7  Tap: back", 4000);
+    Log.printf("[Today] Clock %s\n", s_today_clock ? "on" : "off");
+}
+void today_clock_off() { s_today_clock = false; }
+bool today_clock_showing() {
+    return s_today_clock && g_pages[g_current_page].type == PageInfo::TODAY;
+}
+
+// Swipe on the Today clock: next/previous style (digital → split-flap → Matrix),
+// remembered in Settings
+void switch_clock_style(int step) {
+    static const char* const NAMES[CLOCK_STYLE_COUNT] = { "digital", "split-flap", "Matrix" };
+    static int style = -1;
+    if (style < 0) style = config_load_clock_style();
+    style = ((style + step) % CLOCK_STYLE_COUNT + CLOCK_STYLE_COUNT) % CLOCK_STYLE_COUNT;
+    config_save_clock_style(style);
+    display_set_clock_style(style);
+    Log.printf("[Clock] Style → %s\n", NAMES[style]);
+}
+
+// The clock: date, plus the temperature of the last place shown. The night
+// clock is dim; the Today page's clock is bright during the day.
 static void draw_night_clock() {
     char sub[40] = "";
     time_t now_t = time(nullptr);
@@ -317,7 +430,8 @@ static void draw_night_clock() {
             snprintf(sub + len, sizeof(sub) - len, "   %d°C", (int)lroundf(g_weather.temp_c));
         }
     }
-    display_draw_night_clock(sub);
+    bool bright = (!g_clock_showing || clock_preview_kind() >= 0) && !display_is_night();
+    display_draw_night_clock(sub, clock_scene(), clock_animated(), bright);
 }
 
 // Transit stop: the departure board, or one of the tracked flights
@@ -470,11 +584,13 @@ void draw_current_page(uint32_t now_ms) {
     // The weather page's extra data is only fetched while someone can see it
     fetch_task_set_weather_page(page.type == PageInfo::WEATHER && display_screen_on() &&
                                 !g_clock_showing, g_wx_slot);
-    if (g_config_hint_stage != 0 || overlay_active() || !display_screen_on() ||
-        now_ms - g_last_redraw_ms < 1000) return;
+    if (g_config_hint_stage != 0 || overlay_active() || !display_screen_on()) return;
+    // The clock (night, or Today tapped): every loop while its scene moves —
+    // it paces its own frames and redraws a still clock only once a minute
+    if (g_clock_showing || today_clock_showing()) { draw_night_clock(); return; }
+    if (now_ms - g_last_redraw_ms < 1000) return;
     g_last_redraw_ms = now_ms;
 
-    if (g_clock_showing) { draw_night_clock(); return; }
     switch (page.type) {
         case PageInfo::TRANSIT:      draw_transit_page(page);   break;
         case PageInfo::STOCKS:       draw_stocks_page(now_ms);  break;

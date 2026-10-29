@@ -102,6 +102,22 @@ void run_setup_portal() {
     display_invalidate();
 }
 
+// ── Night clock preview (Remote page): the clock with weather behind it ──────
+static const uint32_t CLOCK_PREVIEW_MS = 20000;
+static int      s_preview_kind     = -1;
+static uint32_t s_preview_until_ms = 0;
+
+void clock_preview(int kind) {
+    if (kind < 0 || kind >= SCENE_COUNT) return;
+    s_preview_kind     = kind;
+    s_preview_until_ms = millis() + CLOCK_PREVIEW_MS;
+}
+
+int clock_preview_kind() {
+    if (s_preview_kind >= 0 && (int32_t)(millis() - s_preview_until_ms) >= 0) s_preview_kind = -1;
+    return s_preview_kind;
+}
+
 // Updates screen power and the fetch rate. Returns true while input must be
 // ignored (from the waking press until it is released, inclusive).
 bool power_tick() {
@@ -134,8 +150,9 @@ bool power_tick() {
 
     // Overlays (pairing code, warnings) count as awake while they show
     bool idle    = hide_mode && !g_woken && g_overlay_until_ms == 0;
-    bool want_on = !(idle && g_night.mode == NIGHT_OFF);
-    bool clock   = idle && g_night.mode == NIGHT_CLOCK;
+    bool preview = clock_preview_kind() >= 0;
+    bool want_on = preview || !(idle && g_night.mode == NIGHT_OFF);
+    bool clock   = preview || (idle && g_night.mode == NIGHT_CLOCK);
 
     if (want_on != display_screen_on()) {
         display_set_screen_on(want_on);
